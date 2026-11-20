@@ -136,3 +136,60 @@ enum JapaneseRomanizer {
         return out
     }
 }
+
+enum KoreanRomanizer {
+    private static let initials = [
+        "g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s",
+        "ss", "", "j", "jj", "ch", "k", "t", "p", "h",
+    ]
+    private static let medials = [
+        "a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa",
+        "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i",
+    ]
+    private static let finals = [
+        "", "k", "k", "k", "n", "n", "n", "t", "l", "k",
+        "m", "l", "l", "l", "l", "l", "m", "p", "p", "t",
+        "t", "ng", "t", "t", "k", "t", "p", "t",
+    ]
+
+    static func containsHangul(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (0xAC00...0xD7A3).contains(v)
+                || (0x1100...0x11FF).contains(v)
+                || (0x3130...0x318F).contains(v) {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func isKoreanTrack(_ lines: [LyricLine]) -> Bool {
+        lines.contains { containsHangul($0.text) }
+    }
+
+    static func romanizeLine(_ text: String) -> String {
+        guard containsHangul(text) else { return text }
+
+        var out = ""
+        out.reserveCapacity(text.count * 2)
+
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if v >= 0xAC00 && v <= 0xD7A3 {
+                let index = Int(v - 0xAC00)
+                let initial = index / (21 * 28)
+                let medial = (index % (21 * 28)) / 28
+                let final = index % 28
+                out.append(initials[initial])
+                out.append(medials[medial])
+                out.append(finals[final])
+            } else {
+                out.unicodeScalars.append(scalar)
+            }
+        }
+
+        let trimmed = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? text : trimmed
+    }
+}

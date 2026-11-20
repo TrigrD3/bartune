@@ -135,6 +135,7 @@ final class LyricsState: ObservableObject {
         static let fontOption = "bartune.fontOption"
         static let fontWeight = "bartune.fontWeight"
         static let romanizeJapanese = "bartune.romanizeJapanese"
+        static let romanizeKorean = "bartune.romanizeKorean"
         static let lowCPUMode = "bartune.lowCPUMode"
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
     }
@@ -199,6 +200,13 @@ final class LyricsState: ObservableObject {
         }
     }
 
+    @Published var romanizeKorean: Bool {
+        didSet {
+            UserDefaults.standard.set(romanizeKorean, forKey: Keys.romanizeKorean)
+            refreshCurrentLineText()
+        }
+    }
+
     @Published var lowCPUMode: Bool {
         didSet { UserDefaults.standard.set(lowCPUMode, forKey: Keys.lowCPUMode) }
     }
@@ -213,11 +221,19 @@ final class LyricsState: ObservableObject {
 
     private var rawLines: [LyricLine] = []
     private var romanizedLines: [LyricLine] = []
+    private var koreanRomanizedLines: [LyricLine] = []
     private var isJapaneseSong: Bool = false
+    private var isKoreanSong: Bool = false
     private var currentTrackId: String?
 
     private var activeLines: [LyricLine] {
-        (romanizeJapanese && isJapaneseSong) ? romanizedLines : rawLines
+        if romanizeJapanese && isJapaneseSong {
+            return romanizedLines
+        }
+        if romanizeKorean && isKoreanSong {
+            return koreanRomanizedLines
+        }
+        return rawLines
     }
 
     init() {
@@ -260,6 +276,7 @@ final class LyricsState: ObservableObject {
         self.backgroundOpacity = storedOpacity > 0 ? storedOpacity : 0.96
 
         self.romanizeJapanese = ud.object(forKey: Keys.romanizeJapanese) as? Bool ?? true
+        self.romanizeKorean = ud.object(forKey: Keys.romanizeKorean) as? Bool ?? true
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
     }
@@ -268,34 +285,16 @@ final class LyricsState: ObservableObject {
         currentTrackId = track?.id
         rawLines = lyrics
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
+        isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         if isJapaneseSong {
-            romanizedLines = lyrics.map { line in
-                if !line.words.isEmpty {
-                    let romWords = line.words.map { w in
-                        WordTimestamp(
-                            timestamp: w.timestamp,
-                            duration: w.duration,
-                            text: JapaneseRomanizer.romanizeLine(w.text) + " "
-                        )
-                    }
-                    let joined = romWords.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-                    return LyricLine(
-                        id: line.id,
-                        timestamp: line.timestamp,
-                        duration: line.duration,
-                        text: joined,
-                        words: romWords
-                    )
-                }
-                return LyricLine(
-                    id: line.id,
-                    timestamp: line.timestamp,
-                    duration: line.duration,
-                    text: JapaneseRomanizer.romanizeLine(line.text)
-                )
-            }
+            romanizedLines = Self.romanizeLines(lyrics, using: JapaneseRomanizer.romanizeLine)
         } else {
             romanizedLines = []
+        }
+        if isKoreanSong {
+            koreanRomanizedLines = Self.romanizeLines(lyrics, using: KoreanRomanizer.romanizeLine)
+        } else {
+            koreanRomanizedLines = []
         }
 
         hasLyrics = !lyrics.isEmpty
@@ -307,6 +306,34 @@ final class LyricsState: ObservableObject {
             currentLineId = -1
             lineProgress = 0.0
             albumColors = nil
+        }
+    }
+
+    private static func romanizeLines(_ lyrics: [LyricLine], using transform: (String) -> String) -> [LyricLine] {
+        lyrics.map { line in
+            if !line.words.isEmpty {
+                let romWords = line.words.map { w in
+                    WordTimestamp(
+                        timestamp: w.timestamp,
+                        duration: w.duration,
+                        text: transform(w.text) + " "
+                    )
+                }
+                let joined = romWords.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                return LyricLine(
+                    id: line.id,
+                    timestamp: line.timestamp,
+                    duration: line.duration,
+                    text: joined,
+                    words: romWords
+                )
+            }
+            return LyricLine(
+                id: line.id,
+                timestamp: line.timestamp,
+                duration: line.duration,
+                text: transform(line.text)
+            )
         }
     }
 
