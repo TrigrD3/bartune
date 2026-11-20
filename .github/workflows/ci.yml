@@ -21,9 +21,9 @@ jobs:
       code: ${{ steps.filter.outputs.code || 'true' }}
     steps:
       - if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         id: filter
         with:
           predicate-quantifier: every
@@ -37,7 +37,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install lint tools
         run: brew install swiftlint swiftformat
       - name: SwiftFormat
@@ -53,9 +53,9 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Cache SwiftPM build
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .build
           key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
@@ -75,7 +75,7 @@ jobs:
           fi
       - name: Upload coverage to Codecov
         if: hashFiles('coverage.lcov') != ''
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: coverage.lcov
           token: ${{ secrets.CODECOV_TOKEN }}
