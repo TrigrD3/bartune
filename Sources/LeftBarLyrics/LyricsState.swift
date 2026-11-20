@@ -6,6 +6,7 @@ final class LyricsState: ObservableObject {
     @Published var currentText: String = ""
     @Published var currentLineId: Int = -1
     @Published var lineProgress: Double = 0.0
+    @Published var cursorLocalX: CGFloat? = nil
     @Published var trackSummary: String = "Not Playing"
     @Published var isPlaying: Bool = false
     @Published var isEnabled: Bool = true

@@ -102,13 +102,46 @@ struct KaraokeLineView: View {
     }
 }
 
+struct CursorCutoutMask: View {
+    let cursorX: CGFloat?
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = max(1, geo.size.width)
+            if let cx = cursorX {
+                let clearHalf: CGFloat = 34
+                let feather: CGFloat = 28
+
+                let s1 = max(0, min(1, (cx - clearHalf - feather) / w))
+                let s2 = max(s1, min(1, (cx - clearHalf) / w))
+                let s3 = max(s2, min(1, (cx + clearHalf) / w))
+                let s4 = max(s3, min(1, (cx + clearHalf + feather) / w))
+
+                LinearGradient(
+                    stops: [
+                        .init(color: .white, location: 0),
+                        .init(color: .white, location: s1),
+                        .init(color: .clear, location: s2),
+                        .init(color: .clear, location: s3),
+                        .init(color: .white, location: s4),
+                        .init(color: .white, location: 1)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+            } else {
+                Color.white
+            }
+        }
+    }
+}
+
 struct LyricsOverlayView: View {
     @ObservedObject var state: LyricsState
 
     var body: some View {
         ZStack(alignment: .leading) {
-            VisualEffectBackground()
-                .overlay(Color(nsColor: .windowBackgroundColor).opacity(0.88))
+            Color(nsColor: .windowBackgroundColor).opacity(0.96)
 
             HStack(spacing: 7) {
                 EqualizerIconView(isPlaying: state.isPlaying)
@@ -125,5 +158,8 @@ struct LyricsOverlayView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .compositingGroup()
+        .mask(CursorCutoutMask(cursorX: state.cursorLocalX))
+        .animation(.easeOut(duration: 0.08), value: state.cursorLocalX == nil)
     }
 }

@@ -209,10 +209,11 @@ final class OverlayWindowController {
         if inside {
             unhoverWorkItem?.cancel()
             unhoverWorkItem = nil
-            if !isHovered {
-                isHovered = true
-                refreshVisibility()
+            isHovered = true
+            if let panel {
+                state.cursorLocalX = loc.x - panel.frame.minX
             }
+            refreshVisibility()
         } else if isHovered && !isMenuLikelyOpen {
             if unhoverWorkItem == nil {
                 let work = DispatchWorkItem { [weak self] in
@@ -220,18 +221,21 @@ final class OverlayWindowController {
                     self.unhoverWorkItem = nil
                     if !self.hoverTriggerRect.contains(NSEvent.mouseLocation) && !self.isMenuLikelyOpen {
                         self.isHovered = false
+                        self.state.cursorLocalX = nil
                         self.refreshVisibility()
                     }
                 }
                 unhoverWorkItem = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
             }
         }
     }
 
     private func refreshVisibility() {
         guard let panel else { return }
-        let visible = state.shouldShowOverlay && !isHovered && !isMenuLikelyOpen
+        // Keep the overlay visible on hover (the cursor spotlight mask reveals only the area under the cursor).
+        // Only hide the full bar when a menu dropdown is actively clicked open.
+        let visible = state.shouldShowOverlay && !isMenuLikelyOpen
         let targetAlpha: CGFloat = visible ? 1.0 : 0.0
 
         guard abs(panel.alphaValue - targetAlpha) > 0.01 else { return }
