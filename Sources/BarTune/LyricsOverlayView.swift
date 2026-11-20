@@ -85,6 +85,7 @@ struct EqualizerIconView: View {
                     .frame(width: w, height: 12)
             }
         }
+        .drawingGroup()
     }
 }
 
@@ -209,10 +210,12 @@ struct LyricsOverlayView: View {
     }
 
     private var activeEqualizerColor: Color {
-        if state.themeMode != .system, let colors = state.albumColors {
-            return Color(nsColor: colors.accentNSColor)
+        let themeFallback: Color = if state.themeMode != .system, let colors = state.albumColors {
+            Color(nsColor: colors.accentNSColor)
+        } else {
+            Color.accentColor
         }
-        return Color.accentColor
+        return state.visualizerColorTheme.resolvedColor(fallback: themeFallback)
     }
 
     private var activeSungColor: Color {
@@ -246,7 +249,7 @@ struct LyricsOverlayView: View {
             HStack(spacing: 7) {
                 if state.showEqualizer {
                     EqualizerIconView(
-                        isPlaying: state.isPlaying && state.animateVisualizer,
+                        isPlaying: state.isEnabled && state.isPlaying && state.animateVisualizer,
                         tint: activeEqualizerColor,
                         lowCPUMode: state.lowCPUMode,
                         style: state.visualizerStyle,
@@ -261,10 +264,12 @@ struct LyricsOverlayView: View {
                     unsungColor: activeUnsungColor,
                     sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled,
-                    isPlaying: state.isPlaying,
+                    isPlaying: state.isEnabled && state.isPlaying,
                     lowCPUMode: state.lowCPUMode
                 )
-                .id("\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)")
+                .id(
+                    "\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)-\(state.translateLyrics)-\(state.translationLanguage.rawValue)"
+                )
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 6)),
                     removal: .opacity.combined(with: .offset(y: -6))

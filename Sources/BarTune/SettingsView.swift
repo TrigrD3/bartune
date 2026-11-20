@@ -1,5 +1,7 @@
-import SwiftUI
 import AppKit
+import Combine
+import Darwin
+import SwiftUI
 
 private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
@@ -36,6 +38,9 @@ struct SettingsView: View {
     @State private var selectedTab: SettingsTab = .general
     @State private var cachedSongCount: Int = 0
     @State private var cachedBytes: Int64 = 0
+    @State private var cpuPercent: Double = 0
+    @State private var memoryBytes: UInt64 = 0
+    private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -108,8 +113,34 @@ struct SettingsView: View {
             Section("Startup") {
                 Toggle("Launch BarTune at Login", isOn: $state.launchAtLogin)
             }
+
+            Section("App Performance") {
+                HStack {
+                    Text("CPU Usage")
+                    Spacer()
+                    Text(String(format: "%.1f%%", cpuPercent))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Memory Usage")
+                    Spacer()
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(memoryBytes), countStyle: .memory))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
+        .onAppear {
+            refreshResourceMetrics()
+        }
+        .onReceive(resourceTimer) { _ in
+            if selectedTab == .general {
+                refreshResourceMetrics()
+            }
+        }
     }
 
     private var appearanceTab: some View {
@@ -206,6 +237,12 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.segmented)
 
+                    Picker("Color", selection: $state.visualizerColorTheme) {
+                        ForEach(VisualizerColorTheme.allCases) { theme in
+                            Text(theme.title).tag(theme)
+                        }
+                    }
+
                     VStack(alignment: .leading, spacing: 4) {
                         HStack {
                             Text("Visualizer Width")
@@ -228,6 +265,22 @@ struct SettingsView: View {
 
     private var lyricsSyncTab: some View {
         Form {
+            Section("Translation") {
+                Toggle("Translate Lyrics", isOn: $state.translateLyrics)
+
+                if state.translateLyrics {
+                    Picker("Target Language", selection: $state.translationLanguage) {
+                        ForEach(TranslationLanguage.allCases) { lang in
+                            Text(lang.title).tag(lang)
+                        }
+                    }
+                }
+
+                Text("Translations are cached locally in Offline Cache for instant repeat playback.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Romanization") {
                 Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
                 Toggle("Korean → Romanized", isOn: $state.romanizeKorean)
@@ -351,6 +404,58 @@ struct SettingsView: View {
         cachedSongCount = stats.count
         cachedBytes = stats.bytes
     }
+
+    private func refreshResourceMetrics() {
+        let metrics = AppResourceMetrics.sample()
+        cpuPercent = metrics.cpuPercent
+        memoryBytes = metrics.memoryBytes
+    }
+}
+
+private enum AppResourceMetrics {
+    static func sample() -> (cpuPercent: Double, memoryBytes: UInt64) {
+        (cpuPercent: currentCPUPercent(), memoryBytes: currentMemoryBytes())
+    }
+
+    private static func currentMemoryBytes() -> UInt64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let status = withUnsafeMutablePointer(to: &info) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), intPtr, &count)
+            }
+        }
+        guard status == KERN_SUCCESS else { return 0 }
+        return info.phys_footprint
+    }
+
+    private static func currentCPUPercent() -> Double {
+        var threads: thread_act_array_t?
+        var threadCount: mach_msg_type_number_t = 0
+        guard task_threads(mach_task_self_, &threads, &threadCount) == KERN_SUCCESS,
+              let threadList = threads
+        else { return 0 }
+
+        defer {
+            let size = vm_size_t(Int(threadCount) * MemoryLayout<thread_t>.size)
+            vm_deallocate(mach_task_self_, vm_address_t(bitPattern: threadList), size)
+        }
+
+        var totalCPU = 0.0
+        for i in 0..<Int(threadCount) {
+            var info = thread_basic_info()
+            var count = mach_msg_type_number_t(THREAD_INFO_MAX)
+            let status = withUnsafeMutablePointer(to: &info) { ptr in
+                ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                    thread_info(threadList[i], thread_flavor_t(THREAD_BASIC_INFO), intPtr, &count)
+                }
+            }
+            if status == KERN_SUCCESS && (info.flags & TH_FLAGS_IDLE) == 0 {
+                totalCPU += (Double(info.cpu_usage) / Double(TH_USAGE_SCALE)) * 100.0
+            }
+        }
+        return totalCPU
+    }
 }
 
 private struct VisualizerPreviewStrip: View {
@@ -365,10 +470,12 @@ private struct VisualizerPreviewStrip: View {
     }
 
     private var equalizerColor: Color {
-        if state.themeMode != .system, let colors = state.albumColors {
-            return Color(nsColor: colors.accentNSColor)
+        let themeFallback: Color = if state.themeMode != .system, let colors = state.albumColors {
+            Color(nsColor: colors.accentNSColor)
+        } else {
+            Color.accentColor
         }
-        return Color.accentColor
+        return state.visualizerColorTheme.resolvedColor(fallback: themeFallback)
     }
 
     private var textColor: Color {

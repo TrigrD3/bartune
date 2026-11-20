@@ -6,18 +6,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state = LyricsState()
     private let spotifyMonitor = SpotifyMonitor()
     private let lyricsFetcher = LyricsFetcher()
+    private let lyricsTranslator = LyricsTranslator()
     private let colorExtractor = AlbumArtColorExtractor()
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
 
     private var statusItem: NSStatusItem?
     private var trackMenuItem: NSMenuItem?
+    private var playPauseMenuItem: NSMenuItem?
     private var toggleMenuItem: NSMenuItem?
     private var offsetMenuItem: NSMenuItem?
     private var hoverModeItems: [HoverMode: NSMenuItem] = [:]
 
     private var lastFetchedTrackId: String?
     private var fetchTask: Task<Void, Never>?
+    private var translateTask: Task<Void, Never>?
     private var colorTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
@@ -54,6 +57,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
+        state.$isPlaying
+            .receive(on: RunLoop.main)
+            .sink { [weak self] isPlaying in
+                self?.playPauseMenuItem?.title = isPlaying ? "Pause" : "Play"
+            }
+            .store(in: &cancellables)
+
         state.$hoverMode
             .receive(on: RunLoop.main)
             .sink { [weak self] mode in
@@ -68,11 +78,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.offsetMenuItem?.title = String(format: "Sync Offset: %@%.1fs", sign, offset)
             }
             .store(in: &cancellables)
+
+        state.$translateLyrics
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                if enabled {
+                    self?.translateCurrentTrack()
+                } else {
+                    self?.translateTask?.cancel()
+                }
+            }
+            .store(in: &cancellables)
+
+        state.$translationLanguage
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, self.state.translateLyrics else { return }
+                self.translateCurrentTrack()
+            }
+            .store(in: &cancellables)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         spotifyMonitor.stop()
         fetchTask?.cancel()
+        translateTask?.cancel()
         colorTask?.cancel()
     }
 
@@ -89,6 +121,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trackItem.isEnabled = false
         menu.addItem(trackItem)
         self.trackMenuItem = trackItem
+
+        let playPauseItem = NSMenuItem(title: "Play", action: #selector(togglePlayPause), keyEquivalent: "")
+        playPauseItem.target = self
+        menu.addItem(playPauseItem)
+        self.playPauseMenuItem = playPauseItem
+
+        let nextItem = NSMenuItem(title: "Next Track", action: #selector(nextTrack), keyEquivalent: "")
+        nextItem.target = self
+        menu.addItem(nextItem)
+
+        let prevItem = NSMenuItem(title: "Previous Track", action: #selector(previousTrack), keyEquivalent: "")
+        prevItem.target = self
+        menu.addItem(prevItem)
 
         menu.addItem(.separator())
 
@@ -155,6 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if lastFetchedTrackId != nil {
                 lastFetchedTrackId = nil
                 fetchTask?.cancel()
+                translateTask?.cancel()
                 colorTask?.cancel()
                 state.setTrack(nil, lyrics: [])
             }
@@ -165,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if track.id != lastFetchedTrackId {
             lastFetchedTrackId = track.id
             fetchTask?.cancel()
+            translateTask?.cancel()
             colorTask?.cancel()
             state.setTrack(track, lyrics: [])
 
@@ -173,6 +220,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let lyrics = await self.lyricsFetcher.fetchLyrics(for: track)
                 guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
                 self.state.setTrack(track, lyrics: lyrics)
+                if self.state.translateLyrics, !lyrics.isEmpty {
+                    self.translateCurrentTrack()
+                }
             }
 
             colorTask = Task { [weak self] in
@@ -184,6 +234,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state.updatePlayback(isPlaying: snapshot.isPlaying, position: snapshot.position)
+    }
+
+    private func translateCurrentTrack() {
+        translateTask?.cancel()
+        guard let trackId = lastFetchedTrackId else { return }
+        let lines = state.rawLyricLines
+        guard !lines.isEmpty else { return }
+        let targetLang = state.translationLanguage
+
+        translateTask = Task { [weak self] in
+            guard let self else { return }
+            let translated = await self.lyricsTranslator.translate(
+                lines: lines,
+                trackId: trackId,
+                targetLanguage: targetLang
+            )
+            guard !Task.isCancelled,
+                  self.lastFetchedTrackId == trackId,
+                  self.state.translationLanguage == targetLang
+            else { return }
+            self.state.setTranslatedLines(translated)
+        }
+    }
+
+    @objc private func togglePlayPause() {
+        spotifyMonitor.sendCommand(.playPause)
+    }
+
+    @objc private func nextTrack() {
+        spotifyMonitor.sendCommand(.nextTrack)
+    }
+
+    @objc private func previousTrack() {
+        spotifyMonitor.sendCommand(.previousTrack)
     }
 
     @objc private func toggleLyrics() {
