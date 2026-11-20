@@ -70,9 +70,8 @@ struct KaraokeLineView: View {
 
                 // Sung karaoke highlighted text with smooth feathered sweep mask
                 Text(text)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 13, weight: .medium))
                     .foregroundStyle(Color.primary)
-                    .shadow(color: Color.accentColor.opacity(0.35), radius: 2, x: 0, y: 0)
                     .fixedSize(horizontal: true, vertical: false)
                     .mask(
                         GeometryReader { maskGeo in
