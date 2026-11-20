@@ -1,6 +1,24 @@
 import Foundation
 import AppKit
 
+private final class CompiledScriptBox: @unchecked Sendable {
+    private let source: String
+    private var script: NSAppleScript?
+
+    init(source: String) {
+        self.source = source
+    }
+
+    func execute() -> String? {
+        if script == nil {
+            script = NSAppleScript(source: source)
+        }
+        var error: NSDictionary?
+        let result = script?.executeAndReturnError(&error)
+        return (error == nil) ? result?.stringValue : nil
+    }
+}
+
 struct PlaybackSnapshot {
     let isRunning: Bool
     let isPlaying: Bool
@@ -63,11 +81,9 @@ final class SpotifyMonitor {
     return "IDLE"
     """
 
-    private let compiledScript: NSAppleScript?
+    private let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
 
-    init() {
-        self.compiledScript = NSAppleScript(source: Self.scriptSource)
-    }
+    init() {}
 
     func setLowCPUMode(_ enabled: Bool) {
         guard lowCPUMode != enabled else { return }
@@ -148,9 +164,9 @@ final class SpotifyMonitor {
             return
         }
 
-        // Only drives line-boundary transitions; smooth 60fps/30fps sweep is rendered
+        // Only drives line-boundary transitions; smooth sweep is rendered
         // directly inside KaraokeLineView via TimelineView without @Published churn.
-        let desiredInterval: TimeInterval = lowCPUMode ? 0.15 : 0.05
+        let desiredInterval: TimeInterval = lowCPUMode ? 0.25 : 0.08
         if let existing = interpolationTimer, abs(existing.timeInterval - desiredInterval) < 0.005 {
             return
         }
@@ -167,31 +183,41 @@ final class SpotifyMonitor {
         guard !isPolling else { return }
         isPolling = true
         let allowBrowser = browserMusicEnabled
-        let scriptSource = Self.scriptSource
+        let runningBundleIds: Set<String> = allowBrowser
+            ? Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+            : []
+        let browserMonitor = self.browserMonitor
+        let spotifyScript = self.spotifyScript
 
         scriptQueue.async { [weak self] in
             let pollStart = Date()
-            var error: NSDictionary?
-            let script = NSAppleScript(source: scriptSource)
-            let result = script?.executeAndReturnError(&error)
+            let raw = spotifyScript.execute()
             let pollEnd = Date()
             // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
             let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
-            let raw = (error == nil) ? result?.stringValue : nil
+
+            var browserSnap: PlaybackSnapshot?
+            var browserNow = now
+            if (raw == nil || raw == "IDLE") && allowBrowser {
+                let bStart = Date()
+                browserSnap = browserMonitor.poll(runningBundleIds: runningBundleIds)
+                let bEnd = Date()
+                browserNow = Date(timeIntervalSince1970: (bStart.timeIntervalSince1970 + bEnd.timeIntervalSince1970) / 2.0)
+            }
 
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer { self.isPolling = false }
-                self.handlePollResult(raw: raw, now: now, allowBrowser: allowBrowser)
+                self.handlePollResult(raw: raw, now: now, browserSnap: browserSnap, browserNow: browserNow)
             }
         }
     }
 
-    private func handlePollResult(raw: String?, now: Date, allowBrowser: Bool) {
+    private func handlePollResult(raw: String?, now: Date, browserSnap: PlaybackSnapshot?, browserNow: Date) {
         guard let raw, raw != "IDLE" else {
-            if allowBrowser, let browserSnap = browserMonitor.poll() {
+            if let browserSnap {
                 lastSnapshot = browserSnap
-                lastPollDate = Date()
+                lastPollDate = browserNow
                 updateInterpolationTimer(isPlaying: browserSnap.isPlaying)
                 onUpdate?(browserSnap)
                 return

@@ -101,4 +101,87 @@ final class BrowserMediaParserTests: XCTestCase {
         XCTAssertEqual(snapshot?.track?.artist, "TK from Ling tosite sigure")
         XCTAssertEqual(snapshot?.track?.title, "Unravel - Acoustic Version")
     }
+
+    func testResolvesActiveYouTubeChapterForLongCompilationVideo() {
+        let sep = "\u{1F}"
+        let gs = "\u{1D}"
+        let rs = "\u{1E}"
+        let chapters = [
+            "0:00\(rs)01. Lemon",
+            "2:27\(rs)02. 春雷",
+            "7:11\(rs)03. Kenshi Yonezu - KICK BACK",
+            "10:26\(rs)04. Uma to Shika",
+            // Duplicate chapter rendered in secondary DOM panel should be deduplicated
+            "7:11\(rs)03. Kenshi Yonezu - KICK BACK",
+        ].joined(separator: gs)
+
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:www.youtube.com:Kenshi Yonezu Playlist|CuratorChannel",
+            "Kenshi Yonezu Playlist",
+            "CuratorChannel",
+            "",
+            "3600.0",
+            "450.0", // 7:30 -> 19s into "KICK BACK" (7:11..10:26 = 195s)
+            "https://i.ytimg.com/vi/abc/hqdefault.jpg",
+            chapters,
+        ].joined(separator: sep)
+
+        let snapshot = BrowserMediaParser.parsePayload(payload)
+        XCTAssertNotNil(snapshot)
+        XCTAssertEqual(snapshot?.track?.artist, "Kenshi Yonezu")
+        XCTAssertEqual(snapshot?.track?.title, "KICK BACK")
+        XCTAssertEqual(snapshot?.track?.duration ?? 0, 195.0, accuracy: 0.001)
+        XCTAssertEqual(snapshot?.position ?? 0, 19.0, accuracy: 0.001)
+        XCTAssertEqual(snapshot?.track?.id, "browser:www.youtube.com:Kenshi Yonezu Playlist|CuratorChannel:ch:431")
+    }
+
+    func testIgnoresChaptersOnShortSingleSongVideos() {
+        let sep = "\u{1F}"
+        let gs = "\u{1D}"
+        let rs = "\u{1E}"
+        let chapters = [
+            "0:00\(rs)Intro",
+            "0:30\(rs)Chorus",
+        ].joined(separator: gs)
+
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:www.youtube.com:Kenshi Yonezu - IRIS OUT|Kenshi Yonezu",
+            "Kenshi Yonezu - IRIS OUT",
+            "Kenshi Yonezu",
+            "",
+            "153.0",
+            "45.0",
+            "",
+            chapters,
+        ].joined(separator: sep)
+
+        let snapshot = BrowserMediaParser.parsePayload(payload)
+        XCTAssertEqual(snapshot?.track?.artist, "Kenshi Yonezu")
+        XCTAssertEqual(snapshot?.track?.title, "IRIS OUT")
+        XCTAssertEqual(snapshot?.track?.duration ?? 0, 153.0, accuracy: 0.001)
+        XCTAssertEqual(snapshot?.position ?? 0, 45.0, accuracy: 0.001)
+    }
+
+    func testExtractsQuotedYouTubeTitleBeforeDashSplitting() {
+        let sep = "\u{1F}"
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:www.youtube.com:JANE DOE|Kenshi Yonezu",
+            "Kenshi Yonezu, Hikaru Utada “JANE DOE” × \"Chainsaw Man – The Movie: Reze Arc\" Special Video",
+            "Kenshi Yonezu  米津玄師",
+            "",
+            "236.641",
+            "110.3",
+            "",
+        ].joined(separator: sep)
+
+        let snapshot = BrowserMediaParser.parsePayload(payload)
+        XCTAssertEqual(snapshot?.track?.artist, "Kenshi Yonezu, Hikaru Utada")
+        XCTAssertEqual(snapshot?.track?.title, "JANE DOE")
+    }
 }
