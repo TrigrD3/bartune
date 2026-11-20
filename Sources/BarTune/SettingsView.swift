@@ -5,6 +5,31 @@ struct SettingsView: View {
     @ObservedObject var state: LyricsState
 
     var body: some View {
+        TabView {
+            generalTab
+                .tabItem {
+                    Label("General", systemImage: "gearshape")
+                }
+
+            appearanceTab
+                .tabItem {
+                    Label("Appearance", systemImage: "paintbrush")
+                }
+
+            visualizerTab
+                .tabItem {
+                    Label("Visualizer", systemImage: "waveform")
+                }
+
+            lyricsSyncTab
+                .tabItem {
+                    Label("Lyrics & Sync", systemImage: "music.note.list")
+                }
+        }
+        .frame(width: 470, height: 430)
+    }
+
+    private var generalTab: some View {
         Form {
             Section("Hover Behavior") {
                 Picker("When hovering left menu bar", selection: $state.hoverMode) {
@@ -28,13 +53,25 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Slider(value: $state.spotlightWidth, in: 36...180, step: 4)
-                        Text("Changes save automatically — hover the left menu bar to see the cutout width.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
                     }
                 }
             }
 
+            Section("Media Sources") {
+                Toggle("Browser Music (YouTube Music, etc.)", isOn: $state.browserMusicEnabled)
+                Text(
+                    "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle. "
+                        + "Requires \"Allow JavaScript from Apple Events\" in your browser."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var appearanceTab: some View {
+        Form {
             Section("Color Theme") {
                 Picker("Theme", selection: $state.themeMode) {
                     ForEach(ThemeMode.allCases) { mode in
@@ -60,9 +97,20 @@ struct SettingsView: View {
                         .help("Current album colors")
                     }
                 }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Background Opacity")
+                        Spacer()
+                        Text("\(Int(state.backgroundOpacity * 100))%")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $state.backgroundOpacity, in: 0.70...1.0, step: 0.02)
+                }
             }
 
-            Section("Typography & Appearance") {
+            Section("Typography & Effects") {
                 Picker("Font", selection: $state.fontOption) {
                     ForEach(FontOption.allCases) { option in
                         Text(option.title).tag(option)
@@ -88,20 +136,49 @@ struct SettingsView: View {
                 }
 
                 Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
-                Toggle("Show Animated Equalizer", isOn: $state.showEqualizer)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var visualizerTab: some View {
+        Form {
+            Section("Visualizer") {
+                Toggle("Show Visualizer", isOn: $state.showEqualizer)
+
+                if state.showEqualizer {
+                    Picker("Style", selection: $state.visualizerStyle) {
+                        ForEach(VisualizerStyle.allCases) { style in
+                            Text(style.title).tag(style)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack {
+                            Text("Visualizer Width")
+                            Spacer()
+                            Text("\(Int(state.visualizerWidth)) pt")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $state.visualizerWidth, in: 12...44, step: 2)
+                    }
+                }
+
+                Text("Lightweight animated indicator (no macOS System Audio Recording permission required).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private var lyricsSyncTab: some View {
+        Form {
+            Section("Romanization") {
                 Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
                 Toggle("Korean → Romanized", isOn: $state.romanizeKorean)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Background Opacity")
-                        Spacer()
-                        Text("\(Int(state.backgroundOpacity * 100))%")
-                            .monospacedDigit()
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $state.backgroundOpacity, in: 0.70...1.0, step: 0.02)
-                }
             }
 
             Section("Performance & Sync") {
@@ -114,13 +191,6 @@ struct SettingsView: View {
                 Text(state.lowCPUMode
                      ? "Lightweight karaoke sweep for lower CPU usage (event-driven sync is always active)."
                      : "30fps karaoke sweep for smoother word-by-word highlighting.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
-                Toggle("Browser Music (YouTube Music, etc.)", isOn: $state.browserMusicEnabled)
-                Text(
-                    "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle. Requires \"Allow JavaScript from Apple Events\" in your browser."
-                )
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
@@ -141,7 +211,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 620)
     }
 }
 

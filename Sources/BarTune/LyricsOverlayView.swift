@@ -5,88 +5,156 @@ struct EqualizerIconView: View {
     let isPlaying: Bool
     let tint: Color
     let lowCPUMode: Bool
+    let style: VisualizerStyle
+    let width: Double
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.25 : 0.12, paused: !isPlaying)) { timeline in
+        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.16 : 0.06, paused: !isPlaying)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
-            HStack(alignment: .bottom, spacing: 1.5) {
-                ForEach(0..<3, id: \.self) { idx in
-                    let wave = isPlaying ? (0.35 + 0.65 * abs(sin(t * 4.5 + Double(idx) * 1.4))) : 0.25
-                    Capsule()
-                        .fill(tint)
-                        .frame(width: 2, height: max(3, 10 * wave))
+            let w = CGFloat(width)
+            switch style {
+            case .bars:
+                let barCount = max(3, min(8, Int((w / 4.2).rounded())))
+                HStack(alignment: .bottom, spacing: 2) {
+                    ForEach(0..<barCount, id: \.self) { idx in
+                        let wave = isPlaying ? (0.28 + 0.72 * abs(sin(t * 4.8 + Double(idx) * 1.15))) : 0.25
+                        Capsule()
+                            .fill(tint)
+                            .frame(width: 2.2, height: max(3, 11 * wave))
+                    }
                 }
+                .frame(width: w, height: 12, alignment: .bottom)
+
+            case .wave:
+                Canvas { context, size in
+                    var path = Path()
+                    let midY = size.height / 2
+                    let amp = isPlaying ? (size.height * 0.38) : 0.6
+                    let steps = max(14, Int(size.width))
+                    let cycles = max(2.2, Double(size.width) / 9.0)
+                    for i in 0...steps {
+                        let frac = Double(i) / Double(steps)
+                        let x = frac * size.width
+                        let y = midY + sin(frac * .pi * cycles + t * 6.0) * amp
+                        if i == 0 {
+                            path.move(to: CGPoint(x: x, y: y))
+                        } else {
+                            path.addLine(to: CGPoint(x: x, y: y))
+                        }
+                    }
+                    context.stroke(path, with: .color(tint), style: StrokeStyle(lineWidth: 1.6, lineCap: .round))
+                }
+                .frame(width: w, height: 12)
+
+            case .dots:
+                let dotCount = max(3, min(7, Int((w / 5.5).rounded())))
+                HStack(spacing: 2.5) {
+                    ForEach(0..<dotCount, id: \.self) { idx in
+                        let scale = isPlaying ? (0.52 + 0.48 * abs(sin(t * 4.4 + Double(idx) * 1.05))) : 0.55
+                        Circle()
+                            .fill(tint)
+                            .frame(width: 3.2, height: 3.2)
+                            .scaleEffect(scale)
+                    }
+                }
+                .frame(width: w, height: 12)
+
+            case .vinyl:
+                let angle = isPlaying ? (t.truncatingRemainder(dividingBy: 3.0) / 3.0) * 360.0 : 0.0
+                ZStack {
+                    Circle()
+                        .stroke(tint, lineWidth: 1.4)
+                    Circle()
+                        .trim(from: 0.0, to: 0.35)
+                        .stroke(tint.opacity(0.65), lineWidth: 1.0)
+                        .padding(2.2)
+                    Circle()
+                        .fill(tint)
+                        .frame(width: 2.5, height: 2.5)
+                }
+                .frame(width: 12, height: 12)
+                .rotationEffect(.degrees(angle))
+                .frame(width: w, height: 12)
+
+            case .note:
+                let pulse = isPlaying ? (0.88 + 0.14 * sin(t * 5.0)) : 0.9
+                Image(systemName: "music.note")
+                    .font(.system(size: 10.5, weight: .semibold))
+                    .foregroundStyle(tint)
+                    .scaleEffect(pulse)
+                    .frame(width: w, height: 12)
             }
-            .frame(width: 10, height: 11, alignment: .bottom)
         }
     }
 }
 
 struct KaraokeLineView: View {
     let text: String
-    let progress: Double
-    let animationStep: Double
+    let state: LyricsState
     let font: Font
     let unsungColor: Color
     let sungColor: Color
     let karaokeEnabled: Bool
+    let isPlaying: Bool
+    let lowCPUMode: Bool
 
     @State private var textWidth: CGFloat = 0
 
     var body: some View {
-        GeometryReader { container in
-            let availableWidth = container.size.width
-            let overflow = max(0, textWidth - availableWidth)
-            let scrollOffset: CGFloat = overflow > 0
-                ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
-                : 0
+        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 30.0) : (1.0 / 60.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
+            let progress = karaokeEnabled ? state.liveProgress(at: timeline.date) : 1.0
+            GeometryReader { container in
+                let availableWidth = container.size.width
+                let overflow = max(0, textWidth - availableWidth)
+                let scrollOffset: CGFloat = overflow > 0
+                    ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
+                    : 0
 
-            ZStack(alignment: .leading) {
-                if karaokeEnabled {
-                    Text(text)
-                        .font(font)
-                        .foregroundStyle(unsungColor)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .background(widthReader)
+                ZStack(alignment: .leading) {
+                    if karaokeEnabled {
+                        Text(text)
+                            .font(font)
+                            .foregroundStyle(unsungColor)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .background(widthReader)
 
-                    Text(text)
-                        .font(font)
-                        .foregroundStyle(sungColor)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .mask(
-                            GeometryReader { maskGeo in
-                                let w = maskGeo.size.width
-                                let feather: CGFloat = 16
-                                let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
+                        Text(text)
+                            .font(font)
+                            .foregroundStyle(sungColor)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .mask(
+                                GeometryReader { maskGeo in
+                                    let w = maskGeo.size.width
+                                    let feather: CGFloat = 14
+                                    let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
 
-                                HStack(spacing: 0) {
-                                    Rectangle()
-                                        .fill(Color.white)
-                                        .frame(width: max(0, fillWidth - feather))
-                                    LinearGradient(
-                                        colors: [Color.white, Color.clear],
-                                        startPoint: .leading,
-                                        endPoint: .trailing
-                                    )
-                                    .frame(width: feather)
-                                    Spacer(minLength: 0)
+                                    HStack(spacing: 0) {
+                                        Rectangle()
+                                            .fill(Color.white)
+                                            .frame(width: max(0, fillWidth - feather))
+                                        LinearGradient(
+                                            colors: [Color.white, Color.clear],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                        .frame(width: feather)
+                                        Spacer(minLength: 0)
+                                    }
                                 }
-                                .animation(progress > 0.01 ? .linear(duration: animationStep) : nil, value: progress)
-                            }
-                        )
-                } else {
-                    Text(text)
-                        .font(font)
-                        .foregroundStyle(sungColor)
-                        .fixedSize(horizontal: true, vertical: false)
-                        .background(widthReader)
+                            )
+                    } else {
+                        Text(text)
+                            .font(font)
+                            .foregroundStyle(sungColor)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .background(widthReader)
+                    }
                 }
+                .offset(x: scrollOffset)
+                .frame(maxHeight: .infinity, alignment: .center)
             }
-            .offset(x: scrollOffset)
-            .animation(.linear(duration: animationStep), value: scrollOffset)
-            .frame(maxHeight: .infinity, alignment: .center)
+            .clipped()
         }
-        .clipped()
     }
 
     private var widthReader: some View {
@@ -181,19 +249,26 @@ struct LyricsOverlayView: View {
 
             HStack(spacing: 7) {
                 if state.showEqualizer {
-                    EqualizerIconView(isPlaying: state.isPlaying, tint: activeEqualizerColor, lowCPUMode: state.lowCPUMode)
+                    EqualizerIconView(
+                        isPlaying: state.isPlaying,
+                        tint: activeEqualizerColor,
+                        lowCPUMode: state.lowCPUMode,
+                        style: state.visualizerStyle,
+                        width: state.visualizerWidth
+                    )
                 }
 
                 KaraokeLineView(
                     text: state.currentText,
-                    progress: state.lineProgress,
-                    animationStep: state.lowCPUMode ? 0.12 : 0.035,
+                    state: state,
                     font: state.fontOption.font(size: state.fontSize, weight: state.fontWeight),
                     unsungColor: activeUnsungColor,
                     sungColor: activeSungColor,
-                    karaokeEnabled: state.karaokeAnimationEnabled
+                    karaokeEnabled: state.karaokeAnimationEnabled,
+                    isPlaying: state.isPlaying,
+                    lowCPUMode: state.lowCPUMode
                 )
-                .id("\(state.currentLineId)-\(state.romanizeJapanese)")
+                .id("\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)")
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 6)),
                     removal: .opacity.combined(with: .offset(y: -6))
