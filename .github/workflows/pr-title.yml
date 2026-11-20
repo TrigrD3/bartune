@@ -35,4 +35,5 @@ jobs:
             build
             ci
             docs
+            deps
           requireScope: false
