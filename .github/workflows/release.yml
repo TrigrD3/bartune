@@ -1,0 +1,93 @@
+name: Build & Release DMG
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fail-closed docs-only PR filter (adapted from pasrom/meeting-transcriber).
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      code: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: .github/filters.yml
+
+  build:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: macos-26
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-tags: true
+
+      - name: Cache SwiftPM build
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-release-
+
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build .app and DMG
+        run: |
+          chmod +x build.sh
+          ./build.sh --dmg
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BarTune-${{ steps.version.outputs.version }}.dmg
+          path: |
+            dist/BarTune-${{ steps.version.outputs.version }}.dmg
+            dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256
+
+      - name: Find previous release tag for changelog
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: prev-tag
+        run: |
+          PREV_TAG=$(git tag --sort=-v:refname | grep -v "^${GITHUB_REF_NAME}$" | head -n 1 || true)
+          echo "tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: BarTune ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/BarTune-${{ steps.version.outputs.version }}.dmg
+            dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256

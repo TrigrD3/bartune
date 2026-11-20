@@ -13,6 +13,11 @@ let package = Package(
         .executableTarget(
             name: "BarTune",
             path: "Sources/BarTune"
-        )
+        ),
+        .testTarget(
+            name: "BarTuneTests",
+            dependencies: ["BarTune"],
+            path: "Tests/BarTuneTests"
+        ),
     ]
 )

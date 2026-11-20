@@ -1,0 +1,34 @@
+# SwiftFormat configuration for BarTune (adapted from pasrom/meeting-transcriber)
+
+--swiftversion 5.9
+--indent 4
+--indentcase false
+--trimwhitespace always
+--voidtype void
+--wraparguments before-first
+--wrapparameters before-first
+--wrapcollections before-first
+--maxwidth 160
+--commas always
+
+--disable andOperator
+--disable docComments
+--disable enumNamespaces
+--disable redundantSelf
+--disable wrapMultilineStatementBraces
+--disable modifierOrder
+--disable wrapIfStatementBodies
+--disable wrapIfExpressionBodies
+--disable repeatedGuard
+--disable redundantType
+--disable sortImports
+--disable blankLinesBetweenScopes
+--disable trailingCommas
+--disable spaceAroundOperators
+--disable redundantReturn
+--disable redundantRawValues
+--disable wrapPropertyBodies
+--disable indent
+--disable unusedArguments
+
+--exclude .build,BarTune.app

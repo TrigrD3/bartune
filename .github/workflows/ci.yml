@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Fail-closed docs-only PR filter (adapted from pasrom/meeting-transcriber).
+  # Non-PR events fall back to `code = 'true'` so push/dispatch always run.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      code: ${{ steps.filter.outputs.code || 'true' }}
+    steps:
+      - if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+      - if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: .github/filters.yml
+
+  lint:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: macos-26
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install lint tools
+        run: brew install swiftlint swiftformat
+      - name: SwiftFormat
+        run: bash scripts/lint.sh --format-only
+      - name: SwiftLint
+        run: swiftlint lint --strict --reporter github-actions-logging
+
+  test:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+    runs-on: macos-26
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache SwiftPM build
+        uses: actions/cache@v4
+        with:
+          path: .build
+          key: ${{ runner.os }}-spm-${{ hashFiles('Package.swift', 'Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+      - name: Build
+        run: swift build
+      - name: Run unit tests
+        run: swift test
+      - name: Verify .app bundle build
+        run: ./build.sh

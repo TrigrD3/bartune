@@ -5,6 +5,7 @@ APP_NAME="BarTune"
 BUNDLE_ID="com.arya.BarTune"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_BUNDLE="$SCRIPT_DIR/$APP_NAME.app"
+VERSION="$(tr -d '[:space:]' < "$SCRIPT_DIR/VERSION" 2>/dev/null || echo "0.2.0")"
 
 echo "==> Building $APP_NAME (release)..."
 cd "$SCRIPT_DIR"
@@ -36,7 +37,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>$VERSION</string>
     <key>CFBundleVersion</key>
     <string>2</string>
     <key>LSMinimumSystemVersion</key>
@@ -57,7 +58,24 @@ if [[ "${1:-}" == "--install" ]]; then
     rm -rf "/Applications/$APP_NAME.app"
     cp -R "$APP_BUNDLE" "/Applications/$APP_NAME.app"
     echo "==> Installed! Launch with: open -a $APP_NAME"
+elif [[ "${1:-}" == "--dmg" ]]; then
+    DIST_DIR="$SCRIPT_DIR/dist"
+    DMG_NAME="$APP_NAME-$VERSION.dmg"
+    DMG_PATH="$DIST_DIR/$DMG_NAME"
+    STAGING_DIR="$(mktemp -d)"
+    trap 'rm -rf "$STAGING_DIR"' EXIT
+
+    mkdir -p "$DIST_DIR"
+    cp -R "$APP_BUNDLE" "$STAGING_DIR/"
+    ln -s /Applications "$STAGING_DIR/Applications"
+
+    echo "==> Creating $DMG_PATH..."
+    rm -f "$DMG_PATH" "$DMG_PATH.sha256"
+    hdiutil create -volname "$APP_NAME" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_PATH"
+    (cd "$DIST_DIR" && shasum -a 256 "$DMG_NAME" > "$DMG_NAME.sha256")
+    echo "==> Created $DMG_PATH"
 else
     echo "==> Built $APP_BUNDLE"
     echo "    Run ./build.sh --install to install to /Applications"
+    echo "    Run ./build.sh --dmg to package dist/$APP_NAME-$VERSION.dmg"
 fi
