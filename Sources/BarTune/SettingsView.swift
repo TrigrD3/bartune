@@ -90,6 +90,7 @@ struct SettingsView: View {
                 Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
                 Toggle("Show Animated Equalizer", isOn: $state.showEqualizer)
                 Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
+                Toggle("Korean → Romanized", isOn: $state.romanizeKorean)
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
