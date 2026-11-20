@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "LeftBarLyrics",
+    name: "BarTune",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "LeftBarLyrics", targets: ["LeftBarLyrics"])
+        .executable(name: "BarTune", targets: ["BarTune"])
     ],
     targets: [
         .executableTarget(
-            name: "LeftBarLyrics",
-            path: "Sources/LeftBarLyrics"
+            name: "BarTune",
+            path: "Sources/BarTune"
         )
     ]
 )

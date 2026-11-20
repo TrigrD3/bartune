@@ -3,6 +3,7 @@ import AppKit
 
 struct EqualizerIconView: View {
     let isPlaying: Bool
+    let tint: Color
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 0.12, paused: !isPlaying)) { timeline in
@@ -11,7 +12,7 @@ struct EqualizerIconView: View {
                 ForEach(0..<3, id: \.self) { idx in
                     let wave = isPlaying ? (0.35 + 0.65 * abs(sin(t * 4.5 + Double(idx) * 1.4))) : 0.25
                     Capsule()
-                        .fill(Color.accentColor)
+                        .fill(tint)
                         .frame(width: 2, height: max(3, 10 * wave))
                 }
             }
@@ -23,7 +24,9 @@ struct EqualizerIconView: View {
 struct KaraokeLineView: View {
     let text: String
     let progress: Double
-    let fontSize: Double
+    let font: Font
+    let unsungColor: Color
+    let sungColor: Color
     let karaokeEnabled: Bool
 
     @State private var textWidth: CGFloat = 0
@@ -38,17 +41,15 @@ struct KaraokeLineView: View {
 
             ZStack(alignment: .leading) {
                 if karaokeEnabled {
-                    // Unsung base text
                     Text(text)
-                        .font(.system(size: fontSize, weight: .medium))
-                        .foregroundStyle(Color.primary.opacity(0.36))
+                        .font(font)
+                        .foregroundStyle(unsungColor)
                         .fixedSize(horizontal: true, vertical: false)
                         .background(widthReader)
 
-                    // Sung karaoke highlighted text with smooth feathered sweep mask
                     Text(text)
-                        .font(.system(size: fontSize, weight: .medium))
-                        .foregroundStyle(Color.primary)
+                        .font(font)
+                        .foregroundStyle(sungColor)
                         .fixedSize(horizontal: true, vertical: false)
                         .mask(
                             GeometryReader { maskGeo in
@@ -72,8 +73,8 @@ struct KaraokeLineView: View {
                         )
                 } else {
                     Text(text)
-                        .font(.system(size: fontSize, weight: .medium))
-                        .foregroundStyle(Color.primary)
+                        .font(font)
+                        .foregroundStyle(sungColor)
                         .fixedSize(horizontal: true, vertical: false)
                         .background(widthReader)
                 }
@@ -133,19 +134,59 @@ struct CursorCutoutMask: View {
 struct LyricsOverlayView: View {
     @ObservedObject var state: LyricsState
 
+    private var activeBackdropColor: Color {
+        if state.themeMode == .albumTint, let colors = state.albumColors {
+            return Color(nsColor: colors.backdropNSColor).opacity(state.backgroundOpacity)
+        }
+        return Color(nsColor: .windowBackgroundColor).opacity(state.backgroundOpacity)
+    }
+
+    private var activeEqualizerColor: Color {
+        if state.themeMode != .system, let colors = state.albumColors {
+            return Color(nsColor: colors.accentNSColor)
+        }
+        return Color.accentColor
+    }
+
+    private var activeSungColor: Color {
+        switch state.themeMode {
+        case .system:
+            return Color.primary
+        case .albumAccent:
+            if let colors = state.albumColors {
+                return Color(nsColor: colors.accentNSColor)
+            }
+            return Color.primary
+        case .albumTint:
+            return Color.white
+        }
+    }
+
+    private var activeUnsungColor: Color {
+        switch state.themeMode {
+        case .albumTint:
+            return Color.white.opacity(0.40)
+        case .system, .albumAccent:
+            return Color.primary.opacity(0.36)
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .leading) {
-            Color(nsColor: .windowBackgroundColor).opacity(state.backgroundOpacity)
+            activeBackdropColor
+                .animation(.easeInOut(duration: 0.45), value: state.albumColors?.accentR)
 
             HStack(spacing: 7) {
                 if state.showEqualizer {
-                    EqualizerIconView(isPlaying: state.isPlaying)
+                    EqualizerIconView(isPlaying: state.isPlaying, tint: activeEqualizerColor)
                 }
 
                 KaraokeLineView(
                     text: state.currentText,
                     progress: state.lineProgress,
-                    fontSize: state.fontSize,
+                    font: state.fontOption.font(size: state.fontSize, weight: state.fontWeight),
+                    unsungColor: activeUnsungColor,
+                    sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled
                 )
                 .id(state.currentLineId)

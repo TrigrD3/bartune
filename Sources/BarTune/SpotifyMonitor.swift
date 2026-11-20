@@ -18,24 +18,40 @@ final class SpotifyMonitor {
     private var lastPollDate: Date = .now
 
     private static let scriptSource = """
+    set sep to character id 31
     if application "Spotify" is running then
         tell application "Spotify"
             set pState to player state as string
-            if pState is "stopped" then
-                return "STOPPED"
+            if pState is "playing" then
+                set tId to "spotify:" & (id of current track as string)
+                set tName to name of current track as string
+                set tArtist to artist of current track as string
+                set tAlbum to album of current track as string
+                set tDur to duration of current track as string
+                set tPos to player position as string
+                set tArt to ""
+                try
+                    set tArt to artwork url of current track as string
+                end try
+                return "SPOTIFY" & sep & pState & sep & tId & sep & tName & sep & tArtist & sep & tAlbum & sep & tDur & sep & tPos & sep & tArt
             end if
-            set tId to id of current track as string
-            set tName to name of current track as string
-            set tArtist to artist of current track as string
-            set tAlbum to album of current track as string
-            set tDur to duration of current track as string
-            set tPos to player position as string
-            set sep to character id 31
-            return "RUNNING" & sep & pState & sep & tId & sep & tName & sep & tArtist & sep & tAlbum & sep & tDur & sep & tPos
         end tell
-    else
-        return "NOT_RUNNING"
     end if
+    if application "Music" is running then
+        tell application "Music"
+            set pState to player state as string
+            if pState is "playing" then
+                set tId to "music:" & (persistent ID of current track as string)
+                set tName to name of current track as string
+                set tArtist to artist of current track as string
+                set tAlbum to album of current track as string
+                set tDur to duration of current track as string
+                set tPos to player position as string
+                return "MUSIC" & sep & pState & sep & tId & sep & tName & sep & tArtist & sep & tAlbum & sep & tDur & sep & tPos & sep & ""
+            end if
+        end tell
+    end if
+    return "IDLE"
     """
 
     private let compiledScript: NSAppleScript?
@@ -75,24 +91,8 @@ final class SpotifyMonitor {
         let result = script.executeAndReturnError(&error)
         let now = Date()
 
-        guard error == nil, let raw = result.stringValue else {
+        guard error == nil, let raw = result.stringValue, raw != "IDLE" else {
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
-            lastSnapshot = snapshot
-            lastPollDate = now
-            onUpdate?(snapshot)
-            return
-        }
-
-        if raw == "NOT_RUNNING" {
-            let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
-            lastSnapshot = snapshot
-            lastPollDate = now
-            onUpdate?(snapshot)
-            return
-        }
-
-        if raw == "STOPPED" {
-            let snapshot = PlaybackSnapshot(isRunning: true, isPlaying: false, track: nil, position: 0)
             lastSnapshot = snapshot
             lastPollDate = now
             onUpdate?(snapshot)
@@ -100,8 +100,9 @@ final class SpotifyMonitor {
         }
 
         let parts = raw.components(separatedBy: "\u{1F}")
-        guard parts.count >= 8, parts[0] == "RUNNING" else { return }
+        guard parts.count >= 8 else { return }
 
+        let source = parts[0]
         let isPlaying = parts[1].lowercased() == "playing"
         let trackId = parts[2]
         let title = parts[3]
@@ -109,15 +110,19 @@ final class SpotifyMonitor {
         let album = parts[5]
 
         // Locale-safe decimal parsing: AppleScript `as string` uses `,` in locales like en_ID, de_DE, uk_UA.
-        let durationMs = Self.parseLocaleDouble(parts[6]) ?? 0
+        let rawDuration = Self.parseLocaleDouble(parts[6]) ?? 0
+        // Spotify returns duration in milliseconds; Apple Music returns seconds.
+        let durationSec = (source == "SPOTIFY") ? (rawDuration / 1000.0) : rawDuration
         let positionSec = Self.parseLocaleDouble(parts[7]) ?? 0
+        let artworkURL = parts.count >= 9 && !parts[8].isEmpty ? parts[8] : nil
 
         let track = TrackInfo(
             id: trackId,
             title: title,
             artist: artist,
             album: album,
-            duration: durationMs / 1000.0
+            duration: durationSec,
+            artworkURL: artworkURL
         )
 
         let snapshot = PlaybackSnapshot(

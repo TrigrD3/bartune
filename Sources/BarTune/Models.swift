@@ -6,6 +6,7 @@ struct TrackInfo: Equatable {
     let artist: String
     let album: String
     let duration: Double // seconds
+    let artworkURL: String?
 }
 
 struct LyricLine: Identifiable, Equatable {

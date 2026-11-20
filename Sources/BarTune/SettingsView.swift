@@ -32,20 +32,61 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Lyrics & Appearance") {
-                Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
-                Toggle("Show Animated Equalizer", isOn: $state.showEqualizer)
+            Section("Color Theme") {
+                Picker("Theme", selection: $state.themeMode) {
+                    ForEach(ThemeMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                HStack(spacing: 8) {
+                    Text(state.themeMode.description)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    if let colors = state.albumColors {
+                        HStack(spacing: 4) {
+                            Circle()
+                                .fill(Color(nsColor: colors.accentNSColor))
+                                .frame(width: 12, height: 12)
+                            Circle()
+                                .fill(Color(nsColor: colors.backdropNSColor))
+                                .frame(width: 12, height: 12)
+                        }
+                        .help("Current album colors")
+                    }
+                }
+            }
+
+            Section("Typography & Appearance") {
+                Picker("Font", selection: $state.fontOption) {
+                    ForEach(FontOption.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+
+                Picker("Weight", selection: $state.fontWeight) {
+                    ForEach(FontWeightOption.allCases) { weight in
+                        Text(weight.title).tag(weight)
+                    }
+                }
+                .pickerStyle(.segmented)
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Font Size")
                         Spacer()
-                        Text("\(Int(state.fontSize)) pt")
+                        Text(String(format: "%.1f pt", state.fontSize))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $state.fontSize, in: 11...15, step: 0.5)
                 }
+
+                Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
+                Toggle("Show Animated Equalizer", isOn: $state.showEqualizer)
+                Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
@@ -77,7 +118,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 420, height: 390)
+        .frame(width: 440, height: 570)
     }
 }
 
@@ -99,7 +140,7 @@ final class SettingsWindowController {
 
         let hosting = NSHostingController(rootView: SettingsView(state: state))
         let win = NSWindow(contentViewController: hosting)
-        win.title = "LeftBar Lyrics Settings"
+        win.title = "BarTune Settings"
         win.styleMask = [.titled, .closable]
         win.isReleasedWhenClosed = false
         win.center()

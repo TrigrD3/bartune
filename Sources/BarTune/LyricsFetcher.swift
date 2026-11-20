@@ -42,7 +42,7 @@ actor LyricsFetcher {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
-        request.setValue("LeftBarLyrics/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
+        request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -67,7 +67,7 @@ actor LyricsFetcher {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 8
-        request.setValue("LeftBarLyrics/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
+        request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
             let (data, response) = try await URLSession.shared.data(for: request)

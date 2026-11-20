@@ -1,24 +1,23 @@
-# LeftBar Lyrics
+# BarTune
 
-A lightweight native macOS app that displays real-time synced Spotify lyrics in the menu bar **to the left of the MacBook notch** — never overlapping your browser tabs or windows.
+A lightweight native macOS app that displays real-time karaoke lyrics in the menu bar **to the left of the MacBook notch** — never overlapping your browser tabs or windows.
 
-Hover your mouse over the left menu bar area and the lyrics instantly fade away to reveal your normal `File, Edit, View, Window, Help` menus. Move your cursor away and the lyrics smoothly return.
+Supports **Spotify** and **Apple Music** out of the box with no login or API keys.
 
 ## Features
 
-- **Left-of-Notch Menu Bar Placement** — Uses `NSScreen.auxiliaryTopLeftArea` on notched MacBooks so lyrics sit strictly inside the menu bar height (never covering tabs).
-- **Hover-to-Reveal App Menus** — Moving your mouse into the left menu bar instantly hides the lyrics and passes clicks straight through to `File, Edit, View, Window, Help`.
-- **Locale-Safe Spotify Sync** — Reads playback directly from Spotify Desktop via AppleScript with comma-decimal support (`en_ID`, `de_DE`, `uk_UA`, etc.).
-- **No Login or API Keys** — Fetches time-synced LRC lyrics from [LRCLIB](https://lrclib.net).
-- **Auto-Hide When Paused** — Automatically reveals your normal menu bar whenever Spotify is paused or closed.
-- **Sync Offset Controls** — Click the `♫` icon on the right side of the menu bar to toggle lyrics or nudge timing (`±0.5s`).
+- **Left-of-Notch Menu Bar Placement** — Uses `NSScreen.auxiliaryTopLeftArea` on notched MacBooks so lyrics sit strictly inside the menu bar height.
+- **Hover-to-Reveal App Menus** — Switch in Settings between **Cursor Spotlight** (peeks only the menu item under your pointer) and **Hide Entire Bar** (fades out the full strip on hover).
+- **Karaoke Sweep Animation** — Smooth 30fps left-to-right highlight with auto-scrolling for long lines and an animated equalizer.
+- **Album Art Color Themes** — Syncs highlight or backdrop colors to the current Spotify album artwork.
+- **Custom Typography** — Choose from 8 font families, 4 weights, and custom font size in Settings (`⌘,`).
+- **Japanese → Romaji** — Built-in offline macOS `CFStringTokenizer` converts Japanese lyrics (Kanji, Hiragana, Katakana) to readable Romaji automatically.
+- **Spotify + Apple Music** — Reads local playback via AppleScript with comma-decimal locale support (`en_ID`, `de_DE`, `uk_UA`, etc.).
 
 ## Build & Install
 
 ```bash
 chmod +x build.sh
 ./build.sh --install
-open -a LeftBarLyrics
+open -a BarTune
 ```
-
-On first launch, allow macOS **Automation** permission so LeftBar Lyrics can read the currently playing song from Spotify.

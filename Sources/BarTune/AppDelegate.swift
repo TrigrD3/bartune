@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state = LyricsState()
     private let spotifyMonitor = SpotifyMonitor()
     private let lyricsFetcher = LyricsFetcher()
+    private let colorExtractor = AlbumArtColorExtractor()
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
 
@@ -17,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var lastFetchedTrackId: String?
     private var fetchTask: Task<Void, Never>?
+    private var colorTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -57,12 +59,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         spotifyMonitor.stop()
         fetchTask?.cancel()
+        colorTask?.cancel()
     }
 
     private func setupStatusBarMenu() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = item.button {
-            button.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "LeftBar Lyrics")
+            button.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "BarTune")
             button.image?.isTemplate = true
         }
 
@@ -81,7 +84,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggleItem)
         self.toggleMenuItem = toggleItem
 
-        // Quick-switch Hover Mode submenu
         let hoverMenuItem = NSMenuItem(title: "Hover Mode", action: nil, keyEquivalent: "")
         let hoverSubmenu = NSMenu()
         for mode in HoverMode.allCases {
@@ -120,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsItem.target = self
         menu.addItem(settingsItem)
 
-        let quitItem = NSMenuItem(title: "Quit LeftBar Lyrics", action: #selector(quitApp), keyEquivalent: "q")
+        let quitItem = NSMenuItem(title: "Quit BarTune", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
@@ -139,6 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if lastFetchedTrackId != nil {
                 lastFetchedTrackId = nil
                 fetchTask?.cancel()
+                colorTask?.cancel()
                 state.setTrack(nil, lyrics: [])
             }
             state.updatePlayback(isPlaying: false, position: 0)
@@ -148,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if track.id != lastFetchedTrackId {
             lastFetchedTrackId = track.id
             fetchTask?.cancel()
+            colorTask?.cancel()
             state.setTrack(track, lyrics: [])
 
             fetchTask = Task { [weak self] in
@@ -155,6 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let lyrics = await self.lyricsFetcher.fetchLyrics(for: track)
                 guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
                 self.state.setTrack(track, lyrics: lyrics)
+            }
+
+            colorTask = Task { [weak self] in
+                guard let self else { return }
+                let colors = await self.colorExtractor.extractColors(from: track.artworkURL)
+                guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
+                self.state.albumColors = colors
             }
         }
 

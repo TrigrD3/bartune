@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="LeftBarLyrics"
-BUNDLE_ID="com.arya.LeftBarLyrics"
+APP_NAME="BarTune"
+BUNDLE_ID="com.arya.BarTune"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_BUNDLE="$SCRIPT_DIR/$APP_NAME.app"
 
@@ -32,19 +32,19 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>LeftBar Lyrics</string>
+    <string>BarTune</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
     <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>LeftBar Lyrics needs Automation access to read the currently playing track and playback position from Spotify.</string>
+    <string>BarTune needs Automation access to read the currently playing track and playback position from Spotify.</string>
 </dict>
 </plist>
 EOF
