@@ -24,9 +24,9 @@ jobs:
       code: ${{ steps.filter.outputs.code || 'true' }}
     steps:
       - if: github.event_name == 'pull_request'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - if: github.event_name == 'pull_request'
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4
         id: filter
         with:
           predicate-quantifier: every
@@ -40,13 +40,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-tags: true
 
       - name: Cache SwiftPM build
         if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: .build
           key: ${{ runner.os }}-spm-release-${{ hashFiles('Package.swift', 'Package.resolved') }}
@@ -68,7 +68,7 @@ jobs:
           ./build.sh --dmg
 
       - name: Upload DMG artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: BarTune-${{ steps.version.outputs.version }}.dmg
           path: |
@@ -84,7 +84,7 @@ jobs:
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: BarTune ${{ github.ref_name }}
           generate_release_notes: true
