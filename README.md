@@ -1,30 +1,39 @@
-# BarTune
+<p align="center">
+  <img src="docs/logo.png" width="144" height="144" alt="BarTune App Icon" />
+</p>
 
-A lightweight native macOS app that displays real-time karaoke lyrics in the menu bar **to the left of the MacBook notch** — keeping your windows, browser tabs, and screen completely unobstructed.
+<h1 align="center">BarTune</h1>
 
-Supports **Spotify** and **Apple Music** out of the box with no login or API keys required.
+<p align="center">
+  <strong>Real-time karaoke lyrics in your macOS menu bar — tucked cleanly to the left of the MacBook notch.</strong><br/>
+  Zero window overlap. Zero accounts or API keys. Built natively in Swift.
+</p>
 
-## Features
+<p align="center">
+  <a href="https://github.com/TrigrD3/bartune/actions/workflows/ci.yml"><img src="https://github.com/TrigrD3/bartune/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <img src="https://img.shields.io/badge/macOS-13.0%2B-black?logo=apple" alt="macOS 13+" />
+  <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white" alt="Swift 5.9+" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
+</p>
 
-- **Left-of-Notch Menu Bar Placement** — Uses `NSScreen.auxiliaryTopLeftArea` on notched MacBooks so lyrics sit strictly inside the menu bar height.
-- **Hover-to-Reveal App Menus** — Choose in Settings between **Cursor Spotlight** (reveals only the menu item under your pointer with an adjustable cutout width) and **Hide Entire Bar** (fades out the strip on hover).
-- **Word-by-Word & Line Karaoke Sync** — Fetches word-level **NetEase YRC** lyrics when available and falls back to **LRCLIB** (including enhanced word-level LRC `<mm:ss.xx>` and standard LRC), with AppleScript latency compensation and a manual **Timing Offset** (`-5.0s` to `+5.0s`).
-- **GPU-Interpolated Smooth Sweep & Low-CPU Modes** — Smooth left-to-right karaoke highlight with auto-scrolling for long lines and an optional animated equalizer. Switch between **Low CPU (Standard)** and **High Precision (30fps)** in Settings, backed by event-driven playback monitoring and idle timer pause.
-- **Album Art Color Themes** — Syncs highlight or backdrop colors to the currently playing album artwork.
-- **Custom Typography & Appearance** — Configure font family, weight, font size (`11–15 pt`), and background opacity (`70%–100%`) in Settings (`⌘,`).
-- **Japanese → Romaji** — Built-in offline macOS `CFStringTokenizer` converts Japanese lyrics (Kanji, Hiragana, Katakana) to Romaji with an instant toggle.
-- **Spotify + Apple Music + Browser Music** — Reads local playback via AppleScript with comma-decimal locale support (`en_ID`, `de_DE`, `uk_UA`, etc.), and falls back to browser tabs (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web in Chrome, Arc, Brave, Edge, or Safari).
+---
 
-## Requirements
+## Why BarTune?
 
-- **macOS 13.0 (Ventura)** or later
-- **Swift 5.9+** (via Xcode or Xcode Command Line Tools) to build from source
-- **Spotify** and/or **Apple Music** desktop app
-- **Automation** permission for BarTune to read track metadata and playback position
+Most desktop lyrics apps float over your editor, browser tabs, or terminal. **BarTune** lives strictly inside the unused menu bar space to the left of your MacBook notch (`NSScreen.auxiliaryTopLeftArea`), smoothly sweeping lyrics in sync with your music — and instantly stepping aside the moment your cursor hovers over app menus.
+
+## Highlights
+
+- **Left-of-Notch Native Placement** — Sits strictly within the macOS menu bar height so your workspace stays 100% unobstructed.
+- **Hover-to-Reveal App Menus** — Choose between **Cursor Spotlight** (peeks only the menu item under your pointer with an adjustable cutout width) or **Hide Entire Bar** on hover.
+- **Spotify, Apple Music & Browser Music** — Works out of the box with desktop **Spotify** and **Apple Music**, and automatically falls back to **YouTube Music, YouTube, Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari.
+- **Zero-Lag 60fps Karaoke Sweep** — Fetches word-by-word **NetEase YRC** lyrics (with cross-script Kanji/Romaji matching and cover/karaoke filtering) and falls back to **LRCLIB**, rendered via a local `TimelineView` with background AppleScript polling and a `-5.0s` to `+5.0s` **Timing Offset**.
+- **Offline Japanese & Korean Romanization** — Built-in offline **Japanese → Romaji** (`CFStringTokenizer`) and **Korean → Romanized** (Revised Romanization) toggles for instant sing-along readability.
+- **Customizable Visualizers & Album Art Themes** — Pick from 5 visualizer styles (**Bars, Wave, Dots, Vinyl, Note**), sync highlight or backdrop colors to album artwork, and fine-tune typography, font size, weight, and opacity in a clean 3-tab Settings window (`⌘,`).
 
 ## Install
 
-### Homebrew (macOS)
+### Homebrew (Recommended)
 
 ```bash
 brew install --cask TrigrD3/tap/bartune
@@ -32,45 +41,37 @@ brew install --cask TrigrD3/tap/bartune
 
 ### Build from Source
 
+Requires **macOS 13.0 (Ventura)+** and **Swift 5.9+** (Xcode or Xcode Command Line Tools).
+
 ```bash
+git clone https://github.com/TrigrD3/bartune.git
+cd bartune
 chmod +x build.sh
 ./build.sh --install
 open -a BarTune
 ```
 
-To build `BarTune.app` locally in the repository without installing to `/Applications`:
+## Settings (`⌘,`)
 
-```bash
-./build.sh
-```
+BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 3-tab native macOS Settings window:
 
-## Usage & Settings
-
-Once launched, BarTune runs as a menu bar utility (`LSUIElement`) and automatically follows playback from Spotify or Apple Music.
-
-Open **Settings** (`⌘,`) to customize:
-- **Hover Behavior** — *Cursor Spotlight* (with Spotlight Width slider) or *Hide Entire Bar*
-- **Color Theme** — Album art–synced or default theme
-- **Typography & Appearance** — Font family, weight, size, karaoke sweep toggle, equalizer toggle, Japanese → Romaji toggle, and background opacity
-- **Performance & Sync** — *Low CPU (Standard)* vs *High Precision (30fps)* and *Timing Offset*
-
-## Project Structure
-
-```text
-Sources/BarTune/
-├── main.swift                   # App entry point
-├── AppDelegate.swift            # Menu bar status item, Settings shortcut, app lifecycle
-├── OverlayWindowController.swift # Left-of-notch overlay window & hover/spotlight masking
-├── LyricsOverlayView.swift      # Karaoke sweep rendering, auto-scroll, equalizer UI
-├── LyricsState.swift            # Observable state & persisted user preferences
-├── SpotifyMonitor.swift         # Event-driven AppleScript playback monitor (Spotify & Apple Music)
-├── LyricsFetcher.swift          # NetEase YRC & LRCLIB lyrics fetching and caching
-├── Models.swift                 # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
-├── AlbumArtColorExtractor.swift # Dominant/accent color extraction from album artwork
-├── Romanizer.swift              # Offline Japanese → Romaji conversion via CFStringTokenizer
-└── SettingsView.swift           # SwiftUI Settings window
-```
+| Tab | Options |
+| :--- | :--- |
+| **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music toggle |
+| **Appearance** | Color Theme (*System*, *Album Accent*, *Album Tint*), Background Opacity, Font Family, Weight, Size, Karaoke Sweep, Visualizer Style (*Bars / Wave / Dots / Vinyl / Note*) |
+| **Lyrics & Sync** | Japanese → Romaji, Korean → Romanized, Karaoke Precision (*Low CPU* vs *High Precision*), Timing Offset stepper |
 
 ## Permissions
 
-On first launch, macOS will prompt you to grant **Automation** access so BarTune can query Spotify or Apple Music. If lyrics do not appear, check **System Settings → Privacy & Security → Automation** and ensure **BarTune** is allowed to control Spotify / Music.
+- **Automation (Spotify / Apple Music / Browsers):** On first launch, macOS prompts for Automation access so BarTune can read the current track and playback position. Manage this anytime under **System Settings → Privacy & Security → Automation**.
+- **Browser Music (Optional):** To read playback from YouTube Music or web players, enable **Allow JavaScript from Apple Events** once in your browser:
+  - **Chrome / Arc / Brave / Edge:** *View → Developer → Allow JavaScript from Apple Events*
+  - **Safari:** *Safari → Settings → Advanced → Show features for web developers*, then *Develop → Allow JavaScript from Apple Events*
+
+## Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, Conventional Commits, and testing guidelines.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
