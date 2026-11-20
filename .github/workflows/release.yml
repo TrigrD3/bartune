@@ -67,6 +67,12 @@ jobs:
           chmod +x build.sh
           ./build.sh --dmg
 
+      - name: Read DMG SHA256
+        id: sha
+        run: |
+          SHA="$(awk '{print $1}' "dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256")"
+          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v4
         with:
@@ -91,3 +97,24 @@ jobs:
           files: |
             dist/BarTune-${{ steps.version.outputs.version }}.dmg
             dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256
+
+      - name: Update Homebrew tap (TrigrD3/homebrew-tap)
+        if: startsWith(github.ref, 'refs/tags/v') && env.TAP_TOKEN != ''
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+        run: |
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/TrigrD3/homebrew-tap.git" /tmp/homebrew-tap
+          mkdir -p /tmp/homebrew-tap/Casks
+          cp Casks/bartune.rb /tmp/homebrew-tap/Casks/bartune.rb
+          sed -i '' "s/version \".*\"/version \"${VERSION}\"/" /tmp/homebrew-tap/Casks/bartune.rb
+          sed -i '' "s/sha256 .*/sha256 \"${SHA256}\"/" /tmp/homebrew-tap/Casks/bartune.rb
+          cd /tmp/homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/bartune.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(cask): update bartune to ${VERSION}"
+            git push origin main
+          fi

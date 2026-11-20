@@ -22,7 +22,15 @@ Supports **Spotify** and **Apple Music** out of the box with no login or API key
 - **Spotify** and/or **Apple Music** desktop app
 - **Automation** permission for BarTune to read track metadata and playback position
 
-## Build & Install
+## Install
+
+### Homebrew (macOS)
+
+```bash
+brew install --cask TrigrD3/tap/bartune
+```
+
+### Build from Source
 
 ```bash
 chmod +x build.sh
