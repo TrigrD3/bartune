@@ -22,12 +22,51 @@ enum BrowserMediaParser {
         return false
     }
 
+    private static let youtubeNoisePatterns: [String] = [
+        #"\s*[\(\[]\s*(?:official\s+)?(?:music\s+video|lyric\s+video|audio|video|mv|m/v|visualizer|lyrics|hd|4k|hq)\s*[\)\]]"#,
+        #"\s+official\s+(?:music\s+video|lyric\s+video|audio|video|mv|visualizer)$"#,
+    ]
+
     static func cleanTitle(_ raw: String) -> String {
         var title = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Strip leading browser notification badge count, e.g. "(783) Song Title"
+        title = title.replacingOccurrences(
+            of: #"^\(\d+\)\s+"#,
+            with: "",
+            options: .regularExpression
+        )
         for suffix in [" - YouTube Music", " - YouTube", " • Spotify"] where title.hasSuffix(suffix) {
             title = String(title.dropLast(suffix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
         }
-        return title
+        for pattern in youtubeNoisePatterns {
+            title = title.replacingOccurrences(
+                of: pattern,
+                with: "",
+                options: [.regularExpression, .caseInsensitive]
+            )
+        }
+        return title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func cleanArtist(_ raw: String) -> String {
+        var artist = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if artist.hasSuffix(" - Topic") {
+            artist = String(artist.dropLast(" - Topic".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return artist
+    }
+
+    static func splitYouTubeArtistAndTitle(title: String, fallbackArtist: String) -> (artist: String, title: String) {
+        for separator in [" - ", " – ", " — "] {
+            if let range = title.range(of: separator) {
+                let lhs = String(title[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let rhs = String(title[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if !lhs.isEmpty && !rhs.isEmpty {
+                    return (artist: lhs, title: rhs)
+                }
+            }
+        }
+        return (artist: fallbackArtist, title: title)
     }
 
     static func parsePayload(_ raw: String) -> PlaybackSnapshot? {
@@ -41,10 +80,18 @@ enum BrowserMediaParser {
         guard isPlaying else { return nil }
 
         let trackId = parts[2]
-        let title = cleanTitle(parts[3])
+        var title = cleanTitle(parts[3])
         guard !title.isEmpty else { return nil }
 
-        let artist = parts[4].trimmingCharacters(in: .whitespacesAndNewlines)
+        var artist = cleanArtist(parts[4])
+        let isStandardYouTube = trackId.hasPrefix("browser:www.youtube.com:")
+            || trackId.hasPrefix("browser:youtube.com:")
+        if isStandardYouTube {
+            let split = splitYouTubeArtistAndTitle(title: title, fallbackArtist: artist)
+            artist = split.artist
+            title = split.title
+        }
+
         let album = parts[5].trimmingCharacters(in: .whitespacesAndNewlines)
         let durationSec = SpotifyMonitor.parseLocaleDouble(parts[6]) ?? 0
         let positionSec = SpotifyMonitor.parseLocaleDouble(parts[7]) ?? 0
