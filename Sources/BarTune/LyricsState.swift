@@ -122,6 +122,26 @@ enum FontWeightOption: String, CaseIterable, Identifiable {
     }
 }
 
+enum VisualizerStyle: String, CaseIterable, Identifiable {
+    case bars
+    case wave
+    case dots
+    case vinyl
+    case note
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .bars: return "Bars"
+        case .wave: return "Wave"
+        case .dots: return "Dots"
+        case .vinyl: return "Vinyl"
+        case .note: return "Note"
+        }
+    }
+}
+
 @MainActor
 final class LyricsState: ObservableObject {
     private enum Keys {
@@ -129,6 +149,8 @@ final class LyricsState: ObservableObject {
         static let spotlightWidth = "bartune.spotlightWidth"
         static let karaokeEnabled = "bartune.karaokeEnabled"
         static let showEqualizer = "bartune.showEqualizer"
+        static let visualizerStyle = "bartune.visualizerStyle"
+        static let visualizerWidth = "bartune.visualizerWidth"
         static let fontSize = "bartune.fontSize"
         static let backgroundOpacity = "bartune.backgroundOpacity"
         static let themeMode = "bartune.themeMode"
@@ -143,6 +165,10 @@ final class LyricsState: ObservableObject {
     @Published var currentText: String = ""
     @Published var currentLineId: Int = -1
     @Published var lineProgress: Double = 0.0
+    @Published var activeLine: LyricLine? = nil
+    @Published var activeLineNextTimestamp: Double = 0.0
+    var playbackAnchorPosition: Double = 0.0
+    var playbackAnchorDate: Date = .now
     @Published var cursorLocalX: CGFloat? = nil
     @Published var trackSummary: String = "Not Playing"
     @Published var isPlaying: Bool = false
@@ -183,6 +209,14 @@ final class LyricsState: ObservableObject {
 
     @Published var showEqualizer: Bool {
         didSet { UserDefaults.standard.set(showEqualizer, forKey: Keys.showEqualizer) }
+    }
+
+    @Published var visualizerStyle: VisualizerStyle {
+        didSet { UserDefaults.standard.set(visualizerStyle.rawValue, forKey: Keys.visualizerStyle) }
+    }
+
+    @Published var visualizerWidth: Double {
+        didSet { UserDefaults.standard.set(visualizerWidth, forKey: Keys.visualizerWidth) }
     }
 
     @Published var fontSize: Double {
@@ -268,6 +302,14 @@ final class LyricsState: ObservableObject {
 
         self.karaokeAnimationEnabled = ud.object(forKey: Keys.karaokeEnabled) as? Bool ?? true
         self.showEqualizer = ud.object(forKey: Keys.showEqualizer) as? Bool ?? true
+        if let raw = ud.string(forKey: Keys.visualizerStyle), let parsed = VisualizerStyle(rawValue: raw) {
+            self.visualizerStyle = parsed
+        } else {
+            self.visualizerStyle = .bars
+        }
+
+        let storedVisWidth = ud.double(forKey: Keys.visualizerWidth)
+        self.visualizerWidth = storedVisWidth > 0 ? storedVisWidth : 20.0
 
         let storedFont = ud.double(forKey: Keys.fontSize)
         self.fontSize = storedFont > 0 ? storedFont : 13.0
@@ -346,11 +388,14 @@ final class LyricsState: ObservableObject {
 
     func updatePlayback(isPlaying: Bool, position: Double) {
         self.isPlaying = isPlaying
+        playbackAnchorPosition = position
+        playbackAnchorDate = Date()
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
             if !isPlaying {
                 currentText = ""
                 currentLineId = -1
+                activeLine = nil
                 lineProgress = 0.0
             }
             return
@@ -374,45 +419,51 @@ final class LyricsState: ObservableObject {
         if let idx = matchedIndex {
             let line = lines[idx]
             let displayText = line.text.isEmpty ? "♪" : line.text
-
             let nextTimestamp: Double = (idx + 1 < lines.count)
                 ? lines[idx + 1].timestamp
                 : (line.timestamp + 4.5)
-            let rawDuration = max(0.4, nextTimestamp - line.timestamp)
-
-            let progress: Double
-            if !line.words.isEmpty {
-                // Exact word-by-word progress using YRC / enhanced LRC word timestamps
-                progress = Self.computeWordProgress(
-                    words: line.words,
-                    position: effectivePos,
-                    lineEnd: line.duration.map { line.timestamp + $0 } ?? nextTimestamp
-                )
-            } else {
-                // Tempo-adaptive pacing when only line-level timestamps exist
-                let effectiveDuration: Double
-                if let exactDur = line.duration {
-                    effectiveDuration = max(0.4, exactDur)
-                } else if rawDuration <= 10.0 {
-                    effectiveDuration = max(0.5, rawDuration * 0.90)
-                } else {
-                    let breakCap = max(4.5, Double(displayText.count) * 0.16)
-                    effectiveDuration = min(rawDuration * 0.85, breakCap)
-                }
-                let elapsed = max(0.0, effectivePos - line.timestamp)
-                progress = min(1.0, max(0.0, elapsed / effectiveDuration))
-            }
 
             if line.id != currentLineId {
                 currentLineId = line.id
                 currentText = displayText
+                activeLine = line
+                activeLineNextTimestamp = nextTimestamp
             }
-            lineProgress = progress
         } else if currentLineId != -1 {
             currentLineId = -1
             currentText = "♪"
+            activeLine = nil
             lineProgress = 0.0
         }
+    }
+
+    func liveProgress(at date: Date) -> Double {
+        guard isPlaying, let line = activeLine else { return 0.0 }
+        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
+        let effectivePos = playbackAnchorPosition + elapsedSinceAnchor + offsetSeconds
+        return Self.computeLineProgress(line: line, nextTimestamp: activeLineNextTimestamp, position: effectivePos)
+    }
+
+    static func computeLineProgress(line: LyricLine, nextTimestamp: Double, position: Double) -> Double {
+        let rawDuration = max(0.4, nextTimestamp - line.timestamp)
+        if !line.words.isEmpty {
+            return computeWordProgress(
+                words: line.words,
+                position: position,
+                lineEnd: line.duration.map { line.timestamp + $0 } ?? nextTimestamp
+            )
+        }
+        let effectiveDuration: Double
+        if let exactDur = line.duration {
+            effectiveDuration = max(0.4, exactDur)
+        } else if rawDuration <= 10.0 {
+            effectiveDuration = max(0.5, rawDuration * 0.90)
+        } else {
+            let breakCap = max(4.5, Double(max(1, line.text.count)) * 0.16)
+            effectiveDuration = min(rawDuration * 0.85, breakCap)
+        }
+        let elapsed = max(0.0, position - line.timestamp)
+        return min(1.0, max(0.0, elapsed / effectiveDuration))
     }
 
     private static func computeWordProgress(

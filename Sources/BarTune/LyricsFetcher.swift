@@ -42,23 +42,34 @@ enum LyricsMatcher {
     }
 
     static func selectBestNetEaseSong(_ songs: [NetEaseSongCandidate], for track: TrackInfo) -> NetEaseSongCandidate? {
-        let valid = songs.filter { song in
-            guard artistMatches(candidateArtists: song.artists, expectedArtist: track.artist) else {
-                return false
-            }
-            guard !isUnwantedVariant(candidateTitle: song.name, expectedTitle: track.title) else {
-                return false
-            }
-            if let durMs = song.durationMs, abs(durMs / 1000.0 - track.duration) > 6.0 {
-                return false
-            }
-            return true
+        let nonVariant = songs.filter {
+            !isUnwantedVariant(candidateTitle: $0.name, expectedTitle: track.title)
         }
 
-        return valid.min { lhs, rhs in
-            let d1 = abs((lhs.durationMs ?? 0) / 1000.0 - track.duration)
-            let d2 = abs((rhs.durationMs ?? 0) / 1000.0 - track.duration)
-            return d1 < d2
+        // 1. Prefer candidates with a matching artist within 6s duration tolerance.
+        let artistMatched = nonVariant.filter { song in
+            let durDiff = song.durationMs.map { abs($0 / 1000.0 - track.duration) } ?? 0
+            return artistMatches(candidateArtists: song.artists, expectedArtist: track.artist) && durDiff <= 6.0
+        }
+        if let best = artistMatched.min(by: {
+            abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
+        }) {
+            return best
+        }
+
+        // 2. Cross-script fallback (e.g. Kanji "澤野弘之" vs Romaji "Sawano Hiroyuki"):
+        // require a non-ASCII artist name, exact normalized title, and duration within 1.5s.
+        let expectedNormTitle = normalize(track.title)
+        guard !expectedNormTitle.isEmpty else { return nil }
+        let crossScript = nonVariant.filter { song in
+            let hasNonASCIIArtist = song.artists.contains { artist in
+                artist.unicodeScalars.contains { !$0.isASCII }
+            }
+            let durDiff = song.durationMs.map { abs($0 / 1000.0 - track.duration) } ?? 999
+            return hasNonASCIIArtist && normalize(song.name) == expectedNormTitle && durDiff <= 1.5
+        }
+        return crossScript.min {
+            abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
         }
     }
 }

@@ -55,4 +55,23 @@ final class LyricsMatcherTests: XCTestCase {
         let selected = LyricsMatcher.selectBestNetEaseSong(candidates, for: track)
         XCTAssertEqual(selected?.id, 2)
     }
+
+    func testMatchesCrossScriptArtistWhenTitleAndDurationMatchTightly() {
+        let track = TrackInfo(
+            id: "spotify:track:reluctant",
+            title: "The Reluctant Heroes",
+            artist: "Sawano Hiroyuki",
+            album: "Attack on Titan",
+            duration: 267.12,
+            artworkURL: nil
+        )
+
+        let candidates: [NetEaseSongCandidate] = [
+            NetEaseSongCandidate(id: 26_562_718, name: "The Reluctant Heroes", artists: ["澤野弘之", "mpi"], durationMs: 267_120),
+            NetEaseSongCandidate(id: 29_732_966, name: "The Reluctant Heroes(Instrumental)", artists: ["澤野弘之"], durationMs: 268_333),
+        ]
+
+        let selected = LyricsMatcher.selectBestNetEaseSong(candidates, for: track)
+        XCTAssertEqual(selected?.id, 26_562_718)
+    }
 }

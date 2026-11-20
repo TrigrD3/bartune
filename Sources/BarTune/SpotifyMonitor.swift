@@ -19,7 +19,9 @@ final class SpotifyMonitor {
     private var lowCPUMode: Bool = true
     private var browserMusicEnabled: Bool = true
     private var isStarted: Bool = false
+    private var isPolling: Bool = false
     private let browserMonitor = BrowserMediaMonitor()
+    private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
 
     private var spotifyObserver: NSObjectProtocol?
     private var musicObserver: NSObjectProtocol?
@@ -146,7 +148,9 @@ final class SpotifyMonitor {
             return
         }
 
-        let desiredInterval: TimeInterval = lowCPUMode ? 0.12 : 0.033
+        // Only drives line-boundary transitions; smooth 60fps/30fps sweep is rendered
+        // directly inside KaraokeLineView via TimelineView without @Published churn.
+        let desiredInterval: TimeInterval = lowCPUMode ? 0.15 : 0.05
         if let existing = interpolationTimer, abs(existing.timeInterval - desiredInterval) < 0.005 {
             return
         }
@@ -160,17 +164,32 @@ final class SpotifyMonitor {
     }
 
     private func poll() {
-        guard let script = compiledScript else { return }
+        guard !isPolling else { return }
+        isPolling = true
+        let allowBrowser = browserMusicEnabled
+        let scriptSource = Self.scriptSource
 
-        let pollStart = Date()
-        var error: NSDictionary?
-        let result = script.executeAndReturnError(&error)
-        let pollEnd = Date()
-        // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
-        let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
+        scriptQueue.async { [weak self] in
+            let pollStart = Date()
+            var error: NSDictionary?
+            let script = NSAppleScript(source: scriptSource)
+            let result = script?.executeAndReturnError(&error)
+            let pollEnd = Date()
+            // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
+            let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
+            let raw = (error == nil) ? result?.stringValue : nil
 
-        guard error == nil, let raw = result.stringValue, raw != "IDLE" else {
-            if browserMusicEnabled, let browserSnap = browserMonitor.poll() {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.isPolling = false }
+                self.handlePollResult(raw: raw, now: now, allowBrowser: allowBrowser)
+            }
+        }
+    }
+
+    private func handlePollResult(raw: String?, now: Date, allowBrowser: Bool) {
+        guard let raw, raw != "IDLE" else {
+            if allowBrowser, let browserSnap = browserMonitor.poll() {
                 lastSnapshot = browserSnap
                 lastPollDate = Date()
                 updateInterpolationTimer(isPlaying: browserSnap.isPlaying)
