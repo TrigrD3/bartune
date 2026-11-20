@@ -87,9 +87,12 @@ final class SpotifyMonitor {
     private func poll() {
         guard let script = compiledScript else { return }
 
+        let pollStart = Date()
         var error: NSDictionary?
         let result = script.executeAndReturnError(&error)
-        let now = Date()
+        let pollEnd = Date()
+        // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
+        let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
 
         guard error == nil, let raw = result.stringValue, raw != "IDLE" else {
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)

@@ -11,18 +11,27 @@ struct TrackInfo: Equatable {
 
 struct WordTimestamp: Equatable {
     let timestamp: Double // seconds
+    let duration: Double? // seconds (exact duration when provided by YRC)
     let text: String
+
+    init(timestamp: Double, duration: Double? = nil, text: String) {
+        self.timestamp = timestamp
+        self.duration = duration
+        self.text = text
+    }
 }
 
 struct LyricLine: Identifiable, Equatable {
     let id: Int
     let timestamp: Double // seconds
+    let duration: Double? // seconds (exact line duration when provided by YRC)
     let text: String
     let words: [WordTimestamp]
 
-    init(id: Int, timestamp: Double, text: String, words: [WordTimestamp] = []) {
+    init(id: Int, timestamp: Double, duration: Double? = nil, text: String, words: [WordTimestamp] = []) {
         self.id = id
         self.timestamp = timestamp
+        self.duration = duration
         self.text = text
         self.words = words
     }
@@ -89,7 +98,6 @@ enum LRCParser {
         return minutes * 60.0 + seconds + fraction
     }
 
-    /// Parses enhanced LRC word tags like `<00:12.34>hello <00:12.80>world`.
     private static func parseEnhancedWords(_ body: String) -> (String, [WordTimestamp]) {
         let nsBody = body as NSString
         let fullRange = NSRange(location: 0, length: nsBody.length)
@@ -114,5 +122,71 @@ enum LRCParser {
 
         let joined = cleanParts.joined().trimmingCharacters(in: .whitespacesAndNewlines)
         return (joined.isEmpty ? body : joined, words)
+    }
+}
+
+/// Parses NetEase YRC word-level karaoke format: `[lineStartMs,lineDurMs](wordStartMs,wordDurMs,0)word...`
+enum YRCParser {
+    private static let lineHeaderRegex = try! NSRegularExpression(
+        pattern: #"^\[(\d+),(\d+)\](.*)$"#
+    )
+    private static let wordRegex = try! NSRegularExpression(
+        pattern: #"\((\d+),(\d+),\d+\)([^(]*)"#
+    )
+
+    static func parse(_ yrc: String) -> [LyricLine] {
+        var result: [LyricLine] = []
+
+        for rawLine in yrc.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard line.hasPrefix("[") else { continue }
+
+            let nsLine = line as NSString
+            let fullRange = NSRange(location: 0, length: nsLine.length)
+            guard let header = lineHeaderRegex.firstMatch(in: line, range: fullRange) else { continue }
+
+            guard let startMs = Double(nsLine.substring(with: header.range(at: 1))),
+                  let durMs = Double(nsLine.substring(with: header.range(at: 2))) else { continue }
+
+            let body = nsLine.substring(with: header.range(at: 3))
+            let nsBody = body as NSString
+            let bodyRange = NSRange(location: 0, length: nsBody.length)
+            let wordMatches = wordRegex.matches(in: body, range: bodyRange)
+            guard !wordMatches.isEmpty else { continue }
+
+            var words: [WordTimestamp] = []
+            var joined = ""
+
+            for wm in wordMatches {
+                guard let wStartMs = Double(nsBody.substring(with: wm.range(at: 1))),
+                      let wDurMs = Double(nsBody.substring(with: wm.range(at: 2))) else { continue }
+                let segment = nsBody.substring(with: wm.range(at: 3))
+                if !segment.isEmpty {
+                    words.append(WordTimestamp(
+                        timestamp: wStartMs / 1000.0,
+                        duration: max(0.03, wDurMs / 1000.0),
+                        text: segment
+                    ))
+                    joined += segment
+                }
+            }
+
+            let trimmed = joined.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+
+            result.append(LyricLine(
+                id: result.count,
+                timestamp: startMs / 1000.0,
+                duration: max(0.2, durMs / 1000.0),
+                text: trimmed,
+                words: words
+            ))
+        }
+
+        return result.sorted { $0.timestamp < $1.timestamp }
+            .enumerated()
+            .map { idx, line in
+                LyricLine(id: idx, timestamp: line.timestamp, duration: line.duration, text: line.text, words: line.words)
+            }
     }
 }

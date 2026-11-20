@@ -258,9 +258,27 @@ final class LyricsState: ObservableObject {
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
         if isJapaneseSong {
             romanizedLines = lyrics.map { line in
-                LyricLine(
+                if !line.words.isEmpty {
+                    let romWords = line.words.map { w in
+                        WordTimestamp(
+                            timestamp: w.timestamp,
+                            duration: w.duration,
+                            text: JapaneseRomanizer.romanizeLine(w.text) + " "
+                        )
+                    }
+                    let joined = romWords.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
+                    return LyricLine(
+                        id: line.id,
+                        timestamp: line.timestamp,
+                        duration: line.duration,
+                        text: joined,
+                        words: romWords
+                    )
+                }
+                return LyricLine(
                     id: line.id,
                     timestamp: line.timestamp,
+                    duration: line.duration,
                     text: JapaneseRomanizer.romanizeLine(line.text)
                 )
             }
@@ -324,18 +342,19 @@ final class LyricsState: ObservableObject {
             let rawDuration = max(0.4, nextTimestamp - line.timestamp)
 
             let progress: Double
-            if !line.words.isEmpty && !(romanizeJapanese && isJapaneseSong) {
-                // Exact word-by-word progress when enhanced LRC word timestamps are present
+            if !line.words.isEmpty {
+                // Exact word-by-word progress using YRC / enhanced LRC word timestamps
                 progress = Self.computeWordProgress(
                     words: line.words,
                     position: effectivePos,
-                    lineEnd: nextTimestamp
+                    lineEnd: line.duration.map { line.timestamp + $0 } ?? nextTimestamp
                 )
             } else {
-                // Tempo-adaptive pacing: follows the song's real line interval (slow ballads glide slowly,
-                // fast tracks sweep briskly) while capping long instrumental breaks.
+                // Tempo-adaptive pacing when only line-level timestamps exist
                 let effectiveDuration: Double
-                if rawDuration <= 10.0 {
+                if let exactDur = line.duration {
+                    effectiveDuration = max(0.4, exactDur)
+                } else if rawDuration <= 10.0 {
                     effectiveDuration = max(0.5, rawDuration * 0.90)
                 } else {
                     let breakCap = max(4.5, Double(displayText.count) * 0.16)
@@ -367,13 +386,14 @@ final class LyricsState: ObservableObject {
 
         for (i, word) in words.enumerated() {
             let wordStart = word.timestamp
-            let wordEnd = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
+            let fallbackEnd = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
+            let wordEnd = word.duration.map { wordStart + $0 } ?? fallbackEnd
             let wordChars = word.text.count
 
             if position < wordStart {
                 return Double(charsBefore) / Double(totalChars)
             } else if position < wordEnd {
-                let wordDur = max(0.05, wordEnd - wordStart)
+                let wordDur = max(0.04, wordEnd - wordStart)
                 let frac = min(1.0, max(0.0, (position - wordStart) / wordDur))
                 return (Double(charsBefore) + Double(wordChars) * frac) / Double(totalChars)
             }
