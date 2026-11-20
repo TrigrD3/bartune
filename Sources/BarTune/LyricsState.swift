@@ -143,6 +143,39 @@ enum VisualizerStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum VisualizerColorTheme: String, CaseIterable, Identifiable {
+    case matchTheme
+    case systemAccent
+    case neonCyan
+    case sunset
+    case emerald
+    case monochrome
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .matchTheme: return "Match Theme"
+        case .systemAccent: return "System Accent"
+        case .neonCyan: return "Neon Cyan"
+        case .sunset: return "Sunset"
+        case .emerald: return "Emerald"
+        case .monochrome: return "Monochrome"
+        }
+    }
+
+    func resolvedColor(fallback: Color) -> Color {
+        switch self {
+        case .matchTheme: return fallback
+        case .systemAccent: return Color.accentColor
+        case .neonCyan: return Color(red: 0.15, green: 0.85, blue: 0.98)
+        case .sunset: return Color(red: 1.0, green: 0.48, blue: 0.32)
+        case .emerald: return Color(red: 0.22, green: 0.86, blue: 0.56)
+        case .monochrome: return Color.primary
+        }
+    }
+}
+
 enum LyricsCacheLimit: Int, CaseIterable, Identifiable {
     case songs100 = 100
     case songs250 = 250
@@ -174,6 +207,7 @@ final class LyricsState: ObservableObject {
         static let showEqualizer = "bartune.showEqualizer"
         static let animateVisualizer = "bartune.animateVisualizer"
         static let visualizerStyle = "bartune.visualizerStyle"
+        static let visualizerColorTheme = "bartune.visualizerColorTheme"
         static let visualizerWidth = "bartune.visualizerWidth"
         static let fontSize = "bartune.fontSize"
         static let backgroundOpacity = "bartune.backgroundOpacity"
@@ -183,6 +217,8 @@ final class LyricsState: ObservableObject {
         static let romanizeJapanese = "bartune.romanizeJapanese"
         static let romanizeKorean = "bartune.romanizeKorean"
         static let romanizeChinese = "bartune.romanizeChinese"
+        static let translateLyrics = "bartune.translateLyrics"
+        static let translationLanguage = "bartune.translationLanguage"
         static let lowCPUMode = "bartune.lowCPUMode"
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
         static let trackOffsets = "bartune.trackOffsets"
@@ -257,7 +293,11 @@ final class LyricsState: ObservableObject {
     }
 
     @Published var visualizerStyle: VisualizerStyle {
-        didSet { UserDefaults.standard.set(visualizerStyle.rawValue, forKey: Keys.visualizerStyle) }
+        didSet { userDefaults.set(visualizerStyle.rawValue, forKey: Keys.visualizerStyle) }
+    }
+
+    @Published var visualizerColorTheme: VisualizerColorTheme {
+        didSet { userDefaults.set(visualizerColorTheme.rawValue, forKey: Keys.visualizerColorTheme) }
     }
 
     @Published var visualizerWidth: Double {
@@ -289,6 +329,21 @@ final class LyricsState: ObservableObject {
     @Published var romanizeChinese: Bool {
         didSet {
             userDefaults.set(romanizeChinese, forKey: Keys.romanizeChinese)
+            refreshCurrentLineText()
+        }
+    }
+
+    @Published var translateLyrics: Bool {
+        didSet {
+            userDefaults.set(translateLyrics, forKey: Keys.translateLyrics)
+            refreshCurrentLineText()
+        }
+    }
+
+    @Published var translationLanguage: TranslationLanguage {
+        didSet {
+            userDefaults.set(translationLanguage.rawValue, forKey: Keys.translationLanguage)
+            translatedLines = []
             refreshCurrentLineText()
         }
     }
@@ -336,6 +391,7 @@ final class LyricsState: ObservableObject {
     private var romanizedLines: [LyricLine] = []
     private var koreanRomanizedLines: [LyricLine] = []
     private var chineseRomanizedLines: [LyricLine] = []
+    private var translatedLines: [LyricLine] = []
     private var isJapaneseSong: Bool = false
     private var isKoreanSong: Bool = false
     private var isChineseSong: Bool = false
@@ -344,7 +400,12 @@ final class LyricsState: ObservableObject {
     private var isRestoringOffset: Bool = false
     private var isSyncingLaunchAtLogin: Bool = false
 
+    var rawLyricLines: [LyricLine] { rawLines }
+
     private var activeLines: [LyricLine] {
+        if translateLyrics && !translatedLines.isEmpty {
+            return translatedLines
+        }
         if romanizeJapanese && isJapaneseSong {
             return romanizedLines
         }
@@ -397,6 +458,13 @@ final class LyricsState: ObservableObject {
             self.visualizerStyle = .bars
         }
 
+        if let raw = ud.string(forKey: Keys.visualizerColorTheme),
+           let parsed = VisualizerColorTheme(rawValue: raw) {
+            self.visualizerColorTheme = parsed
+        } else {
+            self.visualizerColorTheme = .matchTheme
+        }
+
         let storedVisWidth = ud.double(forKey: Keys.visualizerWidth)
         self.visualizerWidth = storedVisWidth > 0 ? storedVisWidth : 20.0
 
@@ -409,6 +477,13 @@ final class LyricsState: ObservableObject {
         self.romanizeJapanese = ud.object(forKey: Keys.romanizeJapanese) as? Bool ?? true
         self.romanizeKorean = ud.object(forKey: Keys.romanizeKorean) as? Bool ?? true
         self.romanizeChinese = ud.object(forKey: Keys.romanizeChinese) as? Bool ?? true
+        self.translateLyrics = ud.object(forKey: Keys.translateLyrics) as? Bool ?? false
+        if let rawLang = ud.string(forKey: Keys.translationLanguage),
+           let parsedLang = TranslationLanguage(rawValue: rawLang) {
+            self.translationLanguage = parsedLang
+        } else {
+            self.translationLanguage = .english
+        }
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
         let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
@@ -430,6 +505,7 @@ final class LyricsState: ObservableObject {
         }
 
         rawLines = lyrics
+        translatedLines = []
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
@@ -489,10 +565,16 @@ final class LyricsState: ObservableObject {
         }
     }
 
+    func setTranslatedLines(_ lines: [LyricLine]) {
+        translatedLines = lines
+        refreshCurrentLineText()
+    }
+
     private func refreshCurrentLineText() {
         guard currentLineId >= 0 else { return }
         if let line = activeLines.first(where: { $0.id == currentLineId }) {
             currentText = line.text.isEmpty ? "♪" : line.text
+            activeLine = line
         }
     }
 

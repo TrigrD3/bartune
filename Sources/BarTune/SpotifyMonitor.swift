@@ -19,6 +19,12 @@ private final class CompiledScriptBox: @unchecked Sendable {
     }
 }
 
+enum PlaybackCommand: Sendable {
+    case playPause
+    case nextTrack
+    case previousTrack
+}
+
 struct PlaybackSnapshot {
     let isRunning: Bool
     let isPlaying: Bool
@@ -38,6 +44,7 @@ final class SpotifyMonitor {
     private var browserMusicEnabled: Bool = true
     private var isStarted: Bool = false
     private var isPolling: Bool = false
+    private var consecutiveIdlePolls: Int = 0
     private let browserMonitor = BrowserMediaMonitor()
     private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
 
@@ -101,6 +108,44 @@ final class SpotifyMonitor {
         }
     }
 
+    func sendCommand(_ command: PlaybackCommand) {
+        let runningBundleIds = Set(
+            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        )
+        let activeTrackId = lastSnapshot?.track?.id ?? ""
+
+        scriptQueue.async { [weak self] in
+            let scriptSource: String?
+            if activeTrackId.hasPrefix("music:")
+                || (!runningBundleIds.contains("com.spotify.client") && runningBundleIds.contains("com.apple.Music")) {
+                let verb = switch command {
+                case .playPause: "playpause"
+                case .nextTrack: "next track"
+                case .previousTrack: "previous track"
+                }
+                scriptSource = "tell application \"Music\" to \(verb)"
+            } else if runningBundleIds.contains("com.spotify.client") {
+                let verb = switch command {
+                case .playPause: "playpause"
+                case .nextTrack: "next track"
+                case .previousTrack: "previous track"
+                }
+                scriptSource = "tell application \"Spotify\" to \(verb)"
+            } else {
+                scriptSource = nil
+            }
+
+            if let source = scriptSource, let script = NSAppleScript(source: source) {
+                var error: NSDictionary?
+                script.executeAndReturnError(&error)
+            }
+
+            Task { @MainActor [weak self] in
+                self?.poll()
+            }
+        }
+    }
+
     func start(lowCPUMode: Bool = true, browserMusicEnabled: Bool = true) {
         stop()
         self.lowCPUMode = lowCPUMode
@@ -144,16 +189,35 @@ final class SpotifyMonitor {
         if let obs = musicObserver { dnc.removeObserver(obs); musicObserver = nil }
     }
 
+    private static let nativePlayerBundleIds: Set<String> = [
+        "com.spotify.client",
+        "com.apple.Music",
+    ]
+
     private func scheduleTimers() {
+        updatePollTimer(isPlaying: lastSnapshot?.isPlaying ?? false)
+        updateInterpolationTimer(isPlaying: lastSnapshot?.isPlaying ?? false)
+    }
+
+    private func updatePollTimer(isPlaying: Bool) {
+        // Event-driven via DistributedNotificationCenter; progressively back off when idle (5s -> 8s).
+        let desiredInterval: TimeInterval
+        if isPlaying {
+            consecutiveIdlePolls = 0
+            desiredInterval = 3.0
+        } else {
+            consecutiveIdlePolls += 1
+            desiredInterval = consecutiveIdlePolls >= 3 ? 8.0 : 5.0
+        }
+        if let existing = pollTimer, abs(existing.timeInterval - desiredInterval) < 0.05 {
+            return
+        }
         pollTimer?.invalidate()
-        // Always event-driven via DistributedNotificationCenter; light 3.0s drift check only.
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: desiredInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.poll()
             }
         }
-
-        updateInterpolationTimer(isPlaying: lastSnapshot?.isPlaying ?? false)
     }
 
     private func updateInterpolationTimer(isPlaying: Bool) {
@@ -183,15 +247,16 @@ final class SpotifyMonitor {
         guard !isPolling else { return }
         isPolling = true
         let allowBrowser = browserMusicEnabled
-        let runningBundleIds: Set<String> = allowBrowser
-            ? Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
-            : []
+        let runningBundleIds = Set(
+            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
+        )
+        let hasNativePlayer = !runningBundleIds.isDisjoint(with: Self.nativePlayerBundleIds)
         let browserMonitor = self.browserMonitor
         let spotifyScript = self.spotifyScript
 
         scriptQueue.async { [weak self] in
             let pollStart = Date()
-            let raw = spotifyScript.execute()
+            let raw: String? = hasNativePlayer ? spotifyScript.execute() : "IDLE"
             let pollEnd = Date()
             // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
             let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
@@ -218,6 +283,7 @@ final class SpotifyMonitor {
             if let browserSnap {
                 lastSnapshot = browserSnap
                 lastPollDate = browserNow
+                updatePollTimer(isPlaying: browserSnap.isPlaying)
                 updateInterpolationTimer(isPlaying: browserSnap.isPlaying)
                 onUpdate?(browserSnap)
                 return
@@ -225,6 +291,7 @@ final class SpotifyMonitor {
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
             lastSnapshot = snapshot
             lastPollDate = now
+            updatePollTimer(isPlaying: false)
             updateInterpolationTimer(isPlaying: false)
             onUpdate?(snapshot)
             return
@@ -262,6 +329,7 @@ final class SpotifyMonitor {
         )
         lastSnapshot = snapshot
         lastPollDate = now
+        updatePollTimer(isPlaying: isPlaying)
         updateInterpolationTimer(isPlaying: isPlaying)
         onUpdate?(snapshot)
     }
