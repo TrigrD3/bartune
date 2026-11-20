@@ -193,3 +193,39 @@ enum KoreanRomanizer {
         return trimmed.isEmpty ? text : trimmed
     }
 }
+
+enum ChineseRomanizer {
+    static func containsHan(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            let v = scalar.value
+            if (0x4E00...0x9FFF).contains(v) || (0x3400...0x4DBF).contains(v) {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func isChineseTrack(_ lines: [LyricLine]) -> Bool {
+        guard !JapaneseRomanizer.isJapaneseTrack(lines),
+              !KoreanRomanizer.isKoreanTrack(lines)
+        else { return false }
+        return lines.contains { containsHan($0.text) }
+    }
+
+    static func romanizeLine(_ text: String) -> String {
+        guard containsHan(text) else { return text }
+        guard let pinyin = text.applyingTransform(.mandarinToLatin, reverse: false)?
+            .applyingTransform(.stripDiacritics, reverse: false)
+        else { return text }
+
+        let cleaned = pinyin
+            .replacingOccurrences(of: "，", with: ", ")
+            .replacingOccurrences(of: "。", with: ".")
+            .replacingOccurrences(of: "！", with: "!")
+            .replacingOccurrences(of: "？", with: "?")
+            .replacingOccurrences(of: " ,", with: ",")
+            .replacingOccurrences(of: " .", with: ".")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? text : cleaned
+    }
+}

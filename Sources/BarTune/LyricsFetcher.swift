@@ -1,4 +1,78 @@
+import CryptoKit
 import Foundation
+
+struct LyricsDiskCache: Sendable {
+    let directory: URL
+    let maxEntries: Int
+
+    static var `default`: LyricsDiskCache {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("com.arya.BarTune/lyrics", isDirectory: true)
+        return LyricsDiskCache(directory: dir, maxEntries: 1000)
+    }
+
+    init(directory: URL, maxEntries: Int = 1000) {
+        self.directory = directory
+        self.maxEntries = max(1, maxEntries)
+    }
+
+    private func fileURL(for trackId: String) -> URL {
+        let digest = SHA256.hash(data: Data(trackId.utf8))
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return directory.appendingPathComponent("\(hex).json")
+    }
+
+    func load(trackId: String) -> [LyricLine]? {
+        let url = fileURL(for: trackId)
+        guard let data = try? Data(contentsOf: url),
+              let lines = try? JSONDecoder().decode([LyricLine].self, from: data),
+              !lines.isEmpty
+        else { return nil }
+        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        return lines
+    }
+
+    func save(trackId: String, lines: [LyricLine]) {
+        guard !lines.isEmpty else { return }
+        let fm = FileManager.default
+        try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
+        guard let data = try? JSONEncoder().encode(lines) else { return }
+        let url = fileURL(for: trackId)
+        try? data.write(to: url, options: .atomic)
+        pruneIfNeeded()
+    }
+
+    func clear() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+        for file in files where file.pathExtension == "json" {
+            try? fm.removeItem(at: file)
+        }
+    }
+
+    private func pruneIfNeeded() {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let jsonFiles = files.filter { $0.pathExtension == "json" }
+        guard jsonFiles.count > maxEntries else { return }
+
+        let sorted = jsonFiles.sorted { lhs, rhs in
+            let d1 = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            let d2 = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+            return d1 < d2
+        }
+        let excess = sorted.count - maxEntries
+        for file in sorted.prefix(excess) {
+            try? fm.removeItem(at: file)
+        }
+    }
+}
 
 struct NetEaseSongCandidate: Equatable {
     let id: Int
@@ -109,34 +183,53 @@ actor LyricsFetcher {
     }
 
     private var cache: [String: [LyricLine]] = [:]
+    private let diskCache: LyricsDiskCache
+
+    init(diskCache: LyricsDiskCache = .default) {
+        self.diskCache = diskCache
+    }
+
+    func clearCache() {
+        cache.removeAll()
+        diskCache.clear()
+    }
 
     func fetchLyrics(for track: TrackInfo) async -> [LyricLine] {
         if let cached = cache[track.id] {
             return cached
         }
 
+        if let diskLines = diskCache.load(trackId: track.id) {
+            cache[track.id] = diskLines
+            return diskLines
+        }
+
         // 1. Try NetEase YRC first for true millisecond word-by-word karaoke sync
         let netEase = await fetchNetEase(track: track)
         if let yrc = netEase.yrc, !yrc.isEmpty {
             cache[track.id] = yrc
+            diskCache.save(trackId: track.id, lines: yrc)
             return yrc
         }
 
         // 2. Fall back to LRCLIB exact match
         if let exact = await fetchLRCLibExact(track: track), !exact.isEmpty {
             cache[track.id] = exact
+            diskCache.save(trackId: track.id, lines: exact)
             return exact
         }
 
         // 3. Fall back to LRCLIB search
         if let searched = await fetchLRCLibSearch(track: track), !searched.isEmpty {
             cache[track.id] = searched
+            diskCache.save(trackId: track.id, lines: searched)
             return searched
         }
 
         // 4. Final fallback: NetEase line-level LRC
         if let lrc = netEase.lrc, !lrc.isEmpty {
             cache[track.id] = lrc
+            diskCache.save(trackId: track.id, lines: lrc)
             return lrc
         }
 

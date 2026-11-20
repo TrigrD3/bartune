@@ -1,7 +1,8 @@
-import Foundation
 import AppKit
-import SwiftUI
 import Combine
+import Foundation
+import ServiceManagement
+import SwiftUI
 
 enum HoverMode: String, CaseIterable, Identifiable {
     case spotlight = "spotlight"
@@ -149,6 +150,7 @@ final class LyricsState: ObservableObject {
         static let spotlightWidth = "bartune.spotlightWidth"
         static let karaokeEnabled = "bartune.karaokeEnabled"
         static let showEqualizer = "bartune.showEqualizer"
+        static let animateVisualizer = "bartune.animateVisualizer"
         static let visualizerStyle = "bartune.visualizerStyle"
         static let visualizerWidth = "bartune.visualizerWidth"
         static let fontSize = "bartune.fontSize"
@@ -158,9 +160,13 @@ final class LyricsState: ObservableObject {
         static let fontWeight = "bartune.fontWeight"
         static let romanizeJapanese = "bartune.romanizeJapanese"
         static let romanizeKorean = "bartune.romanizeKorean"
+        static let romanizeChinese = "bartune.romanizeChinese"
         static let lowCPUMode = "bartune.lowCPUMode"
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
+        static let trackOffsets = "bartune.trackOffsets"
     }
+
+    private static let maxStoredOffsets = 500
 
     @Published var currentText: String = ""
     @Published var currentLineId: Int = -1
@@ -174,7 +180,20 @@ final class LyricsState: ObservableObject {
     @Published var isPlaying: Bool = false
     @Published var isEnabled: Bool = true
     @Published var hasLyrics: Bool = false
-    @Published var offsetSeconds: Double = 0.0
+    @Published var offsetSeconds: Double = 0.0 {
+        didSet {
+            guard !isRestoringOffset, let trackId = currentTrackId else { return }
+            if abs(offsetSeconds) < 0.01 {
+                trackOffsets.removeValue(forKey: trackId)
+            } else {
+                trackOffsets[trackId] = offsetSeconds
+                if trackOffsets.count > Self.maxStoredOffsets, let victim = trackOffsets.keys.first {
+                    trackOffsets.removeValue(forKey: victim)
+                }
+            }
+            userDefaults.set(trackOffsets, forKey: Keys.trackOffsets)
+        }
+    }
     @Published var albumColors: ExtractedAlbumColors? = nil
 
     // Persisted user settings
@@ -208,7 +227,11 @@ final class LyricsState: ObservableObject {
     }
 
     @Published var showEqualizer: Bool {
-        didSet { UserDefaults.standard.set(showEqualizer, forKey: Keys.showEqualizer) }
+        didSet { userDefaults.set(showEqualizer, forKey: Keys.showEqualizer) }
+    }
+
+    @Published var animateVisualizer: Bool {
+        didSet { userDefaults.set(animateVisualizer, forKey: Keys.animateVisualizer) }
     }
 
     @Published var visualizerStyle: VisualizerStyle {
@@ -236,29 +259,59 @@ final class LyricsState: ObservableObject {
 
     @Published var romanizeKorean: Bool {
         didSet {
-            UserDefaults.standard.set(romanizeKorean, forKey: Keys.romanizeKorean)
+            userDefaults.set(romanizeKorean, forKey: Keys.romanizeKorean)
+            refreshCurrentLineText()
+        }
+    }
+
+    @Published var romanizeChinese: Bool {
+        didSet {
+            userDefaults.set(romanizeChinese, forKey: Keys.romanizeChinese)
             refreshCurrentLineText()
         }
     }
 
     @Published var lowCPUMode: Bool {
-        didSet { UserDefaults.standard.set(lowCPUMode, forKey: Keys.lowCPUMode) }
+        didSet { userDefaults.set(lowCPUMode, forKey: Keys.lowCPUMode) }
     }
 
     @Published var browserMusicEnabled: Bool {
-        didSet { UserDefaults.standard.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
+        didSet { userDefaults.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
+    }
+
+    @Published var launchAtLogin: Bool = false {
+        didSet {
+            guard !isSyncingLaunchAtLogin else { return }
+            do {
+                if launchAtLogin {
+                    try SMAppService.mainApp.register()
+                } else {
+                    try SMAppService.mainApp.unregister()
+                }
+            } catch {
+                isSyncingLaunchAtLogin = true
+                launchAtLogin = (SMAppService.mainApp.status == .enabled)
+                isSyncingLaunchAtLogin = false
+            }
+        }
     }
 
     var shouldShowOverlay: Bool {
         isEnabled && isPlaying && !currentText.isEmpty
     }
 
+    private let userDefaults: UserDefaults
     private var rawLines: [LyricLine] = []
     private var romanizedLines: [LyricLine] = []
     private var koreanRomanizedLines: [LyricLine] = []
+    private var chineseRomanizedLines: [LyricLine] = []
     private var isJapaneseSong: Bool = false
     private var isKoreanSong: Bool = false
+    private var isChineseSong: Bool = false
     private var currentTrackId: String?
+    private var trackOffsets: [String: Double] = [:]
+    private var isRestoringOffset: Bool = false
+    private var isSyncingLaunchAtLogin: Bool = false
 
     private var activeLines: [LyricLine] {
         if romanizeJapanese && isJapaneseSong {
@@ -267,11 +320,15 @@ final class LyricsState: ObservableObject {
         if romanizeKorean && isKoreanSong {
             return koreanRomanizedLines
         }
+        if romanizeChinese && isChineseSong {
+            return chineseRomanizedLines
+        }
         return rawLines
     }
 
-    init() {
-        let ud = UserDefaults.standard
+    init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+        let ud = userDefaults
 
         if let raw = ud.string(forKey: Keys.hoverMode), let parsed = HoverMode(rawValue: raw) {
             self.hoverMode = parsed
@@ -302,6 +359,7 @@ final class LyricsState: ObservableObject {
 
         self.karaokeAnimationEnabled = ud.object(forKey: Keys.karaokeEnabled) as? Bool ?? true
         self.showEqualizer = ud.object(forKey: Keys.showEqualizer) as? Bool ?? true
+        self.animateVisualizer = ud.object(forKey: Keys.animateVisualizer) as? Bool ?? true
         if let raw = ud.string(forKey: Keys.visualizerStyle), let parsed = VisualizerStyle(rawValue: raw) {
             self.visualizerStyle = parsed
         } else {
@@ -319,15 +377,29 @@ final class LyricsState: ObservableObject {
 
         self.romanizeJapanese = ud.object(forKey: Keys.romanizeJapanese) as? Bool ?? true
         self.romanizeKorean = ud.object(forKey: Keys.romanizeKorean) as? Bool ?? true
+        self.romanizeChinese = ud.object(forKey: Keys.romanizeChinese) as? Bool ?? true
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
+        self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
+
+        self.isSyncingLaunchAtLogin = true
+        self.launchAtLogin = (SMAppService.mainApp.status == .enabled)
+        self.isSyncingLaunchAtLogin = false
     }
 
     func setTrack(_ track: TrackInfo?, lyrics: [LyricLine]) {
+        let previousTrackId = currentTrackId
         currentTrackId = track?.id
+        if currentTrackId != previousTrackId {
+            isRestoringOffset = true
+            offsetSeconds = currentTrackId.flatMap { trackOffsets[$0] } ?? 0.0
+            isRestoringOffset = false
+        }
+
         rawLines = lyrics
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
+        isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
         if isJapaneseSong {
             romanizedLines = Self.romanizeLines(lyrics, using: JapaneseRomanizer.romanizeLine)
         } else {
@@ -337,6 +409,11 @@ final class LyricsState: ObservableObject {
             koreanRomanizedLines = Self.romanizeLines(lyrics, using: KoreanRomanizer.romanizeLine)
         } else {
             koreanRomanizedLines = []
+        }
+        if isChineseSong {
+            chineseRomanizedLines = Self.romanizeLines(lyrics, using: ChineseRomanizer.romanizeLine)
+        } else {
+            chineseRomanizedLines = []
         }
 
         hasLyrics = !lyrics.isEmpty

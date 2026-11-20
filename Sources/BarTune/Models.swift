@@ -9,7 +9,7 @@ struct TrackInfo: Equatable {
     let artworkURL: String?
 }
 
-struct WordTimestamp: Equatable {
+struct WordTimestamp: Equatable, Codable {
     let timestamp: Double // seconds
     let duration: Double? // seconds (exact duration when provided by YRC)
     let text: String
@@ -21,7 +21,7 @@ struct WordTimestamp: Equatable {
     }
 }
 
-struct LyricLine: Identifiable, Equatable {
+struct LyricLine: Identifiable, Equatable, Codable {
     let id: Int
     let timestamp: Double // seconds
     let duration: Double? // seconds (exact line duration when provided by YRC)
