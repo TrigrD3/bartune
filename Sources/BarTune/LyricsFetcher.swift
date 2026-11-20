@@ -1,5 +1,68 @@
 import Foundation
 
+struct NetEaseSongCandidate: Equatable {
+    let id: Int
+    let name: String
+    let artists: [String]
+    let durationMs: Double?
+}
+
+enum LyricsMatcher {
+    private static let unwantedKeywords = [
+        "karaoke", "instrumental", "翻自", "cover", "live", "tour", "dome", "remix", "sped up", "slowed",
+    ]
+
+    static func normalize(_ text: String) -> String {
+        text.lowercased()
+            .unicodeScalars
+            .filter { CharacterSet.alphanumerics.contains($0) }
+            .map(String.init)
+            .joined()
+    }
+
+    static func artistMatches(candidateArtists: [String], expectedArtist: String) -> Bool {
+        let expected = normalize(expectedArtist)
+        guard !expected.isEmpty else { return true }
+        guard !candidateArtists.isEmpty else { return false }
+
+        return candidateArtists.contains { raw in
+            let candidate = normalize(raw)
+            guard !candidate.isEmpty else { return false }
+            return candidate == expected || candidate.contains(expected) || expected.contains(candidate)
+        }
+    }
+
+    static func isUnwantedVariant(candidateTitle: String, expectedTitle: String) -> Bool {
+        let candLower = candidateTitle.lowercased()
+        let expLower = expectedTitle.lowercased()
+        for keyword in unwantedKeywords where candLower.contains(keyword) && !expLower.contains(keyword) {
+            return true
+        }
+        return false
+    }
+
+    static func selectBestNetEaseSong(_ songs: [NetEaseSongCandidate], for track: TrackInfo) -> NetEaseSongCandidate? {
+        let valid = songs.filter { song in
+            guard artistMatches(candidateArtists: song.artists, expectedArtist: track.artist) else {
+                return false
+            }
+            guard !isUnwantedVariant(candidateTitle: song.name, expectedTitle: track.title) else {
+                return false
+            }
+            if let durMs = song.durationMs, abs(durMs / 1000.0 - track.duration) > 6.0 {
+                return false
+            }
+            return true
+        }
+
+        return valid.min { lhs, rhs in
+            let d1 = abs((lhs.durationMs ?? 0) / 1000.0 - track.duration)
+            let d2 = abs((rhs.durationMs ?? 0) / 1000.0 - track.duration)
+            return d1 < d2
+        }
+    }
+}
+
 actor LyricsFetcher {
     private struct LRCLibRecord: Decodable {
         let syncedLyrics: String?
@@ -9,12 +72,17 @@ actor LyricsFetcher {
         let duration: Double?
     }
 
+    private struct NetEaseArtist: Decodable {
+        let name: String
+    }
+
     private struct NetEaseSearchResponse: Decodable {
         struct Result: Decodable {
             struct Song: Decodable {
                 let id: Int
                 let name: String
                 let duration: Double?
+                let artists: [NetEaseArtist]?
             }
             let songs: [Song]?
         }
@@ -86,14 +154,15 @@ actor LyricsFetcher {
             let decoded = try JSONDecoder().decode(NetEaseSearchResponse.self, from: searchData)
             guard let songs = decoded.result?.songs, !songs.isEmpty else { return (nil, nil) }
 
-            // Pick the song whose duration matches closest (within 6 seconds) to avoid wrong remixes
-            let matched = songs.min { lhs, rhs in
-                let d1 = abs((lhs.duration ?? 0) / 1000.0 - track.duration)
-                let d2 = abs((rhs.duration ?? 0) / 1000.0 - track.duration)
-                return d1 < d2
+            let candidates = songs.map { song in
+                NetEaseSongCandidate(
+                    id: song.id,
+                    name: song.name,
+                    artists: (song.artists ?? []).map(\.name),
+                    durationMs: song.duration
+                )
             }
-            guard let song = matched else { return (nil, nil) }
-            if let durMs = song.duration, abs(durMs / 1000.0 - track.duration) > 6.0 {
+            guard let song = LyricsMatcher.selectBestNetEaseSong(candidates, for: track) else {
                 return (nil, nil)
             }
 
@@ -170,7 +239,17 @@ actor LyricsFetcher {
             }
             let records = try JSONDecoder().decode([LRCLibRecord].self, from: data)
             let best = records
-                .filter { ($0.syncedLyrics ?? "").isEmpty == false }
+                .filter { record in
+                    guard (record.syncedLyrics ?? "").isEmpty == false else { return false }
+                    if let artist = record.artistName,
+                       !LyricsMatcher.artistMatches(candidateArtists: [artist], expectedArtist: track.artist) {
+                        return false
+                    }
+                    if let dur = record.duration, abs(dur - track.duration) > 6.0 {
+                        return false
+                    }
+                    return true
+                }
                 .min { lhs, rhs in
                     let d1 = abs((lhs.duration ?? track.duration) - track.duration)
                     let d2 = abs((rhs.duration ?? track.duration) - track.duration)
