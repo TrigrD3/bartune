@@ -78,6 +78,10 @@ struct SettingsView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
+
+            Section("Startup") {
+                Toggle("Launch BarTune at Login", isOn: $state.launchAtLogin)
+            }
         }
         .formStyle(.grouped)
     }
@@ -156,14 +160,19 @@ struct SettingsView: View {
     private var visualizerTab: some View {
         Form {
             Section("Preview") {
-                VisualizerPreviewStrip(state: state, isAnimating: selectedTab == .visualizer)
-                    .padding(.vertical, 4)
+                VisualizerPreviewStrip(
+                    state: state,
+                    isAnimating: selectedTab == .visualizer && state.animateVisualizer
+                )
+                .padding(.vertical, 4)
             }
 
             Section("Visualizer") {
                 Toggle("Show Visualizer", isOn: $state.showEqualizer)
 
                 if state.showEqualizer {
+                    Toggle("Animate Visualizer", isOn: $state.animateVisualizer)
+
                     Picker("Style", selection: $state.visualizerStyle) {
                         ForEach(VisualizerStyle.allCases) { style in
                             Text(style.title).tag(style)
@@ -196,6 +205,7 @@ struct SettingsView: View {
             Section("Romanization") {
                 Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
                 Toggle("Korean → Romanized", isOn: $state.romanizeKorean)
+                Toggle("Chinese → Pinyin", isOn: $state.romanizeChinese)
             }
 
             Section("Performance & Sync") {
@@ -224,6 +234,18 @@ struct SettingsView: View {
                         state.offsetSeconds = 0.0
                     }
                     .disabled(abs(state.offsetSeconds) < 0.01)
+                }
+
+                Text("Timing offsets are saved automatically per track.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack {
+                    Text("Offline Lyrics Cache")
+                    Spacer()
+                    Button("Clear Cache") {
+                        LyricsDiskCache.default.clear()
+                    }
                 }
             }
         }

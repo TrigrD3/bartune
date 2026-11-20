@@ -246,7 +246,7 @@ struct LyricsOverlayView: View {
             HStack(spacing: 7) {
                 if state.showEqualizer {
                     EqualizerIconView(
-                        isPlaying: state.isPlaying,
+                        isPlaying: state.isPlaying && state.animateVisualizer,
                         tint: activeEqualizerColor,
                         lowCPUMode: state.lowCPUMode,
                         style: state.visualizerStyle,
@@ -264,7 +264,7 @@ struct LyricsOverlayView: View {
                     isPlaying: state.isPlaying,
                     lowCPUMode: state.lowCPUMode
                 )
-                .id("\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)")
+                .id("\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)")
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 6)),
                     removal: .opacity.combined(with: .offset(y: -6))
