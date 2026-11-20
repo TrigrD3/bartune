@@ -5,6 +5,7 @@ import Combine
 final class LyricsState: ObservableObject {
     @Published var currentText: String = ""
     @Published var currentLineId: Int = -1
+    @Published var lineProgress: Double = 0.0
     @Published var trackSummary: String = "Not Playing"
     @Published var isPlaying: Bool = false
     @Published var isEnabled: Bool = true
@@ -28,6 +29,7 @@ final class LyricsState: ObservableObject {
             trackSummary = "Not Playing"
             currentText = ""
             currentLineId = -1
+            lineProgress = 0.0
         }
     }
 
@@ -37,12 +39,13 @@ final class LyricsState: ObservableObject {
             if !isPlaying {
                 currentText = ""
                 currentLineId = -1
+                lineProgress = 0.0
             }
             return
         }
 
         let effectivePos = position + offsetSeconds
-        var matched: LyricLine?
+        var matchedIndex: Int?
 
         // Binary search for the latest line with timestamp <= effectivePos
         var lo = 0
@@ -50,21 +53,40 @@ final class LyricsState: ObservableObject {
         while lo <= hi {
             let mid = (lo + hi) / 2
             if lines[mid].timestamp <= effectivePos {
-                matched = lines[mid]
+                matchedIndex = mid
                 lo = mid + 1
             } else {
                 hi = mid - 1
             }
         }
 
-        if let line = matched {
+        if let idx = matchedIndex {
+            let line = lines[idx]
+            let displayText = line.text.isEmpty ? "♪" : line.text
+
+            // Compute singing duration for smooth karaoke fill
+            let rawDuration: Double
+            if idx + 1 < lines.count {
+                rawDuration = max(0.4, lines[idx + 1].timestamp - line.timestamp)
+            } else {
+                rawDuration = 4.5
+            }
+
+            // Cap fill duration on long instrumental gaps so words still sweep at a natural singing pace
+            let estimatedSingDuration = max(2.2, Double(displayText.count) * 0.11)
+            let effectiveDuration = min(rawDuration, estimatedSingDuration)
+            let elapsed = max(0.0, effectivePos - line.timestamp)
+            let progress = min(1.0, max(0.0, elapsed / effectiveDuration))
+
             if line.id != currentLineId {
                 currentLineId = line.id
-                currentText = line.text.isEmpty ? "♪" : line.text
+                currentText = displayText
             }
+            lineProgress = progress
         } else if currentLineId != -1 {
             currentLineId = -1
             currentText = "♪"
+            lineProgress = 0.0
         }
     }
 }

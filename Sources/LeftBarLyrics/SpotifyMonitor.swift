@@ -54,7 +54,7 @@ final class SpotifyMonitor {
             }
         }
 
-        interpolationTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+        interpolationTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.emitInterpolated()
             }

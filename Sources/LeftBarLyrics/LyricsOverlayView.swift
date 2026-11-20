@@ -13,30 +13,114 @@ struct VisualEffectBackground: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
+struct EqualizerIconView: View {
+    let isPlaying: Bool
+    @State private var phase: Double = 0
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 0.12, paused: !isPlaying)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            HStack(alignment: .bottom, spacing: 1.5) {
+                ForEach(0..<3, id: \.self) { idx in
+                    let wave = isPlaying ? (0.35 + 0.65 * abs(sin(t * 4.5 + Double(idx) * 1.4))) : 0.25
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: 2, height: max(3, 10 * wave))
+                }
+            }
+            .frame(width: 10, height: 11, alignment: .bottom)
+        }
+    }
+}
+
+struct KaraokeLineView: View {
+    let text: String
+    let progress: Double
+
+    @State private var textWidth: CGFloat = 0
+
+    var body: some View {
+        GeometryReader { container in
+            let availableWidth = container.size.width
+            let overflow = max(0, textWidth - availableWidth)
+            // Keep the active sweep point centered when a line is wider than the left menu bar
+            let scrollOffset: CGFloat = overflow > 0
+                ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
+                : 0
+
+            ZStack(alignment: .leading) {
+                // Unsung base text
+                Text(text)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(Color.primary.opacity(0.36))
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(
+                        GeometryReader { textGeo in
+                            Color.clear.onAppear {
+                                textWidth = textGeo.size.width
+                            }
+                            .onChange(of: text) { _ in
+                                textWidth = textGeo.size.width
+                            }
+                            .onChange(of: textGeo.size.width) { newWidth in
+                                textWidth = newWidth
+                            }
+                        }
+                    )
+
+                // Sung karaoke highlighted text with smooth feathered sweep mask
+                Text(text)
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color.primary)
+                    .shadow(color: Color.accentColor.opacity(0.35), radius: 2, x: 0, y: 0)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .mask(
+                        GeometryReader { maskGeo in
+                            let w = maskGeo.size.width
+                            let feather: CGFloat = 16
+                            let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
+
+                            HStack(spacing: 0) {
+                                Rectangle()
+                                    .fill(Color.white)
+                                    .frame(width: max(0, fillWidth - feather))
+                                LinearGradient(
+                                    colors: [Color.white, Color.clear],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                                .frame(width: feather)
+                                Spacer(minLength: 0)
+                            }
+                        }
+                    )
+            }
+            .offset(x: scrollOffset)
+            .animation(.linear(duration: 0.06), value: scrollOffset)
+            .frame(maxHeight: .infinity, alignment: .center)
+        }
+        .clipped()
+    }
+}
+
 struct LyricsOverlayView: View {
     @ObservedObject var state: LyricsState
 
     var body: some View {
         ZStack(alignment: .leading) {
-            // Solid-enough adaptive backdrop to cleanly mask File/Edit/View underneath
             VisualEffectBackground()
                 .overlay(Color(nsColor: .windowBackgroundColor).opacity(0.88))
 
-            HStack(spacing: 6) {
-                Image(systemName: "music.note")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 7) {
+                EqualizerIconView(isPlaying: state.isPlaying)
 
-                Text(state.currentText)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
+                KaraokeLineView(text: state.currentText, progress: state.lineProgress)
                     .id(state.currentLineId)
-                    .transition(.opacity.combined(with: .offset(y: 3)))
-                    .animation(.easeInOut(duration: 0.2), value: state.currentLineId)
-
-                Spacer(minLength: 0)
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .offset(y: 6)),
+                        removal: .opacity.combined(with: .offset(y: -6))
+                    ))
+                    .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
             }
             .padding(.horizontal, 10)
         }
