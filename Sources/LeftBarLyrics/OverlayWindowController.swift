@@ -177,7 +177,7 @@ final class OverlayWindowController {
         }
 
         // Lightweight periodic check while hidden/hovered so we never get stuck hidden.
-        hoverCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: true) { [weak self] _ in
+        hoverCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.evaluateMouseLocation()
             }
@@ -224,7 +224,7 @@ final class OverlayWindowController {
                     }
                 }
                 unhoverWorkItem = work
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
             }
         }
     }
@@ -237,8 +237,8 @@ final class OverlayWindowController {
         guard abs(panel.alphaValue - targetAlpha) > 0.01 else { return }
 
         NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = visible ? 0.22 : 0.10
-            ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            ctx.duration = visible ? 0.08 : 0.05
+            ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
             panel.animator().alphaValue = targetAlpha
         }
     }
