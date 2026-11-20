@@ -1,44 +1,70 @@
 import SwiftUI
 import AppKit
 
-private enum SettingsTab: Hashable {
+private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
     case appearance
     case visualizer
     case lyricsSync
+    case cache
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .appearance: return "Appearance"
+        case .visualizer: return "Visualizer"
+        case .lyricsSync: return "Lyrics & Sync"
+        case .cache: return "Offline Cache"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .general: return "gearshape"
+        case .appearance: return "paintbrush"
+        case .visualizer: return "waveform"
+        case .lyricsSync: return "music.note.list"
+        case .cache: return "internaldrive"
+        }
+    }
 }
 
 struct SettingsView: View {
     @ObservedObject var state: LyricsState
     @State private var selectedTab: SettingsTab = .general
+    @State private var cachedSongCount: Int = 0
+    @State private var cachedBytes: Int64 = 0
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            generalTab
-                .tabItem {
-                    Label("General", systemImage: "gearshape")
-                }
-                .tag(SettingsTab.general)
+        HStack(spacing: 0) {
+            List(SettingsTab.allCases, selection: $selectedTab) { tab in
+                Label(tab.title, systemImage: tab.systemImage)
+                    .tag(tab)
+            }
+            .listStyle(.sidebar)
+            .frame(width: 168)
 
-            appearanceTab
-                .tabItem {
-                    Label("Appearance", systemImage: "paintbrush")
-                }
-                .tag(SettingsTab.appearance)
+            Divider()
 
-            visualizerTab
-                .tabItem {
-                    Label("Visualizer", systemImage: "waveform")
+            Group {
+                switch selectedTab {
+                case .general:
+                    generalTab
+                case .appearance:
+                    appearanceTab
+                case .visualizer:
+                    visualizerTab
+                case .lyricsSync:
+                    lyricsSyncTab
+                case .cache:
+                    cacheTab
                 }
-                .tag(SettingsTab.visualizer)
-
-            lyricsSyncTab
-                .tabItem {
-                    Label("Lyrics & Sync", systemImage: "music.note.list")
-                }
-                .tag(SettingsTab.lyricsSync)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 470, height: 430)
+        .frame(width: 580, height: 440)
     }
 
     private var generalTab: some View {
@@ -239,17 +265,91 @@ struct SettingsView: View {
                 Text("Timing offsets are saved automatically per track.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-
-                HStack {
-                    Text("Offline Lyrics Cache")
-                    Spacer()
-                    Button("Clear Cache") {
-                        LyricsDiskCache.default.clear()
-                    }
-                }
             }
         }
         .formStyle(.grouped)
+    }
+
+    private var cacheTab: some View {
+        Form {
+            Section("Offline Lyrics Cache") {
+                HStack {
+                    Text("Cached Songs")
+                    Spacer()
+                    Text(cachedCountLabel)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Storage Used")
+                    Spacer()
+                    Text(formattedCacheSize)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                Picker("Cache Limit", selection: $state.lyricsCacheLimit) {
+                    ForEach(LyricsCacheLimit.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .onChange(of: state.lyricsCacheLimit) { _ in
+                    refreshCacheStats()
+                }
+
+                HStack {
+                    Button("Reveal in Finder") {
+                        let dir = LyricsDiskCache.default.directory
+                        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                        NSWorkspace.shared.open(dir)
+                    }
+                    Spacer()
+                    Button("Refresh") {
+                        refreshCacheStats()
+                    }
+                    Button("Clear Cache", role: .destructive) {
+                        LyricsDiskCache.default.clear()
+                        refreshCacheStats()
+                    }
+                    .disabled(cachedSongCount == 0)
+                }
+
+                Text(cacheFooterText)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear {
+            refreshCacheStats()
+        }
+    }
+
+    private var cachedCountLabel: String {
+        if state.lyricsCacheLimit == .unlimited {
+            return "\(cachedSongCount)"
+        }
+        return "\(cachedSongCount) / \(state.lyricsCacheLimit.rawValue)"
+    }
+
+    private var cacheFooterText: String {
+        if state.lyricsCacheLimit == .unlimited {
+            return "Fetched lyrics are stored locally with no limit so repeat plays load instantly and work offline."
+        }
+        return "Fetched lyrics are stored locally so repeat plays load instantly and work offline. "
+            + "Oldest entries are pruned automatically once the \(state.lyricsCacheLimit.title) limit is reached."
+    }
+
+    private var formattedCacheSize: String {
+        guard cachedBytes > 0 else { return "0 KB" }
+        return ByteCountFormatter.string(fromByteCount: cachedBytes, countStyle: .file)
+    }
+
+    private func refreshCacheStats() {
+        let stats = LyricsDiskCache.default.stats()
+        cachedSongCount = stats.count
+        cachedBytes = stats.bytes
     }
 }
 

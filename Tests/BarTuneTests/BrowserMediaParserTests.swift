@@ -184,4 +184,23 @@ final class BrowserMediaParserTests: XCTestCase {
         XCTAssertEqual(snapshot?.track?.artist, "Kenshi Yonezu, Hikaru Utada")
         XCTAssertEqual(snapshot?.track?.title, "JANE DOE")
     }
+
+    func testDetectsReversedSongDashArtistYouTubeTitleUsingChannelName() {
+        let sep = "\u{1F}"
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:www.youtube.com:\"Crying for Rain\" - 美波 (Minami) MV|美波",
+            "\"Crying for Rain\" - 美波 (Minami) MV",
+            "美波",
+            "",
+            "253.361",
+            "60.0",
+            "",
+        ].joined(separator: sep)
+
+        let snapshot = BrowserMediaParser.parsePayload(payload)
+        XCTAssertEqual(snapshot?.track?.artist, "美波")
+        XCTAssertEqual(snapshot?.track?.title, "Crying for Rain")
+    }
 }

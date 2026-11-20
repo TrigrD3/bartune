@@ -54,14 +54,40 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertNotNil(cache.load(trackId: "track-3"))
     }
 
+    func testUnlimitedCacheDoesNotPruneAndManualPruneTrimsToNewLimit() {
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+
+        cache.save(trackId: "track-1", lines: sample)
+        Thread.sleep(forTimeInterval: 0.02)
+        cache.save(trackId: "track-2", lines: sample)
+        Thread.sleep(forTimeInterval: 0.02)
+        cache.save(trackId: "track-3", lines: sample)
+
+        XCTAssertEqual(cache.stats().count, 3)
+
+        cache.prune(to: 1)
+        XCTAssertEqual(cache.stats().count, 1)
+        XCTAssertNil(cache.load(trackId: "track-1"))
+        XCTAssertNil(cache.load(trackId: "track-2"))
+        XCTAssertNotNil(cache.load(trackId: "track-3"))
+    }
+
     func testClearRemovesAllCachedLyrics() {
         let cache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
         let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
         cache.save(trackId: "track-a", lines: sample)
         cache.save(trackId: "track-b", lines: sample)
 
+        let before = cache.stats()
+        XCTAssertEqual(before.count, 2)
+        XCTAssertGreaterThan(before.bytes, 0)
+
         cache.clear()
 
+        let after = cache.stats()
+        XCTAssertEqual(after.count, 0)
+        XCTAssertEqual(after.bytes, 0)
         XCTAssertNil(cache.load(trackId: "track-a"))
         XCTAssertNil(cache.load(trackId: "track-b"))
     }

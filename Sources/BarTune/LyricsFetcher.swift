@@ -2,19 +2,30 @@ import CryptoKit
 import Foundation
 
 struct LyricsDiskCache: Sendable {
+    static let limitDefaultsKey = "bartune.lyricsCacheLimit"
+    static let defaultMaxEntries = 1000
+
     let directory: URL
+    /// Maximum cached songs (`0` means unlimited).
     let maxEntries: Int
+
+    static func configuredMaxEntries(from ud: UserDefaults = .standard) -> Int {
+        guard ud.object(forKey: limitDefaultsKey) != nil else {
+            return defaultMaxEntries
+        }
+        return max(0, ud.integer(forKey: limitDefaultsKey))
+    }
 
     static var `default`: LyricsDiskCache {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("com.arya.BarTune/lyrics", isDirectory: true)
-        return LyricsDiskCache(directory: dir, maxEntries: 1000)
+        return LyricsDiskCache(directory: dir, maxEntries: configuredMaxEntries())
     }
 
-    init(directory: URL, maxEntries: Int = 1000) {
+    init(directory: URL, maxEntries: Int = defaultMaxEntries) {
         self.directory = directory
-        self.maxEntries = max(1, maxEntries)
+        self.maxEntries = max(0, maxEntries)
     }
 
     private func fileURL(for trackId: String) -> URL {
@@ -33,14 +44,14 @@ struct LyricsDiskCache: Sendable {
         return lines
     }
 
-    func save(trackId: String, lines: [LyricLine]) {
+    func save(trackId: String, lines: [LyricLine], maxEntriesOverride: Int? = nil) {
         guard !lines.isEmpty else { return }
         let fm = FileManager.default
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(lines) else { return }
         let url = fileURL(for: trackId)
         try? data.write(to: url, options: .atomic)
-        pruneIfNeeded()
+        prune(to: maxEntriesOverride ?? maxEntries)
     }
 
     func clear() {
@@ -51,7 +62,27 @@ struct LyricsDiskCache: Sendable {
         }
     }
 
-    private func pruneIfNeeded() {
+    func stats() -> (count: Int, bytes: Int64) {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return (0, 0) }
+
+        var count = 0
+        var totalBytes: Int64 = 0
+        for file in files where file.pathExtension == "json" {
+            count += 1
+            if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize {
+                totalBytes += Int64(size)
+            }
+        }
+        return (count, totalBytes)
+    }
+
+    func prune(to limit: Int) {
+        guard limit > 0 else { return }
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
             at: directory,
@@ -60,14 +91,14 @@ struct LyricsDiskCache: Sendable {
         ) else { return }
 
         let jsonFiles = files.filter { $0.pathExtension == "json" }
-        guard jsonFiles.count > maxEntries else { return }
+        guard jsonFiles.count > limit else { return }
 
         let sorted = jsonFiles.sorted { lhs, rhs in
             let d1 = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             let d2 = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
             return d1 < d2
         }
-        let excess = sorted.count - maxEntries
+        let excess = sorted.count - limit
         for file in sorted.prefix(excess) {
             try? fm.removeItem(at: file)
         }
@@ -208,28 +239,28 @@ actor LyricsFetcher {
         let netEase = await fetchNetEase(track: track)
         if let yrc = netEase.yrc, !yrc.isEmpty {
             cache[track.id] = yrc
-            diskCache.save(trackId: track.id, lines: yrc)
+            diskCache.save(trackId: track.id, lines: yrc, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
             return yrc
         }
 
         // 2. Fall back to LRCLIB exact match
         if let exact = await fetchLRCLibExact(track: track), !exact.isEmpty {
             cache[track.id] = exact
-            diskCache.save(trackId: track.id, lines: exact)
+            diskCache.save(trackId: track.id, lines: exact, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
             return exact
         }
 
         // 3. Fall back to LRCLIB search
         if let searched = await fetchLRCLibSearch(track: track), !searched.isEmpty {
             cache[track.id] = searched
-            diskCache.save(trackId: track.id, lines: searched)
+            diskCache.save(trackId: track.id, lines: searched, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
             return searched
         }
 
         // 4. Final fallback: NetEase line-level LRC
         if let lrc = netEase.lrc, !lrc.isEmpty {
             cache[track.id] = lrc
-            diskCache.save(trackId: track.id, lines: lrc)
+            diskCache.save(trackId: track.id, lines: lrc, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
             return lrc
         }
 
