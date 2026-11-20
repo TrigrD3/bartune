@@ -25,6 +25,7 @@ struct EqualizerIconView: View {
 struct KaraokeLineView: View {
     let text: String
     let progress: Double
+    let animationStep: Double
     let font: Font
     let unsungColor: Color
     let sungColor: Color
@@ -70,6 +71,7 @@ struct KaraokeLineView: View {
                                     .frame(width: feather)
                                     Spacer(minLength: 0)
                                 }
+                                .animation(progress > 0.01 ? .linear(duration: animationStep) : nil, value: progress)
                             }
                         )
                 } else {
@@ -81,7 +83,7 @@ struct KaraokeLineView: View {
                 }
             }
             .offset(x: scrollOffset)
-            .animation(.linear(duration: 0.06), value: scrollOffset)
+            .animation(.linear(duration: animationStep), value: scrollOffset)
             .frame(maxHeight: .infinity, alignment: .center)
         }
         .clipped()
@@ -185,6 +187,7 @@ struct LyricsOverlayView: View {
                 KaraokeLineView(
                     text: state.currentText,
                     progress: state.lineProgress,
+                    animationStep: state.lowCPUMode ? 0.12 : 0.035,
                     font: state.fontOption.font(size: state.fontSize, weight: state.fontWeight),
                     unsungColor: activeUnsungColor,
                     sungColor: activeSungColor,
