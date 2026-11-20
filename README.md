@@ -13,7 +13,7 @@ Supports **Spotify** and **Apple Music** out of the box with no login or API key
 - **Album Art Color Themes** — Syncs highlight or backdrop colors to the currently playing album artwork.
 - **Custom Typography & Appearance** — Configure font family, weight, font size (`11–15 pt`), and background opacity (`70%–100%`) in Settings (`⌘,`).
 - **Japanese → Romaji** — Built-in offline macOS `CFStringTokenizer` converts Japanese lyrics (Kanji, Hiragana, Katakana) to Romaji with an instant toggle.
-- **Spotify + Apple Music** — Reads local playback via AppleScript with comma-decimal locale support (`en_ID`, `de_DE`, `uk_UA`, etc.).
+- **Spotify + Apple Music + Browser Music** — Reads local playback via AppleScript with comma-decimal locale support (`en_ID`, `de_DE`, `uk_UA`, etc.), and falls back to browser tabs (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web in Chrome, Arc, Brave, Edge, or Safari).
 
 ## Requirements
 

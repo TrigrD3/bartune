@@ -136,6 +136,7 @@ final class LyricsState: ObservableObject {
         static let fontWeight = "bartune.fontWeight"
         static let romanizeJapanese = "bartune.romanizeJapanese"
         static let lowCPUMode = "bartune.lowCPUMode"
+        static let browserMusicEnabled = "bartune.browserMusicEnabled"
     }
 
     @Published var currentText: String = ""
@@ -202,6 +203,10 @@ final class LyricsState: ObservableObject {
         didSet { UserDefaults.standard.set(lowCPUMode, forKey: Keys.lowCPUMode) }
     }
 
+    @Published var browserMusicEnabled: Bool {
+        didSet { UserDefaults.standard.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
+    }
+
     var shouldShowOverlay: Bool {
         isEnabled && isPlaying && !currentText.isEmpty
     }
@@ -256,6 +261,7 @@ final class LyricsState: ObservableObject {
 
         self.romanizeJapanese = ud.object(forKey: Keys.romanizeJapanese) as? Bool ?? true
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
+        self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
     }
 
     func setTrack(_ track: TrackInfo?, lyrics: [LyricLine]) {

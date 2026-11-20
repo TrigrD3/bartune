@@ -11,7 +11,8 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   OverlayWindowController.swift # Left-of-notch overlay window (auxiliaryTopLeftArea) & hover/spotlight mask
   LyricsOverlayView.swift  # GPU-interpolated karaoke sweep, auto-scroll, animated equalizer
   LyricsState.swift        # Observable state & persisted user preferences
-  SpotifyMonitor.swift     # Event-driven AppleScript playback monitor (Spotify & Apple Music)
+  SpotifyMonitor.swift     # Event-driven AppleScript playback monitor (Spotify, Apple Music, browser fallback)
+  BrowserMediaMonitor.swift # Browser tab music monitor (YouTube Music, YouTube, Spotify Web, SoundCloud)
   LyricsFetcher.swift      # NetEase YRC & LRCLIB lyrics fetching and caching
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
   AlbumArtColorExtractor.swift # Dominant/accent color extraction from album artwork

@@ -31,12 +31,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
         }
-        spotifyMonitor.start(lowCPUMode: state.lowCPUMode)
+        spotifyMonitor.start(lowCPUMode: state.lowCPUMode, browserMusicEnabled: state.browserMusicEnabled)
 
         state.$lowCPUMode
             .receive(on: RunLoop.main)
             .sink { [weak self] lowCPU in
                 self?.spotifyMonitor.setLowCPUMode(lowCPU)
+            }
+            .store(in: &cancellables)
+
+        state.$browserMusicEnabled
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                self?.spotifyMonitor.setBrowserMusicEnabled(enabled)
             }
             .store(in: &cancellables)
 

@@ -116,6 +116,13 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
+                Toggle("Browser Music (YouTube Music, etc.)", isOn: $state.browserMusicEnabled)
+                Text(
+                    "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle. Requires \"Allow JavaScript from Apple Events\" in your browser."
+                )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack {
                     Text("Timing Offset")
                     Spacer()

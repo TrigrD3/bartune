@@ -17,7 +17,9 @@ final class SpotifyMonitor {
     private var lastSnapshot: PlaybackSnapshot?
     private var lastPollDate: Date = .now
     private var lowCPUMode: Bool = true
+    private var browserMusicEnabled: Bool = true
     private var isStarted: Bool = false
+    private let browserMonitor = BrowserMediaMonitor()
 
     private var spotifyObserver: NSObjectProtocol?
     private var musicObserver: NSObjectProtocol?
@@ -73,9 +75,18 @@ final class SpotifyMonitor {
         }
     }
 
-    func start(lowCPUMode: Bool = true) {
+    func setBrowserMusicEnabled(_ enabled: Bool) {
+        guard browserMusicEnabled != enabled else { return }
+        browserMusicEnabled = enabled
+        if isStarted {
+            poll()
+        }
+    }
+
+    func start(lowCPUMode: Bool = true, browserMusicEnabled: Bool = true) {
         stop()
         self.lowCPUMode = lowCPUMode
+        self.browserMusicEnabled = browserMusicEnabled
         self.isStarted = true
 
         // Event-driven playback notifications from Spotify and Apple Music
@@ -159,6 +170,13 @@ final class SpotifyMonitor {
         let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
 
         guard error == nil, let raw = result.stringValue, raw != "IDLE" else {
+            if browserMusicEnabled, let browserSnap = browserMonitor.poll() {
+                lastSnapshot = browserSnap
+                lastPollDate = Date()
+                updateInterpolationTimer(isPlaying: browserSnap.isPlaying)
+                onUpdate?(browserSnap)
+                return
+            }
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
             lastSnapshot = snapshot
             lastPollDate = now
@@ -215,7 +233,7 @@ final class SpotifyMonitor {
         onUpdate?(interpolated)
     }
 
-    static func parseLocaleDouble(_ raw: String) -> Double? {
+    nonisolated static func parseLocaleDouble(_ raw: String) -> Double? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = trimmed.replacingOccurrences(of: ",", with: ".")
         return Double(normalized)
