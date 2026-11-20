@@ -1,30 +1,42 @@
 import SwiftUI
 import AppKit
 
+private enum SettingsTab: Hashable {
+    case general
+    case appearance
+    case visualizer
+    case lyricsSync
+}
+
 struct SettingsView: View {
     @ObservedObject var state: LyricsState
+    @State private var selectedTab: SettingsTab = .general
 
     var body: some View {
-        TabView {
+        TabView(selection: $selectedTab) {
             generalTab
                 .tabItem {
                     Label("General", systemImage: "gearshape")
                 }
+                .tag(SettingsTab.general)
 
             appearanceTab
                 .tabItem {
                     Label("Appearance", systemImage: "paintbrush")
                 }
+                .tag(SettingsTab.appearance)
 
             visualizerTab
                 .tabItem {
                     Label("Visualizer", systemImage: "waveform")
                 }
+                .tag(SettingsTab.visualizer)
 
             lyricsSyncTab
                 .tabItem {
                     Label("Lyrics & Sync", systemImage: "music.note.list")
                 }
+                .tag(SettingsTab.lyricsSync)
         }
         .frame(width: 470, height: 430)
     }
@@ -144,7 +156,7 @@ struct SettingsView: View {
     private var visualizerTab: some View {
         Form {
             Section("Preview") {
-                VisualizerPreviewStrip(state: state)
+                VisualizerPreviewStrip(state: state, isAnimating: selectedTab == .visualizer)
                     .padding(.vertical, 4)
             }
 
@@ -221,6 +233,7 @@ struct SettingsView: View {
 
 private struct VisualizerPreviewStrip: View {
     @ObservedObject var state: LyricsState
+    let isAnimating: Bool
 
     private var backdropColor: Color {
         if state.themeMode == .albumTint, let colors = state.albumColors {
@@ -261,9 +274,9 @@ private struct VisualizerPreviewStrip: View {
             HStack(spacing: 7) {
                 if state.showEqualizer {
                     EqualizerIconView(
-                        isPlaying: true,
+                        isPlaying: isAnimating,
                         tint: equalizerColor,
-                        lowCPUMode: state.lowCPUMode,
+                        lowCPUMode: true,
                         style: state.visualizerStyle,
                         width: state.visualizerWidth
                     )
@@ -290,12 +303,13 @@ private struct VisualizerPreviewStrip: View {
 }
 
 @MainActor
-final class SettingsWindowController {
+final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let state: LyricsState
     private var window: NSWindow?
 
     init(state: LyricsState) {
         self.state = state
+        super.init()
     }
 
     func show() {
@@ -310,10 +324,16 @@ final class SettingsWindowController {
         win.title = "BarTune Settings"
         win.styleMask = [.titled, .closable]
         win.isReleasedWhenClosed = false
+        win.delegate = self
         win.center()
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
         self.window = win
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        window?.contentViewController = nil
+        window = nil
     }
 }

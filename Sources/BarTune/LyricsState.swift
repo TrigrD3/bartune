@@ -387,16 +387,18 @@ final class LyricsState: ObservableObject {
     }
 
     func updatePlayback(isPlaying: Bool, position: Double) {
-        self.isPlaying = isPlaying
+        if self.isPlaying != isPlaying {
+            self.isPlaying = isPlaying
+        }
         playbackAnchorPosition = position
         playbackAnchorDate = Date()
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
             if !isPlaying {
-                currentText = ""
-                currentLineId = -1
-                activeLine = nil
-                lineProgress = 0.0
+                if !currentText.isEmpty { currentText = "" }
+                if currentLineId != -1 { currentLineId = -1 }
+                if activeLine != nil { activeLine = nil }
+                if lineProgress != 0.0 { lineProgress = 0.0 }
             }
             return
         }

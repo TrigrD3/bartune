@@ -9,7 +9,7 @@ struct EqualizerIconView: View {
     let width: Double
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.16 : 0.06, paused: !isPlaying)) { timeline in
+        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.30 : 0.10, paused: !isPlaying)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let w = CGFloat(width)
             switch style {
@@ -101,7 +101,7 @@ struct KaraokeLineView: View {
     @State private var textWidth: CGFloat = 0
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 30.0) : (1.0 / 60.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
+        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
             let progress = karaokeEnabled ? state.liveProgress(at: timeline.date) : 1.0
             GeometryReader { container in
                 let availableWidth = container.size.width
@@ -122,26 +122,22 @@ struct KaraokeLineView: View {
                             .font(font)
                             .foregroundStyle(sungColor)
                             .fixedSize(horizontal: true, vertical: false)
-                            .mask(
-                                GeometryReader { maskGeo in
-                                    let w = maskGeo.size.width
-                                    let feather: CGFloat = 14
-                                    let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
-
-                                    HStack(spacing: 0) {
-                                        Rectangle()
-                                            .fill(Color.white)
-                                            .frame(width: max(0, fillWidth - feather))
-                                        LinearGradient(
-                                            colors: [Color.white, Color.clear],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                        .frame(width: feather)
-                                        Spacer(minLength: 0)
-                                    }
-                                }
-                            )
+                            .mask {
+                                let w = max(1, textWidth)
+                                let featherFrac = min(0.25, Double(14 / w))
+                                let edge = max(0.0, min(1.0, progress))
+                                let fadeEnd = min(1.0, edge + featherFrac)
+                                LinearGradient(
+                                    stops: [
+                                        .init(color: .white, location: 0),
+                                        .init(color: .white, location: edge),
+                                        .init(color: .clear, location: fadeEnd),
+                                        .init(color: .clear, location: 1),
+                                    ],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            }
                     } else {
                         Text(text)
                             .font(font)
