@@ -143,6 +143,28 @@ enum VisualizerStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum LyricsCacheLimit: Int, CaseIterable, Identifiable {
+    case songs100 = 100
+    case songs250 = 250
+    case songs500 = 500
+    case songs1000 = 1000
+    case songs2500 = 2500
+    case unlimited = 0
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .songs100: return "100 songs"
+        case .songs250: return "250 songs"
+        case .songs500: return "500 songs"
+        case .songs1000: return "1,000 songs"
+        case .songs2500: return "2,500 songs"
+        case .unlimited: return "Unlimited"
+        }
+    }
+}
+
 @MainActor
 final class LyricsState: ObservableObject {
     private enum Keys {
@@ -279,6 +301,15 @@ final class LyricsState: ObservableObject {
         didSet { userDefaults.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
     }
 
+    @Published var lyricsCacheLimit: LyricsCacheLimit {
+        didSet {
+            userDefaults.set(lyricsCacheLimit.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
+            if lyricsCacheLimit.rawValue > 0 {
+                LyricsDiskCache.default.prune(to: lyricsCacheLimit.rawValue)
+            }
+        }
+    }
+
     @Published var launchAtLogin: Bool = false {
         didSet {
             guard !isSyncingLaunchAtLogin else { return }
@@ -380,6 +411,8 @@ final class LyricsState: ObservableObject {
         self.romanizeChinese = ud.object(forKey: Keys.romanizeChinese) as? Bool ?? true
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
+        let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
+        self.lyricsCacheLimit = LyricsCacheLimit(rawValue: storedLimit) ?? .songs1000
         self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
 
         self.isSyncingLaunchAtLogin = true
