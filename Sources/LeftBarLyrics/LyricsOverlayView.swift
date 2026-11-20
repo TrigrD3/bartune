@@ -1,21 +1,8 @@
 import SwiftUI
 import AppKit
 
-struct VisualEffectBackground: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
-        view.material = .menu
-        view.blendingMode = .behindWindow
-        view.state = .active
-        return view
-    }
-
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
-}
-
 struct EqualizerIconView: View {
     let isPlaying: Bool
-    @State private var phase: Double = 0
 
     var body: some View {
         TimelineView(.animation(minimumInterval: 0.12, paused: !isPlaying)) { timeline in
@@ -36,6 +23,8 @@ struct EqualizerIconView: View {
 struct KaraokeLineView: View {
     let text: String
     let progress: Double
+    let fontSize: Double
+    let karaokeEnabled: Bool
 
     @State private var textWidth: CGFloat = 0
 
@@ -43,56 +32,51 @@ struct KaraokeLineView: View {
         GeometryReader { container in
             let availableWidth = container.size.width
             let overflow = max(0, textWidth - availableWidth)
-            // Keep the active sweep point centered when a line is wider than the left menu bar
             let scrollOffset: CGFloat = overflow > 0
                 ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
                 : 0
 
             ZStack(alignment: .leading) {
-                // Unsung base text
-                Text(text)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color.primary.opacity(0.36))
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(
-                        GeometryReader { textGeo in
-                            Color.clear.onAppear {
-                                textWidth = textGeo.size.width
-                            }
-                            .onChange(of: text) { _ in
-                                textWidth = textGeo.size.width
-                            }
-                            .onChange(of: textGeo.size.width) { newWidth in
-                                textWidth = newWidth
-                            }
-                        }
-                    )
+                if karaokeEnabled {
+                    // Unsung base text
+                    Text(text)
+                        .font(.system(size: fontSize, weight: .medium))
+                        .foregroundStyle(Color.primary.opacity(0.36))
+                        .fixedSize(horizontal: true, vertical: false)
+                        .background(widthReader)
 
-                // Sung karaoke highlighted text with smooth feathered sweep mask
-                Text(text)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Color.primary)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .mask(
-                        GeometryReader { maskGeo in
-                            let w = maskGeo.size.width
-                            let feather: CGFloat = 16
-                            let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
+                    // Sung karaoke highlighted text with smooth feathered sweep mask
+                    Text(text)
+                        .font(.system(size: fontSize, weight: .medium))
+                        .foregroundStyle(Color.primary)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .mask(
+                            GeometryReader { maskGeo in
+                                let w = maskGeo.size.width
+                                let feather: CGFloat = 16
+                                let fillWidth = max(0, min(w + feather, CGFloat(progress) * w + feather * 0.5))
 
-                            HStack(spacing: 0) {
-                                Rectangle()
-                                    .fill(Color.white)
-                                    .frame(width: max(0, fillWidth - feather))
-                                LinearGradient(
-                                    colors: [Color.white, Color.clear],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                                .frame(width: feather)
-                                Spacer(minLength: 0)
+                                HStack(spacing: 0) {
+                                    Rectangle()
+                                        .fill(Color.white)
+                                        .frame(width: max(0, fillWidth - feather))
+                                    LinearGradient(
+                                        colors: [Color.white, Color.clear],
+                                        startPoint: .leading,
+                                        endPoint: .trailing
+                                    )
+                                    .frame(width: feather)
+                                    Spacer(minLength: 0)
+                                }
                             }
-                        }
-                    )
+                        )
+                } else {
+                    Text(text)
+                        .font(.system(size: fontSize, weight: .medium))
+                        .foregroundStyle(Color.primary)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .background(widthReader)
+                }
             }
             .offset(x: scrollOffset)
             .animation(.linear(duration: 0.06), value: scrollOffset)
@@ -100,17 +84,27 @@ struct KaraokeLineView: View {
         }
         .clipped()
     }
+
+    private var widthReader: some View {
+        GeometryReader { textGeo in
+            Color.clear
+                .onAppear { textWidth = textGeo.size.width }
+                .onChange(of: text) { _ in textWidth = textGeo.size.width }
+                .onChange(of: textGeo.size.width) { newWidth in textWidth = newWidth }
+        }
+    }
 }
 
 struct CursorCutoutMask: View {
     let cursorX: CGFloat?
+    let spotlightWidth: Double
 
     var body: some View {
         GeometryReader { geo in
             let w = max(1, geo.size.width)
             if let cx = cursorX {
-                let clearHalf: CGFloat = 34
-                let feather: CGFloat = 28
+                let clearHalf: CGFloat = CGFloat(spotlightWidth) / 2.0
+                let feather: CGFloat = 24
 
                 let s1 = max(0, min(1, (cx - clearHalf - feather) / w))
                 let s2 = max(s1, min(1, (cx - clearHalf) / w))
@@ -141,25 +135,37 @@ struct LyricsOverlayView: View {
 
     var body: some View {
         ZStack(alignment: .leading) {
-            Color(nsColor: .windowBackgroundColor).opacity(0.96)
+            Color(nsColor: .windowBackgroundColor).opacity(state.backgroundOpacity)
 
             HStack(spacing: 7) {
-                EqualizerIconView(isPlaying: state.isPlaying)
+                if state.showEqualizer {
+                    EqualizerIconView(isPlaying: state.isPlaying)
+                }
 
-                KaraokeLineView(text: state.currentText, progress: state.lineProgress)
-                    .id(state.currentLineId)
-                    .transition(.asymmetric(
-                        insertion: .opacity.combined(with: .offset(y: 6)),
-                        removal: .opacity.combined(with: .offset(y: -6))
-                    ))
-                    .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
+                KaraokeLineView(
+                    text: state.currentText,
+                    progress: state.lineProgress,
+                    fontSize: state.fontSize,
+                    karaokeEnabled: state.karaokeAnimationEnabled
+                )
+                .id(state.currentLineId)
+                .transition(.asymmetric(
+                    insertion: .opacity.combined(with: .offset(y: 6)),
+                    removal: .opacity.combined(with: .offset(y: -6))
+                ))
+                .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
             }
             .padding(.horizontal, 10)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
         .compositingGroup()
-        .mask(CursorCutoutMask(cursorX: state.cursorLocalX))
+        .mask(
+            CursorCutoutMask(
+                cursorX: state.hoverMode == .spotlight ? state.cursorLocalX : nil,
+                spotlightWidth: state.spotlightWidth
+            )
+        )
         .animation(.easeOut(duration: 0.08), value: state.cursorLocalX == nil)
     }
 }

@@ -71,9 +71,9 @@ final class OverlayWindowController {
     }
 
     private func observeState() {
-        Publishers.CombineLatest3(state.$isEnabled, state.$isPlaying, state.$currentText)
+        Publishers.CombineLatest4(state.$isEnabled, state.$isPlaying, state.$currentText, state.$hoverMode)
             .receive(on: RunLoop.main)
-            .sink { [weak self] _, _, _ in
+            .sink { [weak self] _, _, _, _ in
                 self?.refreshVisibility()
             }
             .store(in: &cancellables)
@@ -210,8 +210,10 @@ final class OverlayWindowController {
             unhoverWorkItem?.cancel()
             unhoverWorkItem = nil
             isHovered = true
-            if let panel {
+            if state.hoverMode == .spotlight, let panel {
                 state.cursorLocalX = loc.x - panel.frame.minX
+            } else {
+                state.cursorLocalX = nil
             }
             refreshVisibility()
         } else if isHovered && !isMenuLikelyOpen {
@@ -233,9 +235,8 @@ final class OverlayWindowController {
 
     private func refreshVisibility() {
         guard let panel else { return }
-        // Keep the overlay visible on hover (the cursor spotlight mask reveals only the area under the cursor).
-        // Only hide the full bar when a menu dropdown is actively clicked open.
-        let visible = state.shouldShowOverlay && !isMenuLikelyOpen
+        let hiddenByHover = (state.hoverMode == .hideAll) && isHovered
+        let visible = state.shouldShowOverlay && !hiddenByHover && !isMenuLikelyOpen
         let targetAlpha: CGFloat = visible ? 1.0 : 0.0
 
         guard abs(panel.alphaValue - targetAlpha) > 0.01 else { return }

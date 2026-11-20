@@ -7,11 +7,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let spotifyMonitor = SpotifyMonitor()
     private let lyricsFetcher = LyricsFetcher()
     private var overlayController: OverlayWindowController?
+    private var settingsController: SettingsWindowController?
 
     private var statusItem: NSStatusItem?
     private var trackMenuItem: NSMenuItem?
     private var toggleMenuItem: NSMenuItem?
     private var offsetMenuItem: NSMenuItem?
+    private var hoverModeItems: [HoverMode: NSMenuItem] = [:]
 
     private var lastFetchedTrackId: String?
     private var fetchTask: Task<Void, Never>?
@@ -22,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusBarMenu()
         overlayController = OverlayWindowController(state: state)
+        settingsController = SettingsWindowController(state: state)
 
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
@@ -32,6 +35,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] summary in
                 self?.trackMenuItem?.title = summary
+            }
+            .store(in: &cancellables)
+
+        state.$hoverMode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] mode in
+                self?.syncHoverModeMenu(mode)
+            }
+            .store(in: &cancellables)
+
+        state.$offsetSeconds
+            .receive(on: RunLoop.main)
+            .sink { [weak self] offset in
+                let sign = offset > 0 ? "+" : ""
+                self?.offsetMenuItem?.title = String(format: "Sync Offset: %@%.1fs", sign, offset)
             }
             .store(in: &cancellables)
     }
@@ -63,6 +81,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(toggleItem)
         self.toggleMenuItem = toggleItem
 
+        // Quick-switch Hover Mode submenu
+        let hoverMenuItem = NSMenuItem(title: "Hover Mode", action: nil, keyEquivalent: "")
+        let hoverSubmenu = NSMenu()
+        for mode in HoverMode.allCases {
+            let modeItem = NSMenuItem(title: mode.title, action: #selector(selectHoverMode(_:)), keyEquivalent: "")
+            modeItem.target = self
+            modeItem.representedObject = mode.rawValue
+            modeItem.state = (mode == state.hoverMode) ? .on : .off
+            hoverSubmenu.addItem(modeItem)
+            hoverModeItems[mode] = modeItem
+        }
+        hoverMenuItem.submenu = hoverSubmenu
+        menu.addItem(hoverMenuItem)
+
         menu.addItem(.separator())
 
         let offsetHeader = NSMenuItem(title: "Sync Offset: 0.0s", action: nil, keyEquivalent: "")
@@ -84,12 +116,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let settingsItem = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settingsItem.target = self
+        menu.addItem(settingsItem)
+
         let quitItem = NSMenuItem(title: "Quit LeftBar Lyrics", action: #selector(quitApp), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
 
         item.menu = menu
         self.statusItem = item
+    }
+
+    private func syncHoverModeMenu(_ active: HoverMode) {
+        for (mode, item) in hoverModeItems {
+            item.state = (mode == active) ? .on : .off
+        }
     }
 
     private func handlePlaybackUpdate(_ snapshot: PlaybackSnapshot) {
@@ -124,24 +166,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleMenuItem?.state = state.isEnabled ? .on : .off
     }
 
+    @objc private func selectHoverMode(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let mode = HoverMode(rawValue: raw) else { return }
+        state.hoverMode = mode
+    }
+
     @objc private func nudgeEarlier() {
         state.offsetSeconds += 0.5
-        updateOffsetLabel()
     }
 
     @objc private func nudgeLater() {
         state.offsetSeconds -= 0.5
-        updateOffsetLabel()
     }
 
     @objc private func resetOffset() {
         state.offsetSeconds = 0.0
-        updateOffsetLabel()
     }
 
-    private func updateOffsetLabel() {
-        let sign = state.offsetSeconds > 0 ? "+" : ""
-        offsetMenuItem?.title = String(format: "Sync Offset: %@%.1fs", sign, state.offsetSeconds)
+    @objc private func openSettings() {
+        settingsController?.show()
     }
 
     @objc private func quitApp() {
