@@ -28,6 +28,9 @@ struct SettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         Slider(value: $state.spotlightWidth, in: 36...180, step: 4)
+                        Text("Changes save automatically — hover the left menu bar to see the cutout width.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }

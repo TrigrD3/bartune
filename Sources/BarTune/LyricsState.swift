@@ -318,17 +318,32 @@ final class LyricsState: ObservableObject {
             let line = lines[idx]
             let displayText = line.text.isEmpty ? "♪" : line.text
 
-            let rawDuration: Double
-            if idx + 1 < lines.count {
-                rawDuration = max(0.4, lines[idx + 1].timestamp - line.timestamp)
-            } else {
-                rawDuration = 4.5
-            }
+            let nextTimestamp: Double = (idx + 1 < lines.count)
+                ? lines[idx + 1].timestamp
+                : (line.timestamp + 4.5)
+            let rawDuration = max(0.4, nextTimestamp - line.timestamp)
 
-            let estimatedSingDuration = max(2.2, Double(displayText.count) * 0.11)
-            let effectiveDuration = min(rawDuration, estimatedSingDuration)
-            let elapsed = max(0.0, effectivePos - line.timestamp)
-            let progress = min(1.0, max(0.0, elapsed / effectiveDuration))
+            let progress: Double
+            if !line.words.isEmpty && !(romanizeJapanese && isJapaneseSong) {
+                // Exact word-by-word progress when enhanced LRC word timestamps are present
+                progress = Self.computeWordProgress(
+                    words: line.words,
+                    position: effectivePos,
+                    lineEnd: nextTimestamp
+                )
+            } else {
+                // Tempo-adaptive pacing: follows the song's real line interval (slow ballads glide slowly,
+                // fast tracks sweep briskly) while capping long instrumental breaks.
+                let effectiveDuration: Double
+                if rawDuration <= 10.0 {
+                    effectiveDuration = max(0.5, rawDuration * 0.90)
+                } else {
+                    let breakCap = max(4.5, Double(displayText.count) * 0.16)
+                    effectiveDuration = min(rawDuration * 0.85, breakCap)
+                }
+                let elapsed = max(0.0, effectivePos - line.timestamp)
+                progress = min(1.0, max(0.0, elapsed / effectiveDuration))
+            }
 
             if line.id != currentLineId {
                 currentLineId = line.id
@@ -340,5 +355,30 @@ final class LyricsState: ObservableObject {
             currentText = "♪"
             lineProgress = 0.0
         }
+    }
+
+    private static func computeWordProgress(
+        words: [WordTimestamp],
+        position: Double,
+        lineEnd: Double
+    ) -> Double {
+        let totalChars = max(1, words.reduce(0) { $0 + $1.text.count })
+        var charsBefore = 0
+
+        for (i, word) in words.enumerated() {
+            let wordStart = word.timestamp
+            let wordEnd = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
+            let wordChars = word.text.count
+
+            if position < wordStart {
+                return Double(charsBefore) / Double(totalChars)
+            } else if position < wordEnd {
+                let wordDur = max(0.05, wordEnd - wordStart)
+                let frac = min(1.0, max(0.0, (position - wordStart) / wordDur))
+                return (Double(charsBefore) + Double(wordChars) * frac) / Double(totalChars)
+            }
+            charsBefore += wordChars
+        }
+        return 1.0
     }
 }
