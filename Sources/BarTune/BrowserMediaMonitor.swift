@@ -31,7 +31,7 @@ enum BrowserMediaParser {
 
     private static let youtubeNoisePatterns: [String] = [
         #"\s*[\(\[]\s*(?:official\s+)?(?:music\s+video|lyric\s+video|audio|video|mv|m/v|visualizer|lyrics|hd|4k|hq)\s*[\)\]]"#,
-        #"\s+official\s+(?:music\s+video|lyric\s+video|audio|video|mv|visualizer)$"#,
+        #"\s+(?:official\s+)?(?:music\s+video|lyric\s+video|official\s+audio|official\s+video|mv|m/v|visualizer)$"#,
     ]
 
     static func cleanTitle(_ raw: String) -> String {
@@ -71,14 +71,32 @@ enum BrowserMediaParser {
         }
         for separator in [" - ", " – ", " — "] {
             if let range = title.range(of: separator) {
-                let lhs = String(title[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                let rhs = String(title[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                let lhs = stripWrappingQuotes(String(title[..<range.lowerBound]))
+                let rhs = stripWrappingQuotes(String(title[range.upperBound...]))
                 if !lhs.isEmpty && !rhs.isEmpty {
+                    // Detect reversed `"Song Title" - Artist` format when channel name matches rhs
+                    let normFallback = LyricsMatcher.normalize(fallbackArtist)
+                    let normLhs = LyricsMatcher.normalize(lhs)
+                    let normRhs = LyricsMatcher.normalize(rhs)
+                    if !normFallback.isEmpty,
+                       normRhs.contains(normFallback),
+                       !normLhs.contains(normFallback) {
+                        return (artist: fallbackArtist, title: lhs)
+                    }
                     return (artist: lhs, title: rhs)
                 }
             }
         }
-        return (artist: fallbackArtist, title: title)
+        return (artist: fallbackArtist, title: stripWrappingQuotes(title))
+    }
+
+    private static func stripWrappingQuotes(_ text: String) -> String {
+        var out = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pairs: [(Character, Character)] = [("\"", "\""), ("“", "”"), ("「", "」"), ("『", "』")]
+        for (open, close) in pairs where out.first == open && out.last == close && out.count >= 2 {
+            out = String(out.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return out
     }
 
     private static func extractQuotedArtistAndTitle(from title: String) -> (artist: String, title: String)? {
