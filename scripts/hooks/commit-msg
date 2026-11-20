@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+COMMIT_MSG_FILE="$1"
+FIRST_LINE="$(head -n 1 "$COMMIT_MSG_FILE")"
+
+# Allow merge/revert auto-generated messages
+if [[ "$FIRST_LINE" =~ ^(Merge|Revert)\  ]]; then
+    exit 0
+fi
+
+PATTERN='^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\((app|test|build|ci|docs)\))?(!)?: .+$'
+
+if [[ ! "$FIRST_LINE" =~ $PATTERN ]]; then
+    echo "ERROR: Commit message does not follow Conventional Commits." >&2
+    echo "  Expected: <type>(<scope>): <description>" >&2
+    echo "  Types:    feat, fix, docs, style, refactor, perf, test, chore, build, ci, revert" >&2
+    echo "  Scopes:   app, test, build, ci, docs (optional)" >&2
+    echo "  Got:      $FIRST_LINE" >&2
+    exit 1
+fi
