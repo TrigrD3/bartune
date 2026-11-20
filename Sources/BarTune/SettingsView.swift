@@ -143,6 +143,11 @@ struct SettingsView: View {
 
     private var visualizerTab: some View {
         Form {
+            Section("Preview") {
+                VisualizerPreviewStrip(state: state)
+                    .padding(.vertical, 4)
+            }
+
             Section("Visualizer") {
                 Toggle("Show Visualizer", isOn: $state.showEqualizer)
 
@@ -211,6 +216,76 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+private struct VisualizerPreviewStrip: View {
+    @ObservedObject var state: LyricsState
+
+    private var backdropColor: Color {
+        if state.themeMode == .albumTint, let colors = state.albumColors {
+            return Color(nsColor: colors.backdropNSColor).opacity(state.backgroundOpacity)
+        }
+        return Color(nsColor: .windowBackgroundColor).opacity(state.backgroundOpacity)
+    }
+
+    private var equalizerColor: Color {
+        if state.themeMode != .system, let colors = state.albumColors {
+            return Color(nsColor: colors.accentNSColor)
+        }
+        return Color.accentColor
+    }
+
+    private var textColor: Color {
+        switch state.themeMode {
+        case .system:
+            return Color.primary
+        case .albumAccent:
+            if let colors = state.albumColors {
+                return Color(nsColor: colors.accentNSColor)
+            }
+            return Color.primary
+        case .albumTint:
+            return Color.white
+        }
+    }
+
+    private var previewText: String {
+        state.currentText.isEmpty ? "Now playing in your menu bar" : state.currentText
+    }
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            backdropColor
+
+            HStack(spacing: 7) {
+                if state.showEqualizer {
+                    EqualizerIconView(
+                        isPlaying: true,
+                        tint: equalizerColor,
+                        lowCPUMode: state.lowCPUMode,
+                        style: state.visualizerStyle,
+                        width: state.visualizerWidth
+                    )
+                }
+
+                Text(previewText)
+                    .font(state.fontOption.font(size: state.fontSize, weight: state.fontWeight))
+                    .foregroundStyle(textColor)
+                    .lineLimit(1)
+
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 10)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 28)
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+        )
+        .animation(.easeInOut(duration: 0.2), value: state.showEqualizer)
     }
 }
 
