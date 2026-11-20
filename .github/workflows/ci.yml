@@ -63,7 +63,22 @@ jobs:
             ${{ runner.os }}-spm-
       - name: Build
         run: swift build
-      - name: Run unit tests
-        run: swift test
+      - name: Run unit tests with coverage
+        run: swift test --enable-code-coverage
+      - name: Export LCOV coverage
+        run: |
+          BIN_PATH="$(swift build --show-bin-path)"
+          TEST_BIN="$(find "$BIN_PATH" -maxdepth 3 -name 'BarTunePackageTests' -type f | head -n 1)"
+          PROFDATA="$(swift test --show-codecov-path | sed 's|/codecov/.*|/codecov/default.profdata|')"
+          if [[ -n "$TEST_BIN" && -f "$PROFDATA" ]]; then
+            xcrun llvm-cov export -format=lcov "$TEST_BIN" -instr-profile="$PROFDATA" > coverage.lcov
+          fi
+      - name: Upload coverage to Codecov
+        if: hashFiles('coverage.lcov') != ''
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
       - name: Verify .app bundle build
         run: ./build.sh

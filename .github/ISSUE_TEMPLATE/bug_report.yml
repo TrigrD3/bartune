@@ -1,0 +1,44 @@
+name: Bug Report
+description: Report a bug or playback/lyrics issue in BarTune
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear description of the bug.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Play a track on Spotify / Apple Music
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: player
+    attributes:
+      label: Music Player
+      options:
+        - Spotify
+        - Apple Music
+        - Both
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS Version
+      placeholder: "e.g. macOS 15.3 (Apple Silicon)"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: BarTune Version
+      placeholder: "e.g. 0.2.0"

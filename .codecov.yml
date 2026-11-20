@@ -1,0 +1,27 @@
+# Codecov configuration — see https://docs.codecov.com/docs/codecov-yaml
+codecov:
+  require_ci_to_pass: true
+
+coverage:
+  precision: 1
+  round: down
+  range: "60...85"
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+    patch:
+      default:
+        target: 50%
+        threshold: 10%
+
+comment:
+  layout: "reach, diff, flags, files"
+  behavior: once
+  require_changes: true
+
+ignore:
+  - "Tests/**/*"
+  - "Sources/BarTune/main.swift"
+  - "Sources/BarTune/AppDelegate.swift"
