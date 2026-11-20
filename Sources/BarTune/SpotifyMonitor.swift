@@ -16,6 +16,11 @@ final class SpotifyMonitor {
     private var interpolationTimer: Timer?
     private var lastSnapshot: PlaybackSnapshot?
     private var lastPollDate: Date = .now
+    private var lowCPUMode: Bool = true
+    private var isStarted: Bool = false
+
+    private var spotifyObserver: NSObjectProtocol?
+    private var musicObserver: NSObjectProtocol?
 
     private static let scriptSource = """
     set sep to character id 31
@@ -60,28 +65,87 @@ final class SpotifyMonitor {
         self.compiledScript = NSAppleScript(source: Self.scriptSource)
     }
 
-    func start() {
-        stop()
-        poll()
+    func setLowCPUMode(_ enabled: Bool) {
+        guard lowCPUMode != enabled else { return }
+        lowCPUMode = enabled
+        if isStarted {
+            scheduleTimers()
+        }
+    }
 
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.6, repeats: true) { [weak self] _ in
+    func start(lowCPUMode: Bool = true) {
+        stop()
+        self.lowCPUMode = lowCPUMode
+        self.isStarted = true
+
+        // Event-driven playback notifications from Spotify and Apple Music
+        let dnc = DistributedNotificationCenter.default()
+        spotifyObserver = dnc.addObserver(
+            forName: NSNotification.Name("com.spotify.client.PlaybackStateChanged"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.poll()
+            }
+        }
+        musicObserver = dnc.addObserver(
+            forName: NSNotification.Name("com.apple.Music.playerInfo"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
             Task { @MainActor in
                 self?.poll()
             }
         }
 
-        interpolationTimer = Timer.scheduledTimer(withTimeInterval: 0.033, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.emitInterpolated()
-            }
-        }
+        poll()
+        scheduleTimers()
     }
 
     func stop() {
+        isStarted = false
         pollTimer?.invalidate()
         pollTimer = nil
         interpolationTimer?.invalidate()
         interpolationTimer = nil
+
+        let dnc = DistributedNotificationCenter.default()
+        if let obs = spotifyObserver { dnc.removeObserver(obs); spotifyObserver = nil }
+        if let obs = musicObserver { dnc.removeObserver(obs); musicObserver = nil }
+    }
+
+    private func scheduleTimers() {
+        pollTimer?.invalidate()
+        // Always event-driven via DistributedNotificationCenter; light 3.0s drift check only.
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.poll()
+            }
+        }
+
+        updateInterpolationTimer(isPlaying: lastSnapshot?.isPlaying ?? false)
+    }
+
+    private func updateInterpolationTimer(isPlaying: Bool) {
+        if !isPlaying {
+            // Pause interpolation completely when idle/paused -> ~0% CPU
+            interpolationTimer?.invalidate()
+            interpolationTimer = nil
+            return
+        }
+
+        let desiredInterval: TimeInterval = lowCPUMode ? 0.12 : 0.033
+        if let existing = interpolationTimer, abs(existing.timeInterval - desiredInterval) < 0.005 {
+            return
+        }
+
+        interpolationTimer?.invalidate()
+        interpolationTimer = Timer.scheduledTimer(withTimeInterval: desiredInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.emitInterpolated()
+            }
+        }
     }
 
     private func poll() {
@@ -98,6 +162,7 @@ final class SpotifyMonitor {
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
             lastSnapshot = snapshot
             lastPollDate = now
+            updateInterpolationTimer(isPlaying: false)
             onUpdate?(snapshot)
             return
         }
@@ -112,9 +177,7 @@ final class SpotifyMonitor {
         let artist = parts[4]
         let album = parts[5]
 
-        // Locale-safe decimal parsing: AppleScript `as string` uses `,` in locales like en_ID, de_DE, uk_UA.
         let rawDuration = Self.parseLocaleDouble(parts[6]) ?? 0
-        // Spotify returns duration in milliseconds; Apple Music returns seconds.
         let durationSec = (source == "SPOTIFY") ? (rawDuration / 1000.0) : rawDuration
         let positionSec = Self.parseLocaleDouble(parts[7]) ?? 0
         let artworkURL = parts.count >= 9 && !parts[8].isEmpty ? parts[8] : nil
@@ -136,6 +199,7 @@ final class SpotifyMonitor {
         )
         lastSnapshot = snapshot
         lastPollDate = now
+        updateInterpolationTimer(isPlaying: isPlaying)
         onUpdate?(snapshot)
     }
 

@@ -31,7 +31,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
         }
-        spotifyMonitor.start()
+        spotifyMonitor.start(lowCPUMode: state.lowCPUMode)
+
+        state.$lowCPUMode
+            .receive(on: RunLoop.main)
+            .sink { [weak self] lowCPU in
+                self?.spotifyMonitor.setLowCPUMode(lowCPU)
+            }
+            .store(in: &cancellables)
 
         state.$trackSummary
             .receive(on: RunLoop.main)

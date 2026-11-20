@@ -135,6 +135,7 @@ final class LyricsState: ObservableObject {
         static let fontOption = "bartune.fontOption"
         static let fontWeight = "bartune.fontWeight"
         static let romanizeJapanese = "bartune.romanizeJapanese"
+        static let lowCPUMode = "bartune.lowCPUMode"
     }
 
     @Published var currentText: String = ""
@@ -197,6 +198,10 @@ final class LyricsState: ObservableObject {
         }
     }
 
+    @Published var lowCPUMode: Bool {
+        didSet { UserDefaults.standard.set(lowCPUMode, forKey: Keys.lowCPUMode) }
+    }
+
     var shouldShowOverlay: Bool {
         isEnabled && isPlaying && !currentText.isEmpty
     }
@@ -250,6 +255,7 @@ final class LyricsState: ObservableObject {
         self.backgroundOpacity = storedOpacity > 0 ? storedOpacity : 0.96
 
         self.romanizeJapanese = ud.object(forKey: Keys.romanizeJapanese) as? Bool ?? true
+        self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
     }
 
     func setTrack(_ track: TrackInfo?, lyrics: [LyricLine]) {

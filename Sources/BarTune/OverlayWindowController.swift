@@ -176,11 +176,20 @@ final class OverlayWindowController {
             }
         }
 
-        // Lightweight periodic check while hidden/hovered so we never get stuck hidden.
-        hoverCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.05, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.evaluateMouseLocation()
+        // Only run the periodic hover check while hovered or a menu is open (0 CPU wakeups otherwise).
+    }
+
+    private func ensureHoverCheckTimer(_ active: Bool) {
+        if active {
+            guard hoverCheckTimer == nil else { return }
+            hoverCheckTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.evaluateMouseLocation()
+                }
             }
+        } else {
+            hoverCheckTimer?.invalidate()
+            hoverCheckTimer = nil
         }
     }
 
@@ -210,6 +219,7 @@ final class OverlayWindowController {
             unhoverWorkItem?.cancel()
             unhoverWorkItem = nil
             isHovered = true
+            ensureHoverCheckTimer(true)
             if state.hoverMode == .spotlight, let panel {
                 state.cursorLocalX = loc.x - panel.frame.minX
             } else {
@@ -224,12 +234,15 @@ final class OverlayWindowController {
                     if !self.hoverTriggerRect.contains(NSEvent.mouseLocation) && !self.isMenuLikelyOpen {
                         self.isHovered = false
                         self.state.cursorLocalX = nil
+                        self.ensureHoverCheckTimer(false)
                         self.refreshVisibility()
                     }
                 }
                 unhoverWorkItem = work
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: work)
             }
+        } else if !isHovered && !isMenuLikelyOpen {
+            ensureHoverCheckTimer(false)
         }
     }
 

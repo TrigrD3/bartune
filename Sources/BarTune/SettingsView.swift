@@ -103,7 +103,19 @@ struct SettingsView: View {
                 }
             }
 
-            Section("Sync Offset") {
+            Section("Performance & Sync") {
+                Picker("Karaoke Precision", selection: $state.lowCPUMode) {
+                    Text("Low CPU (Standard)").tag(true)
+                    Text("High Precision (30fps)").tag(false)
+                }
+                .pickerStyle(.segmented)
+
+                Text(state.lowCPUMode
+                     ? "Lightweight karaoke sweep for lower CPU usage (event-driven sync is always active)."
+                     : "30fps karaoke sweep for smoother word-by-word highlighting.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                 HStack {
                     Text("Timing Offset")
                     Spacer()
@@ -121,7 +133,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 440, height: 570)
+        .frame(width: 440, height: 620)
     }
 }
 

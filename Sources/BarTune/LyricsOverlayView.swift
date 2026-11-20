@@ -4,9 +4,10 @@ import AppKit
 struct EqualizerIconView: View {
     let isPlaying: Bool
     let tint: Color
+    let lowCPUMode: Bool
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 0.12, paused: !isPlaying)) { timeline in
+        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.25 : 0.12, paused: !isPlaying)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             HStack(alignment: .bottom, spacing: 1.5) {
                 ForEach(0..<3, id: \.self) { idx in
@@ -178,7 +179,7 @@ struct LyricsOverlayView: View {
 
             HStack(spacing: 7) {
                 if state.showEqualizer {
-                    EqualizerIconView(isPlaying: state.isPlaying, tint: activeEqualizerColor)
+                    EqualizerIconView(isPlaying: state.isPlaying, tint: activeEqualizerColor, lowCPUMode: state.lowCPUMode)
                 }
 
                 KaraokeLineView(
@@ -189,7 +190,7 @@ struct LyricsOverlayView: View {
                     sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled
                 )
-                .id(state.currentLineId)
+                .id("\(state.currentLineId)-\(state.romanizeJapanese)")
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: 6)),
                     removal: .opacity.combined(with: .offset(y: -6))

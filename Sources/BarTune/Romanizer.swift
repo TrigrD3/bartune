@@ -104,12 +104,35 @@ enum JapaneseRomanizer {
         }
 
         let joined = parts.joined(separator: " ")
+            .replacingOccurrences(of: "~tsu ", with: "~tsu")
             .replacingOccurrences(of: " ,", with: ",")
             .replacingOccurrences(of: " .", with: ".")
             .replacingOccurrences(of: " !", with: "!")
             .replacingOccurrences(of: " ?", with: "?")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        return joined.isEmpty ? text : joined
+        let cleanedSokuon = resolveSokuon(joined)
+        return cleanedSokuon.isEmpty ? text : cleanedSokuon
+    }
+
+    /// Converts macOS tokenizer's `~tsu` (small っ) into a doubled following consonant (e.g., `waka~tsuteru` -> `wakatteru`).
+    private static func resolveSokuon(_ input: String) -> String {
+        guard input.contains("~tsu") else { return input }
+        let chars = Array(input)
+        var out = ""
+        var i = 0
+        while i < chars.count {
+            if i + 3 < chars.count,
+               chars[i] == "~", chars[i + 1] == "t", chars[i + 2] == "s", chars[i + 3] == "u" {
+                if i + 4 < chars.count, chars[i + 4].isLetter {
+                    out.append(chars[i + 4])
+                }
+                i += 4
+            } else {
+                out.append(chars[i])
+                i += 1
+            }
+        }
+        return out
     }
 }
