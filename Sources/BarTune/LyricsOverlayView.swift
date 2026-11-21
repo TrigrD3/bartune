@@ -325,7 +325,7 @@ struct LyricsOverlayView: View {
                     MarqueeTrackLabelView(
                         text: state.trackSummary,
                         color: activeUnsungColor,
-                        maxWidth: 140,
+                        maxWidth: 116,
                         isPlaying: state.isEnabled && state.isPlaying,
                         lowCPUMode: state.lowCPUMode
                     )
@@ -468,51 +468,39 @@ private struct MarqueeTrackLabelView: View {
     let isPlaying: Bool
     let lowCPUMode: Bool
 
-    @State private var textWidth: CGFloat = 0
-    @State private var isScrolling: Bool = false
+    @State private var startDate: Date = .now
 
-    private var needsScroll: Bool {
-        textWidth > maxWidth + 1
-    }
-
-    private var travelDistance: CGFloat {
-        textWidth + MarqueeScrollCalculator.gap
-    }
-
-    private var scrollDuration: Double {
-        max(3.0, Double(travelDistance) / 24.0)
+    private var measuredTextWidth: CGFloat {
+        let font = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+        let size = (text as NSString).size(withAttributes: [.font: font])
+        return ceil(size.width) + 2
     }
 
     var body: some View {
-        let displayWidth = needsScroll ? maxWidth : max(1, textWidth)
+        let textWidth = measuredTextWidth
+        let needsScroll = textWidth > maxWidth + 1
+        let displayWidth = needsScroll ? maxWidth : textWidth
 
-        HStack(spacing: MarqueeScrollCalculator.gap) {
-            labelText
-                .background(widthReader)
-            if needsScroll {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !isPlaying || !needsScroll)) { timeline in
+            let elapsed = max(0, timeline.date.timeIntervalSince(startDate))
+            let xOffset = MarqueeScrollCalculator.offset(
+                at: elapsed,
+                textWidth: textWidth,
+                containerWidth: maxWidth
+            )
+
+            HStack(spacing: MarqueeScrollCalculator.gap) {
                 labelText
+                if needsScroll {
+                    labelText
+                }
             }
+            .offset(x: xOffset)
+            .frame(width: displayWidth, alignment: .leading)
+            .clipped()
         }
-        .offset(x: isScrolling && needsScroll ? -travelDistance : 0)
-        .frame(width: displayWidth, alignment: .leading)
-        .clipped()
-        .onAppear { restartMarquee() }
-        .onChange(of: text) { _ in restartMarquee() }
-        .onChange(of: textWidth) { _ in restartMarquee() }
-        .onChange(of: isPlaying) { _ in restartMarquee() }
-    }
-
-    private func restartMarquee() {
-        var reset = Transaction()
-        reset.disablesAnimations = true
-        withTransaction(reset) {
-            isScrolling = false
-        }
-        guard isPlaying, needsScroll else { return }
-        DispatchQueue.main.async {
-            withAnimation(.linear(duration: scrollDuration).repeatForever(autoreverses: false)) {
-                isScrolling = true
-            }
+        .onChange(of: text) { _ in
+            startDate = .now
         }
     }
 
@@ -521,14 +509,5 @@ private struct MarqueeTrackLabelView: View {
             .font(.system(size: 10.5, weight: .regular))
             .foregroundStyle(color)
             .fixedSize(horizontal: true, vertical: false)
-    }
-
-    private var widthReader: some View {
-        GeometryReader { geo in
-            Color.clear
-                .onAppear { textWidth = geo.size.width }
-                .onChange(of: text) { _ in textWidth = geo.size.width }
-                .onChange(of: geo.size.width) { newW in textWidth = newW }
-        }
     }
 }

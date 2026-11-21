@@ -51,6 +51,7 @@ struct SettingsView: View {
     @State private var whisperCLIFound: Bool = false
     @State private var isDownloadingModel: Bool = false
     @State private var modelDownloadError: String?
+    @State private var selectedDownloadPreset: WhisperModelPreset = .base
     @State private var metricsTracker = ResourceMetricsTracker()
     @State private var permissions = AppPermissionsSnapshot.empty
     private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
@@ -429,6 +430,12 @@ struct SettingsView: View {
                         }
                     }
 
+                    Picker("Download Model", selection: $selectedDownloadPreset) {
+                        ForEach(WhisperModelPreset.allCases) { preset in
+                            Text(preset.title).tag(preset)
+                        }
+                    }
+
                     HStack {
                         Button("Choose Existing…") {
                             chooseExistingWhisperModel()
@@ -444,8 +451,8 @@ struct SettingsView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else {
-                            Button("Download Tiny (~75 MB)") {
-                                downloadDefaultWhisperModel()
+                            Button("Download Selected") {
+                                downloadSelectedWhisperModel()
                             }
                         }
                     }
@@ -732,12 +739,13 @@ struct SettingsView: View {
         }
     }
 
-    private func downloadDefaultWhisperModel() {
+    private func downloadSelectedWhisperModel() {
+        let preset = selectedDownloadPreset
         isDownloadingModel = true
         modelDownloadError = nil
         Task {
             do {
-                let url = try await AudioSyncManager.downloadSharedDefaultModel()
+                let url = try await AudioSyncManager.downloadSharedModel(preset)
                 await MainActor.run {
                     isDownloadingModel = false
                     state.whisperModelPath = url.path

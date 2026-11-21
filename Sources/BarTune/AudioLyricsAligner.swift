@@ -99,6 +99,18 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let medianOffset: Double?
     let alignedLineCount: Int
     let lines: [LyricLine]
+
+    /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
+    /// Rejects single-line partial matches on multi-line tracks and extreme outlier offsets (> 5s).
+    var isReliable: Bool {
+        let nonEmptyCount = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        guard nonEmptyCount > 0 else { return false }
+        if let offset = medianOffset, abs(offset) > 5.0 {
+            return false
+        }
+        let minRequired = min(2, nonEmptyCount)
+        return alignedLineCount >= minRequired
+    }
 }
 
 struct AudioSyncedLyricsCache: Sendable {
@@ -194,6 +206,28 @@ struct DiscoveredWhisperModel: Identifiable, Equatable, Hashable, Sendable {
 
     var formattedSize: String {
         ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
+    }
+}
+
+enum WhisperModelPreset: String, CaseIterable, Identifiable, Sendable {
+    case tiny = "ggml-tiny.bin"
+    case base = "ggml-base.bin"
+    case small = "ggml-small.bin"
+    case medium = "ggml-medium.bin"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .tiny: return "Tiny (~75 MB · Fastest)"
+        case .base: return "Base (~142 MB · Balanced)"
+        case .small: return "Small (~466 MB · Accurate)"
+        case .medium: return "Medium (~1.5 GB · Best Vocals)"
+        }
+    }
+
+    var downloadURL: URL {
+        URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(rawValue)")!
     }
 }
 
@@ -597,9 +631,15 @@ enum LyricsAudioAligner {
         let medianOffset: Double?
         if offsetSamples.count >= 2 {
             let sorted = offsetSamples.sorted()
-            medianOffset = sorted[sorted.count / 2]
+            let candidate = sorted[sorted.count / 2]
+            let consistent = sorted.filter { abs($0 - candidate) <= 1.5 }
+            if consistent.count >= 2, abs(candidate) <= 5.0 {
+                medianOffset = candidate
+            } else {
+                medianOffset = nil
+            }
         } else {
-            medianOffset = offsetSamples.first
+            medianOffset = nil
         }
 
         let shift = medianOffset ?? 0.0
