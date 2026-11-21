@@ -90,8 +90,8 @@ swiftformat Sources Tests
 
 ## Distribution
 
-- `VERSION` is the single source of truth for app versioning (`build.sh`, `release.yml`, and Release Please all read/update it).
-- `.github/workflows/release-please.yml` maintains an automated Release PR from Conventional Commits on `main`. Merging the Release PR tags `vX.Y.Z`, calls `.github/workflows/release.yml` to build `BarTune-X.Y.Z.dmg` + `.sha256`, attaches them to the GitHub Release, and updates `Casks/bartune.rb` in `TrigrD3/homebrew-tap` (using `HOMEBREW_TAP_TOKEN`). Manual `v*` tag pushes continue to work too.
+- `VERSION` is the single source of truth for app versioning (read by `build.sh` and `release.yml`).
+- Releases are on-demand only via `.github/workflows/release.yml`: either push a `vX.Y.Z` tag (matching `VERSION`) or run **Build & Release DMG** via `workflow_dispatch` with `publish: true`. This builds `BarTune-X.Y.Z.dmg` + `.sha256`, creates the GitHub Release, and updates `Casks/bartune.rb` in `TrigrD3/homebrew-tap` (using `HOMEBREW_TAP_TOKEN`). PRs targeting `main` still run the DMG build as a CI check without publishing.
 - Users install via `brew install --cask TrigrD3/tap/bartune`.
 
 ## Git Workflow
