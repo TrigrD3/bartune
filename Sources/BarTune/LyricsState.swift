@@ -412,6 +412,7 @@ final class LyricsState: ObservableObject {
         didSet {
             userDefaults.set(translationLanguage.rawValue, forKey: Keys.translationLanguage)
             translatedLines = []
+            translationsById = [:]
             refreshCurrentLineText()
         }
     }
@@ -495,7 +496,13 @@ final class LyricsState: ObservableObject {
     private var romanizedLines: [LyricLine] = []
     private var koreanRomanizedLines: [LyricLine] = []
     private var chineseRomanizedLines: [LyricLine] = []
+    private struct TranslationEntry {
+        let sourceText: String
+        let translatedText: String
+    }
+
     private var translatedLines: [LyricLine] = []
+    private var translationsById: [Int: TranslationEntry] = [:]
     private var isJapaneseSong: Bool = false
     private var isKoreanSong: Bool = false
     private var isChineseSong: Bool = false
@@ -629,6 +636,8 @@ final class LyricsState: ObservableObject {
 
         rawLines = lyrics
         translatedLines = []
+        translationsById = [:]
+        clearActiveLineState()
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
@@ -653,11 +662,16 @@ final class LyricsState: ObservableObject {
             trackSummary = "\(track.artist) — \(track.title)"
         } else {
             trackSummary = "Not Playing"
-            currentText = ""
-            currentLineId = -1
-            lineProgress = 0.0
             albumColors = nil
         }
+    }
+
+    private func clearActiveLineState() {
+        if !currentText.isEmpty { currentText = "" }
+        if currentLineId != -1 { currentLineId = -1 }
+        if activeLine != nil { activeLine = nil }
+        if activeLineNextTimestamp != 0.0 { activeLineNextTimestamp = 0.0 }
+        if lineProgress != 0.0 { lineProgress = 0.0 }
     }
 
     private static func romanizeLines(_ lyrics: [LyricLine], using transform: (String) -> String) -> [LyricLine] {
@@ -688,9 +702,53 @@ final class LyricsState: ObservableObject {
         }
     }
 
-    func setTranslatedLines(_ lines: [LyricLine]) {
-        translatedLines = lines
-        refreshCurrentLineText()
+    @discardableResult
+    func setTranslatedLines(_ lines: [LyricLine], sourceLines: [LyricLine]? = nil) -> Bool {
+        if let sourceLines, !Self.translationSourceMatches(sourceLines, rawLines) {
+            return false
+        }
+        guard !lines.isEmpty else {
+            translationsById = [:]
+            translatedLines = []
+            if isPlaying {
+                syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+            } else {
+                refreshCurrentLineText()
+            }
+            return true
+        }
+        guard !rawLines.isEmpty else {
+            translationsById = [:]
+            translatedLines = lines
+            if isPlaying {
+                syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+            } else {
+                refreshCurrentLineText()
+            }
+            return true
+        }
+
+        let translatedById = Dictionary(
+            lines.map { ($0.id, $0) },
+            uniquingKeysWith: { _, latest in latest }
+        )
+        var entries: [Int: TranslationEntry] = [:]
+        for source in rawLines {
+            if let match = translatedById[source.id] {
+                entries[source.id] = TranslationEntry(
+                    sourceText: source.text,
+                    translatedText: match.text
+                )
+            }
+        }
+        translationsById = entries
+        translatedLines = Self.projectTranslatedLines(entries, onto: rawLines)
+        if isPlaying {
+            syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+        } else {
+            refreshCurrentLineText()
+        }
+        return true
     }
 
     func applyAudioSyncedLines(_ lines: [LyricLine]) {
@@ -705,14 +763,58 @@ final class LyricsState: ObservableObject {
         if isChineseSong {
             chineseRomanizedLines = Self.romanizeLines(lines, using: ChineseRomanizer.romanizeLine)
         }
-        refreshCurrentLineText()
+        if !translationsById.isEmpty {
+            translatedLines = Self.projectTranslatedLines(
+                translationsById,
+                onto: lines
+            )
+        }
+        if isPlaying {
+            syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+        } else {
+            refreshCurrentLineText()
+        }
+    }
+
+    private static func translationSourceMatches(_ lhs: [LyricLine], _ rhs: [LyricLine]) -> Bool {
+        lhs.count == rhs.count && zip(lhs, rhs).allSatisfy { $0.id == $1.id && $0.text == $1.text }
+    }
+
+    /// Re-projects genuine translated text onto the latest source timestamps/durations by line ID.
+    /// Falls back to the source line for display without mutating stored translations when its source text changed.
+    private static func projectTranslatedLines(
+        _ entries: [Int: TranslationEntry],
+        onto sourceLines: [LyricLine]
+    ) -> [LyricLine] {
+        guard !entries.isEmpty, !sourceLines.isEmpty else { return [] }
+
+        var retainedTranslation = false
+        let projected: [LyricLine] = sourceLines.map { source in
+            guard let entry = entries[source.id], entry.sourceText == source.text else {
+                return source
+            }
+            retainedTranslation = true
+            return LyricLine(
+                id: source.id,
+                timestamp: source.timestamp,
+                duration: source.duration,
+                text: entry.translatedText,
+                words: []
+            )
+        }
+        return retainedTranslation ? projected : []
     }
 
     private func refreshCurrentLineText() {
         guard currentLineId >= 0 else { return }
-        if let line = activeLines.first(where: { $0.id == currentLineId }) {
+        let lines = activeLines
+        if let idx = lines.firstIndex(where: { $0.id == currentLineId }) {
+            let line = lines[idx]
             currentText = line.text.isEmpty ? "♪" : line.text
             activeLine = line
+            activeLineNextTimestamp = (idx + 1 < lines.count)
+                ? lines[idx + 1].timestamp
+                : (line.timestamp + 4.5)
         }
     }
 
@@ -725,16 +827,19 @@ final class LyricsState: ObservableObject {
         self.playbackRate = playbackRate
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
-            if !isPlaying {
-                if !currentText.isEmpty { currentText = "" }
-                if currentLineId != -1 { currentLineId = -1 }
-                if activeLine != nil { activeLine = nil }
-                if lineProgress != 0.0 { lineProgress = 0.0 }
-            }
+            clearActiveLineState()
             return
         }
 
-        let effectivePos = position + offsetSeconds
+        syncActiveLine(for: position + offsetSeconds, in: lines)
+    }
+
+    private func syncActiveLine(for effectivePos: Double, in lines: [LyricLine]) {
+        guard !lines.isEmpty else {
+            clearActiveLineState()
+            return
+        }
+
         var matchedIndex: Int?
 
         var lo = 0
@@ -756,16 +861,20 @@ final class LyricsState: ObservableObject {
                 ? lines[idx + 1].timestamp
                 : (line.timestamp + 4.5)
 
-            if line.id != currentLineId {
-                currentLineId = line.id
-                currentText = displayText
-                activeLine = line
-                activeLineNextTimestamp = nextTimestamp
+            if line.id != currentLineId
+                || currentText != displayText
+                || activeLine != line
+                || activeLineNextTimestamp != nextTimestamp {
+                if currentLineId != line.id { currentLineId = line.id }
+                if currentText != displayText { currentText = displayText }
+                if activeLine != line { activeLine = line }
+                if activeLineNextTimestamp != nextTimestamp { activeLineNextTimestamp = nextTimestamp }
             }
         } else if currentLineId != -1 {
             currentLineId = -1
             currentText = "♪"
             activeLine = nil
+            activeLineNextTimestamp = 0.0
             lineProgress = 0.0
         }
     }

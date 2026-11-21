@@ -295,7 +295,7 @@ final class LyricsCacheTests: XCTestCase {
         )
         let track = TrackInfo(id: "spotify:track:wrong-match", title: "Song", artist: "Artist", album: "", duration: 180, artworkURL: nil)
         let source = [LyricLine(id: 0, timestamp: 1, text: "source")]
-        let translationKey = "\(track.id):tr:en"
+        let translationKey = LyricsTranslator.cacheKey(trackId: track.id, targetLanguage: .english, lines: source)
 
         func seed(_ text: String) {
             diskCache.save(trackId: track.id, lines: [LyricLine(id: 0, timestamp: 1, text: text)], title: track.title, artist: track.artist)
@@ -332,7 +332,10 @@ final class LyricsCacheTests: XCTestCase {
 
         func seed(_ id: String, _ text: String) {
             diskCache.save(trackId: id, lines: [LyricLine(id: 0, timestamp: 1, text: text)], title: id, artist: "Artist")
-            diskCache.save(trackId: "\(id):tr:en", lines: [LyricLine(id: 0, timestamp: 1, text: "\(text) en")])
+            diskCache.save(
+                trackId: LyricsTranslator.cacheKey(trackId: id, targetLanguage: .english, lines: source),
+                lines: [LyricLine(id: 0, timestamp: 1, text: "\(text) en")]
+            )
         }
         func track(_ id: String) -> TrackInfo {
             TrackInfo(id: id, title: id, artist: "Artist", album: "", duration: 180, artworkURL: nil)
