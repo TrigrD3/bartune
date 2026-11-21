@@ -121,14 +121,18 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
 
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
     /// Rejects single-line partial matches on multi-line tracks (including transcript-only
-    /// caches that omit untranscribed lines) and extreme outlier offsets (> 5s).
+    /// caches that omit untranscribed lines), extreme outlier offsets (> 5s), and
+    /// duplicate/inverted line timestamps from cross-line bleed.
     var isReliable: Bool {
-        let nonEmptyCount = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
-        guard nonEmptyCount > 0 else { return false }
+        let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !nonEmpty.isEmpty else { return false }
         if let offset = medianOffset, abs(offset) > 5.0 {
             return false
         }
-        let referenceCount = max(nonEmptyCount, sourceLineCount ?? 0)
+        for idx in 1..<nonEmpty.count where nonEmpty[idx].timestamp < nonEmpty[idx - 1].timestamp + 0.15 {
+            return false
+        }
+        let referenceCount = max(nonEmpty.count, sourceLineCount ?? 0)
         let minRequired = min(2, referenceCount)
         return alignedLineCount >= minRequired
     }
@@ -631,20 +635,25 @@ enum LyricsAudioAligner {
 
         let normalizedRec = sortedRecognized.map { normalizeToken($0.text) }
 
-        // Pass 1: estimate global offset from confident line matches.
+        // Pass 1: estimate global offset from confident, temporally coherent line matches.
         var offsetSamples: [Double] = []
         for (lineIdx, line) in lines.enumerated() {
             let lineTokens = tokenizeLine(line.text)
+            let meaningfulCount = lineTokens.filter { !$0.normalized.isEmpty }.count
+            guard meaningfulCount > 0 else { continue }
+            let minMatches = meaningfulCount <= 2 ? 1 : max(2, meaningfulCount / 3)
             let nextTs = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : (line.timestamp + 4.5)
             let lineEnd = line.duration.map { line.timestamp + $0 } ?? nextTs
             let matches = matchLineTokens(
                 lineTokens: lineTokens,
-                windowStart: line.timestamp - searchWindow,
-                windowEnd: lineEnd + searchWindow,
+                expectedStart: line.timestamp,
+                window: (line.timestamp - searchWindow)...(lineEnd + searchWindow),
                 recognized: sortedRecognized,
                 normalizedRec: normalizedRec
             )
-            if let first = matches.first(where: { $0.tokenIndex == 0 }) {
+            if matches.count >= minMatches,
+               let first = matches.first(where: { $0.tokenIndex == 0 }),
+               abs(first.word.startTime - line.timestamp) <= 5.0 {
                 offsetSamples.append(first.word.startTime - line.timestamp)
             }
         }
@@ -664,26 +673,41 @@ enum LyricsAudioAligner {
         }
 
         let shift = medianOffset ?? 0.0
+        let localPadding = min(searchWindow, medianOffset != nil ? 1.5 : 2.0)
         var alignedLines: [LyricLine] = []
         alignedLines.reserveCapacity(lines.count)
         var matchedLineCount = 0
         var matchedWordCount = 0
+        var lastConsumedWordEnd: Double = 0.0
+        var previousLineEnd: Double = 0.0
+        var previousEmittedTimestamp: Double?
 
-        // Pass 2: align each line around its offset-adjusted window and build smooth WordTimestamps.
+        // Pass 2: align each line inside a tight, monotonic window so adjacent lines never steal words or overlap.
         for (lineIdx, line) in lines.enumerated() {
             let lineTokens = tokenizeLine(line.text)
+            let isNonEmpty = !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let nextTs = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : (line.timestamp + 4.5)
             let rawLineDur = max(0.4, line.duration ?? (nextTs - line.timestamp))
             let shiftedStart = max(0, line.timestamp + shift)
             let shiftedEnd = shiftedStart + rawLineDur
-
-            let matches = matchLineTokens(
-                lineTokens: lineTokens,
-                windowStart: shiftedStart - min(searchWindow, 5.0),
-                windowEnd: shiftedEnd + min(searchWindow, 5.0),
-                recognized: sortedRecognized,
-                normalizedRec: normalizedRec
+            let nextShiftedStart = (lineIdx + 1 < lines.count) ? max(0, nextTs + shift) : (shiftedEnd + localPadding)
+            let minAllowedStart = max(
+                previousEmittedTimestamp.map { $0 + 0.25 } ?? 0,
+                previousLineEnd
             )
+
+            let windowStart = max(0, max(lastConsumedWordEnd, shiftedStart - localPadding))
+            let windowEnd = min(shiftedEnd + localPadding, nextShiftedStart + 0.4)
+
+            let matches: [TokenMatch] = windowEnd > windowStart
+                ? matchLineTokens(
+                    lineTokens: lineTokens,
+                    expectedStart: shiftedStart,
+                    window: windowStart...windowEnd,
+                    recognized: sortedRecognized,
+                    normalizedRec: normalizedRec
+                )
+                : []
 
             let matchMap = Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) })
             let meaningfulTokenCount = lineTokens.filter { !$0.normalized.isEmpty }.count
@@ -691,79 +715,110 @@ enum LyricsAudioAligner {
 
             if replaceTextWithTranscription {
                 let windowWords = sortedRecognized.filter {
-                    $0.startTime >= shiftedStart - 0.6 && $0.startTime < shiftedEnd + 0.4
+                    $0.startTime >= max(lastConsumedWordEnd, shiftedStart - 0.6) && $0.startTime < min(shiftedEnd + 0.4, nextShiftedStart)
                 }
                 if !windowWords.isEmpty, Self.transcriptionMatchesLine(lineTokens: lineTokens, recognized: windowWords) {
-                    matchedLineCount += 1
-                    matchedWordCount += windowWords.count
-                    let transcribedWords: [WordTimestamp] = windowWords.enumerated().map { idx, word in
-                        let suffix = (idx + 1 < windowWords.count) ? " " : ""
-                        return WordTimestamp(
-                            timestamp: word.startTime,
-                            duration: max(0.05, word.duration),
-                            text: word.text + suffix
+                    let startTs = windowWords.first?.startTime ?? shiftedStart
+                    if abs(startTs - shiftedStart) <= 2.5, startTs >= minAllowedStart {
+                        matchedLineCount += 1
+                        matchedWordCount += windowWords.count
+                        let transcribedWords: [WordTimestamp] = windowWords.enumerated().map { idx, word in
+                            let suffix = (idx + 1 < windowWords.count) ? " " : ""
+                            return WordTimestamp(
+                                timestamp: word.startTime,
+                                duration: max(0.05, word.duration),
+                                text: word.text + suffix
+                            )
+                        }
+                        let transcribedText = transcribedWords.map(\.text).joined()
+                        let actualWordEnd = windowWords.map(\.endTime).max() ?? shiftedEnd
+                        let clampedEnd = nextShiftedStart > startTs + 0.3 ? min(actualWordEnd, nextShiftedStart) : actualWordEnd
+                        let emittedDuration = max(0.3, clampedEnd - startTs)
+                        lastConsumedWordEnd = max(lastConsumedWordEnd, actualWordEnd + 0.01)
+                        previousLineEnd = max(previousLineEnd, startTs + emittedDuration)
+                        previousEmittedTimestamp = startTs
+                        alignedLines.append(
+                            LyricLine(
+                                id: line.id,
+                                timestamp: startTs,
+                                duration: emittedDuration,
+                                text: transcribedText,
+                                words: transcribedWords
+                            )
                         )
                     }
-                    let transcribedText = transcribedWords.map(\.text).joined()
-                    let startTs = windowWords.first?.startTime ?? shiftedStart
-                    let endTs = windowWords.last?.endTime ?? shiftedEnd
-                    alignedLines.append(
-                        LyricLine(
-                            id: line.id,
-                            timestamp: startTs,
-                            duration: max(0.3, endTs - startTs),
-                            text: transcribedText,
-                            words: transcribedWords
-                        )
-                    )
                 }
                 // In transcript-only mode, omit untranscribed static fallback lines.
                 continue
             }
 
             if matches.count >= minMatches {
-                matchedLineCount += 1
-                matchedWordCount += matches.count
-
                 let builtWords = interpolateWordTimestamps(
                     tokens: lineTokens,
                     matches: matchMap,
-                    fallbackStart: shiftedStart,
-                    fallbackEnd: shiftedEnd
+                    fallbackStart: max(shiftedStart, minAllowedStart),
+                    fallbackEnd: max(shiftedEnd, minAllowedStart + 0.4)
                 )
                 let newLineStart = builtWords.first?.timestamp ?? shiftedStart
-                let lastWordEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
-                let newDuration = max(0.3, lastWordEnd - newLineStart)
+                let rawEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
 
-                alignedLines.append(
-                    LyricLine(
-                        id: line.id,
-                        timestamp: newLineStart,
-                        duration: newDuration,
-                        text: line.text,
-                        words: builtWords
+                if abs(newLineStart - shiftedStart) <= 2.5, newLineStart >= minAllowedStart {
+                    let clampedEnd = nextShiftedStart > newLineStart + 0.3 ? min(rawEnd, nextShiftedStart) : rawEnd
+                    let newDuration = max(0.3, clampedEnd - newLineStart)
+                    let actualMatchedEnd = matches.map(\.word.endTime).max() ?? clampedEnd
+                    matchedLineCount += 1
+                    matchedWordCount += matches.count
+                    lastConsumedWordEnd = max(lastConsumedWordEnd, actualMatchedEnd + 0.01)
+                    previousLineEnd = max(previousLineEnd, newLineStart + newDuration)
+                    previousEmittedTimestamp = newLineStart
+
+                    alignedLines.append(
+                        LyricLine(
+                            id: line.id,
+                            timestamp: newLineStart,
+                            duration: newDuration,
+                            text: line.text,
+                            words: builtWords
+                        )
                     )
-                )
-            } else if let offset = medianOffset, abs(offset) >= 0.15 {
-                let shiftedWords = line.words.map { word in
+                    continue
+                }
+            }
+
+            let baseStart = (medianOffset.map { abs($0) >= 0.15 ? max(0, line.timestamp + $0) : line.timestamp }) ?? line.timestamp
+            let fallbackStart: Double = if isNonEmpty, let prevTs = previousEmittedTimestamp, baseStart < prevTs + 0.25 {
+                prevTs + 0.25
+            } else {
+                baseStart
+            }
+            let wordShift = fallbackStart - line.timestamp
+            let fallbackWords: [WordTimestamp] = abs(wordShift) >= 0.001
+                ? line.words.map { word in
                     WordTimestamp(
-                        timestamp: max(0, word.timestamp + offset),
+                        timestamp: max(0, word.timestamp + wordShift),
                         duration: word.duration,
                         text: word.text
                     )
                 }
-                alignedLines.append(
-                    LyricLine(
-                        id: line.id,
-                        timestamp: max(0, line.timestamp + offset),
-                        duration: line.duration,
-                        text: line.text,
-                        words: shiftedWords
-                    )
-                )
-            } else {
-                alignedLines.append(line)
+                : line.words
+
+            if isNonEmpty {
+                previousEmittedTimestamp = fallbackStart
+                if let dur = line.duration {
+                    previousLineEnd = max(previousLineEnd, fallbackStart + max(0.25, dur))
+                } else {
+                    previousLineEnd = max(previousLineEnd, fallbackStart + 0.25)
+                }
             }
+            alignedLines.append(
+                LyricLine(
+                    id: line.id,
+                    timestamp: fallbackStart,
+                    duration: line.duration,
+                    text: line.text,
+                    words: fallbackWords
+                )
+            )
         }
 
         return AudioAlignmentResult(
@@ -781,35 +836,62 @@ enum LyricsAudioAligner {
 
     private static func matchLineTokens(
         lineTokens: [DisplayToken],
-        windowStart: Double,
-        windowEnd: Double,
+        expectedStart: Double,
+        window: ClosedRange<Double>,
         recognized: [RecognizedAudioWord],
         normalizedRec: [String]
     ) -> [TokenMatch] {
         var candidates: [(recIdx: Int, word: RecognizedAudioWord, norm: String)] = []
-        for (i, word) in recognized.enumerated() where word.startTime >= windowStart && word.startTime <= windowEnd {
+        for (i, word) in recognized.enumerated() where window.contains(word.startTime) {
             candidates.append((i, word, normalizedRec[i]))
         }
         guard !candidates.isEmpty else { return [] }
 
-        var matches: [TokenMatch] = []
-        var cursor = 0
+        func scan(startingAt initialCursor: Int) -> [TokenMatch] {
+            var matches: [TokenMatch] = []
+            var cursor = initialCursor
+            var lastMatchTime: Double?
 
-        for (tokenIdx, token) in lineTokens.enumerated() {
-            guard !token.normalized.isEmpty else { continue }
-            var foundIdx: Int?
-            let searchLimit = min(candidates.count, cursor + 8)
-            for cIdx in cursor..<searchLimit where tokensMatch(token.normalized, candidates[cIdx].norm) {
-                foundIdx = cIdx
-                break
+            for (tokenIdx, token) in lineTokens.enumerated() {
+                guard !token.normalized.isEmpty else { continue }
+                let searchLimit = min(candidates.count, cursor + 8)
+                for cIdx in cursor..<searchLimit where tokensMatch(token.normalized, candidates[cIdx].norm) {
+                    let word = candidates[cIdx].word
+                    if let prevTime = lastMatchTime, word.startTime - prevTime > 3.5 {
+                        break
+                    }
+                    matches.append(TokenMatch(tokenIndex: tokenIdx, word: word))
+                    lastMatchTime = word.startTime
+                    cursor = cIdx + 1
+                    break
+                }
             }
-            if let hit = foundIdx {
-                matches.append(TokenMatch(tokenIndex: tokenIdx, word: candidates[hit].word))
-                cursor = hit + 1
+            return matches
+        }
+
+        // Try starting from each candidate matching the first meaningful token (plus cursor 0 fallback)
+        // and pick the temporally coherent run with the most matches, breaking ties by proximity to expectedStart.
+        var startIndices: [Int] = [0]
+        if let firstNorm = lineTokens.first(where: { !$0.normalized.isEmpty })?.normalized {
+            for (idx, cand) in candidates.enumerated() where idx > 0 && tokensMatch(firstNorm, cand.norm) {
+                startIndices.append(idx)
             }
         }
 
-        return matches
+        var bestMatches: [TokenMatch] = []
+        var bestDistance = Double.greatestFiniteMagnitude
+
+        for startIdx in startIndices {
+            let run = scan(startingAt: startIdx)
+            guard !run.isEmpty else { continue }
+            let distance = abs((run.first?.word.startTime ?? expectedStart) - expectedStart)
+            if run.count > bestMatches.count || (run.count == bestMatches.count && distance < bestDistance) {
+                bestMatches = run
+                bestDistance = distance
+            }
+        }
+
+        return bestMatches
     }
 
     private static func tokensMatch(_ lhs: String, _ rhs: String) -> Bool {
