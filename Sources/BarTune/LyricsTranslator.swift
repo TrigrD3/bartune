@@ -60,11 +60,18 @@ enum LyricsTranslationParser {
 }
 
 actor LyricsTranslator {
+    typealias DataLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
     private let diskCache: LyricsDiskCache
+    private let dataLoader: DataLoader
     private var memoryCache: [String: [LyricLine]] = [:]
 
-    init(diskCache: LyricsDiskCache = .default) {
+    init(
+        diskCache: LyricsDiskCache = .default,
+        dataLoader: @escaping DataLoader = { try await URLSession.shared.data(for: $0) }
+    ) {
         self.diskCache = diskCache
+        self.dataLoader = dataLoader
     }
 
     func clearCache() {
@@ -88,11 +95,15 @@ actor LyricsTranslator {
         }
 
         // Batch lines in chunks of 25 to stay well within URL query limits.
-        var translatedAll: [String] = []
-        translatedAll.reserveCapacity(lines.count)
+        var resultLines: [LyricLine] = []
+        resultLines.reserveCapacity(lines.count)
+        var allBatchesSucceeded = true
         let chunkSize = 25
 
         for start in stride(from: 0, to: lines.count, by: chunkSize) {
+            if Task.isCancelled {
+                return lines
+            }
             let end = min(start + chunkSize, lines.count)
             let chunk = Array(lines[start..<end])
             let chunkTexts = chunk.map { line -> String in
@@ -102,18 +113,20 @@ actor LyricsTranslator {
 
             if let translatedChunk = await translateBatch(chunkTexts, to: targetLanguage),
                translatedChunk.count == chunk.count {
-                translatedAll.append(contentsOf: translatedChunk)
+                resultLines.append(
+                    contentsOf: LyricsTranslationParser.applyTranslatedLines(translatedChunk, to: chunk)
+                )
             } else {
-                translatedAll.append(contentsOf: chunk.map(\.text))
+                allBatchesSucceeded = false
+                resultLines.append(contentsOf: chunk)
             }
         }
 
-        let result = LyricsTranslationParser.applyTranslatedLines(translatedAll, to: lines)
-        if result != lines {
-            memoryCache[cacheKey] = result
-            diskCache.save(trackId: cacheKey, lines: result, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
+        if allBatchesSucceeded, !Task.isCancelled, resultLines != lines {
+            memoryCache[cacheKey] = resultLines
+            diskCache.save(trackId: cacheKey, lines: resultLines, maxEntriesOverride: LyricsDiskCache.configuredMaxEntries())
         }
-        return result
+        return resultLines
     }
 
     private func translateBatch(_ texts: [String], to target: TranslationLanguage) async -> [String]? {
@@ -133,7 +146,7 @@ actor LyricsTranslator {
         request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await dataLoader(request)
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 return nil
             }

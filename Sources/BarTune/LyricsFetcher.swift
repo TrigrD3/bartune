@@ -260,15 +260,97 @@ enum LyricsMatcher {
         return false
     }
 
+    private static func stripTitleDecorations(_ title: String) -> String {
+        var stripped = title.replacingOccurrences(
+            of: #"[\(\[\（\【][^\)\]\）\】]*[\)\]\）\】]"#,
+            with: " ",
+            options: .regularExpression
+        )
+        for separator in [" - ", " – ", " — "] {
+            if let range = stripped.range(of: separator) {
+                stripped = String(stripped[..<range.lowerBound])
+            }
+        }
+        stripped = stripped.replacingOccurrences(
+            of: #"\s+(?:feat\.?|ft\.?|featuring)\b.*$"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        return stripped
+    }
+
+    private static func alternateTitleSegments(_ title: String) -> [String] {
+        var segments: [String] = []
+
+        if let regex = try? NSRegularExpression(pattern: #"[\(\[\（\【]([^\)\]\）\】]+)[\)\]\）\】]"#) {
+            let nsTitle = title as NSString
+            let range = NSRange(location: 0, length: nsTitle.length)
+            for match in regex.matches(in: title, range: range) where match.numberOfRanges > 1 {
+                let inner = normalize(nsTitle.substring(with: match.range(at: 1)))
+                if !inner.isEmpty {
+                    segments.append(inner)
+                }
+            }
+        }
+
+        let core = stripTitleDecorations(title)
+        for separator in [" / ", "／"] where core.contains(separator) {
+            for part in core.components(separatedBy: separator) {
+                let normalizedPart = normalize(part)
+                if !normalizedPart.isEmpty {
+                    segments.append(normalizedPart)
+                }
+            }
+        }
+
+        return segments
+    }
+
+    static func titleMatches(candidateTitle: String, expectedTitle: String) -> Bool {
+        let expFull = normalize(expectedTitle)
+        guard !expFull.isEmpty else { return true }
+        let candFull = normalize(candidateTitle)
+        guard !candFull.isEmpty else { return false }
+
+        if candFull == expFull {
+            return true
+        }
+
+        let candCore = normalize(stripTitleDecorations(candidateTitle))
+        let expCore = normalize(stripTitleDecorations(expectedTitle))
+        if !candCore.isEmpty, !expCore.isEmpty, candCore == expCore {
+            return true
+        }
+        if !candCore.isEmpty, candCore == expFull {
+            return true
+        }
+        if !expCore.isEmpty, candFull == expCore {
+            return true
+        }
+
+        let candAlternates = alternateTitleSegments(candidateTitle)
+        if candAlternates.contains(where: { $0 == expFull || (!expCore.isEmpty && $0 == expCore) }) {
+            return true
+        }
+        let expAlternates = alternateTitleSegments(expectedTitle)
+        if expAlternates.contains(where: { $0 == candFull || (!candCore.isEmpty && $0 == candCore) }) {
+            return true
+        }
+
+        return false
+    }
+
     static func selectBestNetEaseSong(_ songs: [NetEaseSongCandidate], for track: TrackInfo) -> NetEaseSongCandidate? {
         let nonVariant = songs.filter {
             !isUnwantedVariant(candidateTitle: $0.name, expectedTitle: track.title)
         }
 
-        // 1. Prefer candidates with a matching artist within 6s duration tolerance.
+        // 1. Prefer candidates with matching artist and title within 6s duration tolerance.
         let artistMatched = nonVariant.filter { song in
             let durDiff = song.durationMs.map { abs($0 / 1000.0 - track.duration) } ?? 0
-            return artistMatches(candidateArtists: song.artists, expectedArtist: track.artist) && durDiff <= 6.0
+            return artistMatches(candidateArtists: song.artists, expectedArtist: track.artist)
+                && titleMatches(candidateTitle: song.name, expectedTitle: track.title)
+                && durDiff <= 6.0
         }
         if let best = artistMatched.min(by: {
             abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
@@ -291,10 +373,42 @@ enum LyricsMatcher {
             abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
         }
     }
+
+    static func selectBestLRCLibRecord(
+        _ records: [LyricsFetcher.LRCLibRecord],
+        for track: TrackInfo
+    ) -> LyricsFetcher.LRCLibRecord? {
+        records
+            .filter { record in
+                guard (record.syncedLyrics ?? "").isEmpty == false else { return false }
+                if let trackName = record.trackName {
+                    guard !isUnwantedVariant(candidateTitle: trackName, expectedTitle: track.title),
+                          titleMatches(candidateTitle: trackName, expectedTitle: track.title)
+                    else { return false }
+                } else if !normalize(track.title).isEmpty {
+                    return false
+                }
+                if let artist = record.artistName,
+                   !artistMatches(candidateArtists: [artist], expectedArtist: track.artist) {
+                    return false
+                }
+                if let dur = record.duration, abs(dur - track.duration) > 6.0 {
+                    return false
+                }
+                return true
+            }
+            .min { lhs, rhs in
+                let d1 = abs((lhs.duration ?? track.duration) - track.duration)
+                let d2 = abs((rhs.duration ?? track.duration) - track.duration)
+                return d1 < d2
+            }
+    }
 }
 
 actor LyricsFetcher {
-    private struct LRCLibRecord: Decodable {
+    typealias DataLoader = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+
+    struct LRCLibRecord: Decodable, Equatable {
         let syncedLyrics: String?
         let plainLyrics: String?
         let trackName: String?
@@ -329,9 +443,14 @@ actor LyricsFetcher {
 
     private var cache: [String: [LyricLine]] = [:]
     private let diskCache: LyricsDiskCache
+    private let dataLoader: DataLoader
 
-    init(diskCache: LyricsDiskCache = .default) {
+    init(
+        diskCache: LyricsDiskCache = .default,
+        dataLoader: @escaping DataLoader = { try await URLSession.shared.data(for: $0) }
+    ) {
         self.diskCache = diskCache
+        self.dataLoader = dataLoader
     }
 
     func clearCache() {
@@ -367,64 +486,80 @@ actor LyricsFetcher {
             return diskEntry.lines
         }
 
-        // 1. Try NetEase YRC first for true millisecond word-by-word karaoke sync
-        let netEase = await fetchNetEase(track: track)
-        if let yrc = netEase.yrc, !yrc.isEmpty {
-            cache[track.id] = yrc
-            diskCache.save(
-                trackId: track.id,
-                lines: yrc,
-                title: track.title,
-                artist: track.artist,
-                maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-            )
-            return yrc
-        }
+        do {
+            // 1. Try NetEase YRC first for true millisecond word-by-word karaoke sync
+            try Task.checkCancellation()
+            let netEase = try await fetchNetEase(track: track)
+            if let yrc = netEase.yrc, !yrc.isEmpty {
+                cache[track.id] = yrc
+                diskCache.save(
+                    trackId: track.id,
+                    lines: yrc,
+                    title: track.title,
+                    artist: track.artist,
+                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                )
+                return yrc
+            }
 
-        // 2. Fall back to LRCLIB exact match
-        if let exact = await fetchLRCLibExact(track: track), !exact.isEmpty {
-            cache[track.id] = exact
-            diskCache.save(
-                trackId: track.id,
-                lines: exact,
-                title: track.title,
-                artist: track.artist,
-                maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-            )
-            return exact
-        }
+            // 2. Fall back to LRCLIB exact match
+            try Task.checkCancellation()
+            if let exact = try await fetchLRCLibExact(track: track), !exact.isEmpty {
+                cache[track.id] = exact
+                diskCache.save(
+                    trackId: track.id,
+                    lines: exact,
+                    title: track.title,
+                    artist: track.artist,
+                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                )
+                return exact
+            }
 
-        // 3. Fall back to LRCLIB search
-        if let searched = await fetchLRCLibSearch(track: track), !searched.isEmpty {
-            cache[track.id] = searched
-            diskCache.save(
-                trackId: track.id,
-                lines: searched,
-                title: track.title,
-                artist: track.artist,
-                maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-            )
-            return searched
-        }
+            // 3. Fall back to LRCLIB search
+            try Task.checkCancellation()
+            if let searched = try await fetchLRCLibSearch(track: track), !searched.isEmpty {
+                cache[track.id] = searched
+                diskCache.save(
+                    trackId: track.id,
+                    lines: searched,
+                    title: track.title,
+                    artist: track.artist,
+                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                )
+                return searched
+            }
 
-        // 4. Final fallback: NetEase line-level LRC
-        if let lrc = netEase.lrc, !lrc.isEmpty {
-            cache[track.id] = lrc
-            diskCache.save(
-                trackId: track.id,
-                lines: lrc,
-                title: track.title,
-                artist: track.artist,
-                maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-            )
-            return lrc
-        }
+            // 4. Final fallback: NetEase line-level LRC
+            try Task.checkCancellation()
+            if let lrc = netEase.lrc, !lrc.isEmpty {
+                cache[track.id] = lrc
+                diskCache.save(
+                    trackId: track.id,
+                    lines: lrc,
+                    title: track.title,
+                    artist: track.artist,
+                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                )
+                return lrc
+            }
 
-        cache[track.id] = []
-        return []
+            return []
+        } catch is CancellationError {
+            return []
+        } catch {
+            return []
+        }
     }
 
-    private func fetchNetEase(track: TrackInfo) async -> (yrc: [LyricLine]?, lrc: [LyricLine]?) {
+    private static func isCancellationError(_ error: Error) -> Bool {
+        error is CancellationError
+            || (error as? URLError)?.code == .cancelled
+            || Task.isCancelled
+    }
+
+    private func fetchNetEase(track: TrackInfo) async throws -> (yrc: [LyricLine]?, lrc: [LyricLine]?) {
+        try Task.checkCancellation()
         var searchComp = URLComponents(string: "https://music.163.com/api/search/get")!
         searchComp.queryItems = [
             URLQueryItem(name: "s", value: "\(track.title) \(track.artist)"),
@@ -438,7 +573,8 @@ actor LyricsFetcher {
         searchReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (searchData, searchResp) = try await URLSession.shared.data(for: searchReq)
+            let (searchData, searchResp) = try await dataLoader(searchReq)
+            try Task.checkCancellation()
             guard let http = searchResp as? HTTPURLResponse, http.statusCode == 200 else {
                 return (nil, nil)
             }
@@ -464,7 +600,8 @@ actor LyricsFetcher {
             lyricReq.timeoutInterval = 5
             lyricReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
-            let (lyricData, lyricResp) = try await URLSession.shared.data(for: lyricReq)
+            let (lyricData, lyricResp) = try await dataLoader(lyricReq)
+            try Task.checkCancellation()
             guard let lHttp = lyricResp as? HTTPURLResponse, lHttp.statusCode == 200 else {
                 return (nil, nil)
             }
@@ -480,11 +617,15 @@ actor LyricsFetcher {
             }
             return (parsedYRC, parsedLRC)
         } catch {
+            if Self.isCancellationError(error) {
+                throw CancellationError()
+            }
             return (nil, nil)
         }
     }
 
-    private func fetchLRCLibExact(track: TrackInfo) async -> [LyricLine]? {
+    private func fetchLRCLibExact(track: TrackInfo) async throws -> [LyricLine]? {
+        try Task.checkCancellation()
         var components = URLComponents(string: "https://lrclib.net/api/get")!
         components.queryItems = [
             URLQueryItem(name: "artist_name", value: track.artist),
@@ -499,7 +640,8 @@ actor LyricsFetcher {
         request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await dataLoader(request)
+            try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 return nil
             }
@@ -507,11 +649,15 @@ actor LyricsFetcher {
             guard let synced = record.syncedLyrics, !synced.isEmpty else { return nil }
             return LRCParser.parse(synced)
         } catch {
+            if Self.isCancellationError(error) {
+                throw CancellationError()
+            }
             return nil
         }
     }
 
-    private func fetchLRCLibSearch(track: TrackInfo) async -> [LyricLine]? {
+    private func fetchLRCLibSearch(track: TrackInfo) async throws -> [LyricLine]? {
+        try Task.checkCancellation()
         var components = URLComponents(string: "https://lrclib.net/api/search")!
         components.queryItems = [
             URLQueryItem(name: "artist_name", value: track.artist),
@@ -524,31 +670,19 @@ actor LyricsFetcher {
         request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await dataLoader(request)
+            try Task.checkCancellation()
             guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
                 return nil
             }
             let records = try JSONDecoder().decode([LRCLibRecord].self, from: data)
-            let best = records
-                .filter { record in
-                    guard (record.syncedLyrics ?? "").isEmpty == false else { return false }
-                    if let artist = record.artistName,
-                       !LyricsMatcher.artistMatches(candidateArtists: [artist], expectedArtist: track.artist) {
-                        return false
-                    }
-                    if let dur = record.duration, abs(dur - track.duration) > 6.0 {
-                        return false
-                    }
-                    return true
-                }
-                .min { lhs, rhs in
-                    let d1 = abs((lhs.duration ?? track.duration) - track.duration)
-                    let d2 = abs((rhs.duration ?? track.duration) - track.duration)
-                    return d1 < d2
-                }
+            let best = LyricsMatcher.selectBestLRCLibRecord(records, for: track)
             guard let synced = best?.syncedLyrics else { return nil }
             return LRCParser.parse(synced)
         } catch {
+            if Self.isCancellationError(error) {
+                throw CancellationError()
+            }
             return nil
         }
     }

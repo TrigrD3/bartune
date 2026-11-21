@@ -168,4 +168,116 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: cache.fileURL(forCacheKey: modernKey).path))
         XCTAssertEqual(cache.loadByCacheKey(modernKey)?.title, "Yoru ni Kakeru")
     }
+
+    func testFailedLookupDoesNotMaskLaterDiskHit() async {
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
+        let expected = [LyricLine(id: 0, timestamp: 1, text: "Found")]
+
+        // Case 1: HTTP 503 from all providers must not negative-cache in memory.
+        let track503 = TrackInfo(
+            id: "spotify:track:failed-503",
+            title: "Offline Song",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            artworkURL: nil
+        )
+        let fetcher503 = LyricsFetcher(diskCache: diskCache) { request in
+            let response = try XCTUnwrap(try HTTPURLResponse(
+                url: XCTUnwrap(request.url),
+                statusCode: 503,
+                httpVersion: nil,
+                headerFields: nil
+            ))
+            return (Data(), response)
+        }
+
+        let first503 = await fetcher503.fetchLyrics(for: track503)
+        XCTAssertTrue(first503.isEmpty)
+
+        diskCache.save(trackId: track503.id, lines: expected, title: track503.title, artist: track503.artist)
+        let retried503 = await fetcher503.fetchLyrics(for: track503)
+        XCTAssertEqual(retried503, expected)
+
+        // Case 2: Cancelled lookup must not negative-cache in memory.
+        let trackCancelled = TrackInfo(
+            id: "spotify:track:cancelled",
+            title: "Skipped Song",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            artworkURL: nil
+        )
+        let fetcherCancelled = LyricsFetcher(diskCache: diskCache) { _ in
+            throw CancellationError()
+        }
+
+        let firstCancelled = await fetcherCancelled.fetchLyrics(for: trackCancelled)
+        XCTAssertTrue(firstCancelled.isEmpty)
+
+        diskCache.save(trackId: trackCancelled.id, lines: expected, title: trackCancelled.title, artist: trackCancelled.artist)
+        let retriedCancelled = await fetcherCancelled.fetchLyrics(for: trackCancelled)
+        XCTAssertEqual(retriedCancelled, expected)
+    }
+
+    func testCancelledLookupStopsEarlyAndRetriesWhenOnline() async {
+        final class StubState: @unchecked Sendable {
+            private let lock = NSLock()
+            var shouldCancel = true
+            var requestedHosts: [String] = []
+
+            func recordAndCheckCancel(host: String) -> Bool {
+                lock.lock()
+                defer { lock.unlock() }
+                requestedHosts.append(host)
+                return shouldCancel
+            }
+
+            func setOnline() {
+                lock.lock()
+                defer { lock.unlock() }
+                shouldCancel = false
+            }
+
+            func hosts() -> [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return requestedHosts
+            }
+        }
+
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
+        let stubState = StubState()
+        let track = TrackInfo(
+            id: "spotify:track:cancel-then-online",
+            title: "Dawn",
+            artist: "Iris",
+            album: "Album",
+            duration: 200,
+            artworkURL: nil
+        )
+
+        let fetcher = LyricsFetcher(diskCache: diskCache) { request in
+            let url = try XCTUnwrap(request.url)
+            let host = url.host ?? ""
+            if stubState.recordAndCheckCancel(host: host) {
+                throw URLError(.cancelled)
+            }
+            if url.path == "/api/get" {
+                let json = #"{"syncedLyrics":"[00:01.00]Online lyric","trackName":"Dawn","artistName":"Iris","duration":200}"#
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+                return (Data(json.utf8), response)
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+
+        let cancelledResult = await fetcher.fetchLyrics(for: track)
+        XCTAssertTrue(cancelledResult.isEmpty)
+        XCTAssertEqual(stubState.hosts(), ["music.163.com"], "Cancellation should stop before falling through to LRCLIB")
+
+        stubState.setOnline()
+        let onlineResult = await fetcher.fetchLyrics(for: track)
+        XCTAssertEqual(onlineResult.map(\.text), ["Online lyric"])
+    }
 }
