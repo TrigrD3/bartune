@@ -7,19 +7,28 @@ import ScreenCaptureKit
 import Speech
 
 private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sendable {
-    var onAudioSamples: (([Float], Double) -> Void)?
-    private var stream: SCStream?
-    private var activeTargetBundleIds: Set<String> = []
-    private var launchObserver: NSObjectProtocol?
-    private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
-
-    deinit {
-        if let observer = launchObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+    private let callbackLock = NSLock()
+    private var _onAudioSamples: (([Float], Double) -> Void)?
+    var onAudioSamples: (([Float], Double) -> Void)? {
+        get {
+            callbackLock.lock()
+            defer { callbackLock.unlock() }
+            return _onAudioSamples
+        }
+        set {
+            callbackLock.lock()
+            defer { callbackLock.unlock() }
+            _onAudioSamples = newValue
         }
     }
 
-    private func makeContentFilter(
+    @MainActor private var stream: SCStream?
+    @MainActor private var activeTargetBundleIds: Set<String> = []
+    @MainActor private var launchObserver: NSObjectProtocol?
+    @MainActor private var sessionID: UInt64 = 0
+    private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
+
+    private static func makeContentFilter(
         content: SCShareableContent,
         display: SCDisplay,
         targetBundleIds: Set<String>
@@ -31,17 +40,21 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
         return SCContentFilter(display: display, excludingWindows: [])
     }
 
+    @MainActor
     func start(targetBundleIds: Set<String> = []) async throws {
         stop()
+        sessionID &+= 1
+        let currentSession = sessionID
+
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        guard sessionID == currentSession else { return }
         guard let display = content.displays.first else {
             throw NSError(domain: "BarTune.AudioCapture", code: 1, userInfo: [
                 NSLocalizedDescriptionKey: "No display available for system audio capture.",
             ])
         }
 
-        activeTargetBundleIds = targetBundleIds
-        let filter = makeContentFilter(content: content, display: display, targetBundleIds: targetBundleIds)
+        let filter = Self.makeContentFilter(content: content, display: display, targetBundleIds: targetBundleIds)
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
@@ -52,10 +65,17 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
         config.height = 2
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        try await stream.startCapture()
-        self.stream = stream
+        let newStream = SCStream(filter: filter, configuration: config, delegate: nil)
+        try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
+        try await newStream.startCapture()
+
+        guard sessionID == currentSession else {
+            try? await newStream.stopCapture()
+            return
+        }
+
+        stream = newStream
+        activeTargetBundleIds = targetBundleIds
 
         if !targetBundleIds.isEmpty {
             launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
@@ -63,19 +83,21 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
                 object: nil,
                 queue: .main
             ) { [weak self] notification in
-                guard let self, let activeStream = self.stream else { return }
-                let launchedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
-                if let bundleId = launchedApp?.bundleIdentifier, self.activeTargetBundleIds.contains(bundleId) {
-                    return
-                }
-                let targets = self.activeTargetBundleIds
-                Task { [weak self] in
-                    guard let self, self.stream === activeStream else { return }
+                let launchedBundleId = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
+                    .bundleIdentifier
+                Task { @MainActor [weak self] in
+                    guard let self, self.sessionID == currentSession, let activeStream = self.stream else { return }
+                    if let bundleId = launchedBundleId, self.activeTargetBundleIds.contains(bundleId) {
+                        return
+                    }
+                    let targets = self.activeTargetBundleIds
                     guard let updated = try? await SCShareableContent.excludingDesktopWindows(
                         false,
                         onScreenWindowsOnly: false
-                    ), let updatedDisplay = updated.displays.first else { return }
-                    let updatedFilter = self.makeContentFilter(
+                    ), self.sessionID == currentSession, self.stream === activeStream,
+                        let updatedDisplay = updated.displays.first
+                    else { return }
+                    let updatedFilter = Self.makeContentFilter(
                         content: updated,
                         display: updatedDisplay,
                         targetBundleIds: targets
@@ -86,7 +108,9 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
         }
     }
 
+    @MainActor
     func stop() {
+        sessionID &+= 1
         if let observer = launchObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
             launchObserver = nil
