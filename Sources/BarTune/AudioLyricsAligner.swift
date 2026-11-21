@@ -117,6 +117,19 @@ struct AudioSyncedLyricsCache: Sendable {
         try? FileManager.default.removeItem(at: fileURL(for: trackId))
     }
 
+    func removeByCacheKey(_ cacheKey: String) {
+        try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(cacheKey).json"))
+    }
+
+    func syncEngine(forCacheKey cacheKey: String) -> AudioSyncEngine? {
+        let url = directory.appendingPathComponent("\(cacheKey).json")
+        guard let data = try? Data(contentsOf: url),
+              let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: data),
+              !record.lines.isEmpty
+        else { return nil }
+        return record.engine
+    }
+
     func clear() {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
@@ -419,10 +432,13 @@ enum LyricsAudioAligner {
     }
 
     /// Aligns fetched lyric lines against recognized audio words to produce precise word-level karaoke timings.
+    /// When `replaceTextWithTranscription` is true, matched lines permanently use the recognized audio words
+    /// as their lyric text (useful when written lyrics differ from sung pronunciation).
     static func align(
         lines: [LyricLine],
         recognizedWords: [RecognizedAudioWord],
-        searchWindow: Double = 8.0
+        searchWindow: Double = 8.0,
+        replaceTextWithTranscription: Bool = false
     ) -> AudioAlignmentResult {
         guard !lines.isEmpty, !recognizedWords.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
@@ -489,6 +505,37 @@ enum LyricsAudioAligner {
             let matchMap = Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) })
             let meaningfulTokenCount = lineTokens.filter { !$0.normalized.isEmpty }.count
             let minMatches = meaningfulTokenCount <= 2 ? 1 : max(2, meaningfulTokenCount / 3)
+
+            if replaceTextWithTranscription {
+                let windowWords = sortedRecognized.filter {
+                    $0.startTime >= shiftedStart - 0.6 && $0.startTime < shiftedEnd + 0.4
+                }
+                if !windowWords.isEmpty {
+                    matchedLineCount += 1
+                    matchedWordCount += windowWords.count
+                    let transcribedWords: [WordTimestamp] = windowWords.enumerated().map { idx, word in
+                        let suffix = (idx + 1 < windowWords.count) ? " " : ""
+                        return WordTimestamp(
+                            timestamp: word.startTime,
+                            duration: max(0.05, word.duration),
+                            text: word.text + suffix
+                        )
+                    }
+                    let transcribedText = transcribedWords.map(\.text).joined()
+                    let startTs = windowWords.first?.startTime ?? shiftedStart
+                    let endTs = windowWords.last?.endTime ?? shiftedEnd
+                    alignedLines.append(
+                        LyricLine(
+                            id: line.id,
+                            timestamp: startTs,
+                            duration: max(0.3, endTs - startTs),
+                            text: transcribedText,
+                            words: transcribedWords
+                        )
+                    )
+                    continue
+                }
+            }
 
             if matches.count >= minMatches {
                 matchedLineCount += 1

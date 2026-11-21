@@ -245,4 +245,41 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
         XCTAssertEqual(state.rawLyricLines, cachedLines)
     }
+
+    func testAlignReplacesTextWithTranscribedWordsWhenEnabled() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "Original written kanji"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "actual", startTime: 10.1, duration: 0.4, confidence: 0.92),
+            RecognizedAudioWord(text: "sung", startTime: 10.6, duration: 0.4, confidence: 0.90),
+            RecognizedAudioWord(text: "words", startTime: 11.1, duration: 0.5, confidence: 0.95),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines[0].text, "actual sung words")
+        XCTAssertEqual(result.lines[0].words.count, 3)
+        XCTAssertEqual(result.lines[0].words[0].timestamp, 10.1, accuracy: 0.01)
+        XCTAssertEqual(result.lines[0].words[2].timestamp, 11.1, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testLyricsStatePersistsReplaceWithTranscriptionSetting() throws {
+        let suiteName = "bartune.test.replacetranscript.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let state = LyricsState(userDefaults: ud)
+        XCTAssertFalse(state.replaceLyricsWithTranscription)
+
+        state.replaceLyricsWithTranscription = true
+        let reloaded = LyricsState(userDefaults: ud)
+        XCTAssertTrue(reloaded.replaceLyricsWithTranscription)
+    }
 }

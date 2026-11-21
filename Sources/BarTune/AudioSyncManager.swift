@@ -450,7 +450,11 @@ final class AudioSyncManager {
 
     private func applyAlignment(engine: AudioSyncEngine) {
         guard !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
-        let result = LyricsAudioAligner.align(lines: baseLines, recognizedWords: recognizedWords)
+        let result = LyricsAudioAligner.align(
+            lines: baseLines,
+            recognizedWords: recognizedWords,
+            replaceTextWithTranscription: state.replaceLyricsWithTranscription
+        )
         guard result.matchedLineCount > 0 else { return }
 
         state.applyAudioSyncedLines(result.lines)
@@ -472,7 +476,11 @@ final class AudioSyncManager {
     private func persistCurrentAlignmentIfReady() {
         let engine = state.audioSyncEngine
         guard engine != .off, !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
-        let result = LyricsAudioAligner.align(lines: baseLines, recognizedWords: recognizedWords)
+        let result = LyricsAudioAligner.align(
+            lines: baseLines,
+            recognizedWords: recognizedWords,
+            replaceTextWithTranscription: state.replaceLyricsWithTranscription
+        )
         guard result.matchedLineCount > 0 else { return }
         persistAlignment(result, engine: engine)
     }

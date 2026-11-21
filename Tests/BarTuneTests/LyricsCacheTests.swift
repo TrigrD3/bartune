@@ -118,4 +118,50 @@ final class LyricsCacheTests: XCTestCase {
         reloaded.setTrack(trackB, lyrics: [])
         XCTAssertEqual(reloaded.offsetSeconds, -0.8, accuracy: 0.001)
     }
+
+    func testListEntriesSupportsMetadataLegacyFilesAndAudioSyncStatus() throws {
+        let baseDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("bartune-list-tests-\(UUID().uuidString)", isDirectory: true)
+        let lyricsDir = baseDir.appendingPathComponent("lyrics", isDirectory: true)
+        let syncDir = baseDir.appendingPathComponent("sync", isDirectory: true)
+        try FileManager.default.createDirectory(at: lyricsDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: baseDir) }
+
+        let cache = LyricsDiskCache(directory: lyricsDir, maxEntries: 100)
+        let syncCache = AudioSyncedLyricsCache(directory: syncDir)
+
+        let lines = [LyricLine(id: 0, timestamp: 1.0, text: "First lyric")]
+        cache.save(trackId: "spotify:track:modern", lines: lines, title: "Yoru ni Kakeru", artist: "YOASOBI")
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "spotify:track:modern",
+                engine: .appleSpeech,
+                syncedAt: Date(),
+                medianOffset: 0.1,
+                alignedLineCount: 1,
+                lines: lines
+            )
+        )
+
+        let legacyKey = LyricsDiskCache.cacheKey(for: "spotify:track:legacy")
+        let legacyLines = [LyricLine(id: 0, timestamp: 2.0, text: "Legacy opening line")]
+        let legacyData = try JSONEncoder().encode(legacyLines)
+        try legacyData.write(to: lyricsDir.appendingPathComponent("\(legacyKey).json"))
+
+        let entries = cache.listEntries(audioSyncCache: syncCache)
+        XCTAssertEqual(entries.count, 2)
+
+        let modern = try XCTUnwrap(entries.first { $0.trackId == "spotify:track:modern" })
+        XCTAssertEqual(modern.title, "Yoru ni Kakeru")
+        XCTAssertEqual(modern.artist, "YOASOBI")
+        XCTAssertEqual(modern.syncEngine, .appleSpeech)
+
+        let legacy = try XCTUnwrap(entries.first { $0.cacheKey == legacyKey })
+        XCTAssertEqual(legacy.title, "Legacy opening line")
+        XCTAssertEqual(legacy.artist, "")
+        XCTAssertNil(legacy.syncEngine)
+
+        cache.removeByCacheKey(legacyKey)
+        XCTAssertEqual(cache.listEntries(audioSyncCache: syncCache).count, 1)
+    }
 }
