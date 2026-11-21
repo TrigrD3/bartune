@@ -13,12 +13,10 @@
 
 --disable andOperator
 --disable docComments
---disable enumNamespaces
 --disable redundantSelf
 --disable wrapMultilineStatementBraces
 --disable modifierOrder
 --disable wrapIfStatementBodies
---disable wrapIfExpressionBodies
 --disable repeatedGuard
 --disable redundantType
 --disable sortImports

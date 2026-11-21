@@ -16,9 +16,84 @@ disabled_rules:
   - cyclomatic_complexity
   - identifier_name
   - trailing_comma
-  - multiple_closures_with_trailing_closure
   - nesting
   - force_try
   - large_tuple
   - implicit_optional_initialization
   - redundant_string_enum_value
+
+opt_in_rules:
+  # Concurrency & safety
+  - unhandled_throwing_task
+  - incompatible_concurrency_annotation
+  - async_without_await
+  - unowned_variable_capture
+  - weak_delegate
+  - identical_operands
+  - fatal_error_message
+  - overridden_super_call
+  - override_in_extension
+  - prohibited_super_call
+  - private_swiftui_state
+  - private_subject
+  - unneeded_escaping
+  - unneeded_throws_rethrows
+  - discarded_notification_center_observer
+  - force_unwrapping
+
+  # Performance
+  - empty_count
+  - empty_string
+  - empty_collection_literal
+  - first_where
+  - last_where
+  - sorted_first_last
+  - reduce_into
+  - flatmap_over_map_reduce
+  - contains_over_filter_count
+  - contains_over_filter_is_empty
+  - contains_over_first_not_nil
+  - contains_over_range_nil_comparison
+
+  # Correctness & tests
+  - balanced_xctest_lifecycle
+  - empty_xctest_method
+  - final_test_case
+  - test_case_accessibility
+  - xct_specific_matcher
+  - fallthrough
+  - redundant_nil_coalescing
+  - return_value_from_void_function
+  - toggle_bool
+  - untyped_error_in_catch
+  - raw_value_for_camel_cased_codable_enum
+  - discouraged_optional_boolean
+
+custom_rules:
+  no_print_statements:
+    name: "No print or NSLog statements"
+    included: 'Sources/.*\.swift'
+    regex: '\b(print|NSLog)\s*\('
+    message: "Avoid print/NSLog in menu-bar daemon sources; use structured logging or remove debug output."
+    severity: warning
+
+  no_dispatch_main_sync:
+    name: "No DispatchQueue.main.sync"
+    included: 'Sources/.*\.swift'
+    regex: 'DispatchQueue\.main\.sync\b'
+    message: "Avoid DispatchQueue.main.sync to prevent main-thread deadlocks; use async or MainActor."
+    severity: error
+
+  no_local_machine_paths:
+    name: "No local machine paths"
+    included: '(Sources|Tests)/.*\.swift'
+    regex: '/Users/[A-Za-z0-9_.-]+'
+    message: "Do not hardcode local machine paths in sources or tests."
+    severity: error
+
+  locale_safe_applescript_double:
+    name: "Locale-safe AppleScript Double parsing"
+    included: 'Sources/BarTune/(SpotifyMonitor|BrowserMediaMonitor)\.swift'
+    regex: '\bDouble\(\s*(parts|fields)\['
+    message: "Use SpotifyMonitor.parseLocaleDouble(...) instead of Double(...) when parsing AppleScript numeric output."
+    severity: error

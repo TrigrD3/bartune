@@ -560,7 +560,9 @@ actor LyricsFetcher {
 
     private func fetchNetEase(track: TrackInfo) async throws -> (yrc: [LyricLine]?, lrc: [LyricLine]?) {
         try Task.checkCancellation()
-        var searchComp = URLComponents(string: "https://music.163.com/api/search/get")!
+        guard var searchComp = URLComponents(string: "https://music.163.com/api/search/get") else {
+            return (nil, nil)
+        }
         searchComp.queryItems = [
             URLQueryItem(name: "s", value: "\(track.title) \(track.artist)"),
             URLQueryItem(name: "type", value: "1"),
@@ -626,7 +628,7 @@ actor LyricsFetcher {
 
     private func fetchLRCLibExact(track: TrackInfo) async throws -> [LyricLine]? {
         try Task.checkCancellation()
-        var components = URLComponents(string: "https://lrclib.net/api/get")!
+        guard var components = URLComponents(string: "https://lrclib.net/api/get") else { return nil }
         components.queryItems = [
             URLQueryItem(name: "artist_name", value: track.artist),
             URLQueryItem(name: "track_name", value: track.title),
@@ -658,7 +660,7 @@ actor LyricsFetcher {
 
     private func fetchLRCLibSearch(track: TrackInfo) async throws -> [LyricLine]? {
         try Task.checkCancellation()
-        var components = URLComponents(string: "https://lrclib.net/api/search")!
+        guard var components = URLComponents(string: "https://lrclib.net/api/search") else { return nil }
         components.queryItems = [
             URLQueryItem(name: "artist_name", value: track.artist),
             URLQueryItem(name: "track_name", value: track.title)

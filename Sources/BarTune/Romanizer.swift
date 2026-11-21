@@ -50,7 +50,7 @@ enum JapaneseRomanizer {
         var parts: [String] = []
         var cursor = 0
 
-        while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
+        while !CFStringTokenizerAdvanceToNextToken(tokenizer).isEmpty {
             let tokenRange = CFStringTokenizerGetCurrentTokenRange(tokenizer)
             guard tokenRange.location != kCFNotFound, tokenRange.length > 0 else { continue }
 
