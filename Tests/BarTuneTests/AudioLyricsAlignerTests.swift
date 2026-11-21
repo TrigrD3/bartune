@@ -406,7 +406,8 @@ final class AudioLyricsAlignerTests: XCTestCase {
         )
 
         XCTAssertEqual(result.matchedLineCount, 0)
-        XCTAssertEqual(result.lines[0].text, "We are the champions")
+        // Transcript-only mode must omit unmatched/unrelated lines instead of falling back to static text.
+        XCTAssertTrue(result.lines.isEmpty)
     }
 
     func testTargetBundleIdentifiersMapToActiveMediaPlayer() {
