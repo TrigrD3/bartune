@@ -350,4 +350,55 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertEqual(raw.map(\.text), ["new"])
         XCTAssertEqual(translated.map(\.text), ["new en"])
     }
+
+    @MainActor
+    func testOfflineCacheStatsLoadOffMainThread() async {
+        final class ThreadFlag: @unchecked Sendable {
+            var ranOnMain = true
+        }
+        let flag = ThreadFlag()
+        let model = OfflineCacheStatsModel {
+            flag.ranOnMain = Thread.isMainThread
+            return OfflineCacheSnapshot(cachedSongCount: 7)
+        }
+
+        await model.refresh().value
+
+        XCTAssertFalse(flag.ranOnMain)
+        XCTAssertEqual(model.snapshot.cachedSongCount, 7)
+    }
+
+    @MainActor
+    func testOfflineCacheStatsIgnoreSupersededRefresh() async {
+        final class Loads: @unchecked Sendable {
+            private let lock = NSLock()
+            private var count = 0
+            let gate = DispatchSemaphore(value: 0)
+
+            func next() -> Int {
+                lock.lock()
+                defer { lock.unlock() }
+                count += 1
+                return count
+            }
+        }
+        let loads = Loads()
+        let firstStarted = expectation(description: "first load started")
+        let model = OfflineCacheStatsModel {
+            let call = loads.next()
+            if call == 1 {
+                firstStarted.fulfill()
+                loads.gate.wait()
+            }
+            return OfflineCacheSnapshot(cachedSongCount: call)
+        }
+
+        let stale = model.refresh()
+        await fulfillment(of: [firstStarted], timeout: 5)
+        await model.refresh().value
+        loads.gate.signal()
+        await stale.value
+
+        XCTAssertEqual(model.snapshot.cachedSongCount, 2)
+    }
 }

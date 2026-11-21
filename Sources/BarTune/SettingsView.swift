@@ -37,15 +37,58 @@ private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
+struct OfflineCacheSnapshot: Equatable, Sendable {
+    var cachedSongCount = 0
+    var cachedBytes: Int64 = 0
+    var syncedSongCount = 0
+    var syncedBytes: Int64 = 0
+    var songs: [CachedSongSummary] = []
+
+    static func load(
+        lyricsCache: LyricsDiskCache = .default,
+        syncCache: AudioSyncedLyricsCache = .default
+    ) -> OfflineCacheSnapshot {
+        let stats = lyricsCache.stats()
+        let syncStats = syncCache.stats()
+        return OfflineCacheSnapshot(
+            cachedSongCount: stats.count,
+            cachedBytes: stats.bytes,
+            syncedSongCount: syncStats.count,
+            syncedBytes: syncStats.bytes,
+            songs: lyricsCache.listEntries(audioSyncCache: syncCache)
+        )
+    }
+}
+
+/// Scans and decodes the Offline Cache off the main thread, publishing only the newest refresh.
+@MainActor
+final class OfflineCacheStatsModel: ObservableObject {
+    @Published private(set) var snapshot = OfflineCacheSnapshot()
+    private let load: @Sendable () -> OfflineCacheSnapshot
+    private var latestRefresh = 0
+
+    init(load: @escaping @Sendable () -> OfflineCacheSnapshot = { OfflineCacheSnapshot.load() }) {
+        self.load = load
+    }
+
+    @discardableResult
+    func refresh() -> Task<Void, Never> {
+        latestRefresh += 1
+        let refreshID = latestRefresh
+        let load = load
+        return Task {
+            let snapshot = await Task.detached(priority: .utility) { load() }.value
+            guard refreshID == latestRefresh else { return }
+            self.snapshot = snapshot
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var state: LyricsState
     let cacheRemover: OfflineCacheRemover
     @State private var selectedTab: SettingsTab = .general
-    @State private var cachedSongCount: Int = 0
-    @State private var cachedBytes: Int64 = 0
-    @State private var syncedSongCount: Int = 0
-    @State private var syncedBytes: Int64 = 0
-    @State private var cachedSongs: [CachedSongSummary] = []
+    @StateObject private var cacheStats = OfflineCacheStatsModel()
     @State private var cacheSearchQuery: String = ""
     @State private var inspectingSong: CachedSongSummary?
     @State private var songPendingDeletion: CachedSongSummary?
@@ -734,6 +777,12 @@ struct SettingsView: View {
         }
     }
 
+    private var cachedSongCount: Int { cacheStats.snapshot.cachedSongCount }
+    private var cachedBytes: Int64 { cacheStats.snapshot.cachedBytes }
+    private var syncedSongCount: Int { cacheStats.snapshot.syncedSongCount }
+    private var syncedBytes: Int64 { cacheStats.snapshot.syncedBytes }
+    private var cachedSongs: [CachedSongSummary] { cacheStats.snapshot.songs }
+
     private var cachedCountLabel: String {
         if state.lyricsCacheLimit == .unlimited {
             return "\(cachedSongCount)"
@@ -790,13 +839,7 @@ struct SettingsView: View {
     }
 
     private func refreshCacheStats() {
-        let stats = LyricsDiskCache.default.stats()
-        cachedSongCount = stats.count
-        cachedBytes = stats.bytes
-        let syncStats = AudioSyncedLyricsCache.default.stats()
-        syncedSongCount = syncStats.count
-        syncedBytes = syncStats.bytes
-        cachedSongs = LyricsDiskCache.default.listEntries(audioSyncCache: .default)
+        cacheStats.refresh()
     }
 
     private func refreshWhisperDiscovery() {
