@@ -321,6 +321,18 @@ struct LyricsOverlayView: View {
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
 
+                if !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
+                    MarqueeTrackLabelView(
+                        text: state.trackSummary,
+                        color: activeUnsungColor,
+                        maxWidth: 140,
+                        isPlaying: state.isEnabled && state.isPlaying,
+                        lowCPUMode: state.lowCPUMode
+                    )
+                    .layoutPriority(1)
+                    .transition(.opacity)
+                }
+
                 if state.showSyncBadge,
                    let badge = state.audioSyncStatus.overlayBadge,
                    !(badge.isSynced && hideSyncedBadge) {
@@ -331,20 +343,11 @@ struct LyricsOverlayView: View {
                         lowCPUMode: state.lowCPUMode
                     )
                     .fixedSize()
+                    .layoutPriority(2)
                     .transition(.asymmetric(
                         insertion: .opacity.combined(with: .scale(scale: 0.85)),
                         removal: .opacity.combined(with: .scale(scale: 0.92))
                     ))
-                } else if !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
-                    Text(state.trackSummary)
-                        .font(.system(size: 10.5, weight: .regular))
-                        .foregroundStyle(activeUnsungColor)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(maxWidth: 150, alignment: .trailing)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .layoutPriority(1)
-                        .transition(.opacity)
                 }
             }
             .padding(.horizontal, 10)
@@ -432,6 +435,85 @@ private struct SpotlightMaskModifier: ViewModifier {
                 .mask(CursorCutoutMask(cursorX: cursorX, spotlightWidth: spotlightWidth))
         } else {
             content
+        }
+    }
+}
+
+enum MarqueeScrollCalculator {
+    static let gap: CGFloat = 24
+
+    /// Computes horizontal scroll offset for a smoothly looping marquee label.
+    /// Returns `0` when the text already fits inside `containerWidth`.
+    static func offset(
+        at elapsed: Double,
+        textWidth: CGFloat,
+        containerWidth: CGFloat,
+        speed: Double = 24.0,
+        pauseDuration: Double = 1.6
+    ) -> CGFloat {
+        guard textWidth > containerWidth + 1, speed > 0 else { return 0 }
+        let travel = Double(textWidth + gap)
+        let scrollDuration = travel / speed
+        let cycle = pauseDuration + scrollDuration
+        let phase = elapsed.truncatingRemainder(dividingBy: cycle)
+        guard phase > pauseDuration else { return 0 }
+        return -CGFloat((phase - pauseDuration) * speed)
+    }
+}
+
+private struct MarqueeTrackLabelView: View {
+    let text: String
+    let color: Color
+    let maxWidth: CGFloat
+    let isPlaying: Bool
+    let lowCPUMode: Bool
+
+    @State private var textWidth: CGFloat = 0
+    @State private var startDate: Date = .now
+
+    private var needsScroll: Bool {
+        textWidth > maxWidth + 1
+    }
+
+    var body: some View {
+        let displayWidth = needsScroll ? maxWidth : max(1, textWidth)
+        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 12.0) : (1.0 / 30.0), paused: !isPlaying || !needsScroll)) { timeline in
+            let elapsed = max(0, timeline.date.timeIntervalSince(startDate))
+            let xOffset = MarqueeScrollCalculator.offset(
+                at: elapsed,
+                textWidth: textWidth,
+                containerWidth: maxWidth
+            )
+
+            HStack(spacing: MarqueeScrollCalculator.gap) {
+                labelText
+                    .background(widthReader)
+                if needsScroll {
+                    labelText
+                }
+            }
+            .offset(x: xOffset)
+            .frame(width: displayWidth, alignment: .leading)
+            .clipped()
+        }
+        .onChange(of: text) { _ in
+            startDate = .now
+        }
+    }
+
+    private var labelText: some View {
+        Text(text)
+            .font(.system(size: 10.5, weight: .regular))
+            .foregroundStyle(color)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private var widthReader: some View {
+        GeometryReader { geo in
+            Color.clear
+                .onAppear { textWidth = geo.size.width }
+                .onChange(of: text) { _ in textWidth = geo.size.width }
+                .onChange(of: geo.size.width) { newW in textWidth = newW }
         }
     }
 }

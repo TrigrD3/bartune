@@ -90,4 +90,11 @@ final class LyricsStatePerformanceTests: XCTestCase {
         let elapsed = CFAbsoluteTimeGetCurrent() - start
         XCTAssertLessThan(elapsed, 0.5, "100 chapter payload parses should stay well under 0.5s")
     }
+
+    func testMarqueeScrollCalculatorStaysZeroWhenTextFitsAndScrollsWhenOverflowing() {
+        XCTAssertEqual(MarqueeScrollCalculator.offset(at: 5.0, textWidth: 100, containerWidth: 140), 0)
+        XCTAssertEqual(MarqueeScrollCalculator.offset(at: 1.0, textWidth: 200, containerWidth: 140), 0)
+        let scrolled = MarqueeScrollCalculator.offset(at: 2.6, textWidth: 200, containerWidth: 140, speed: 24.0, pauseDuration: 1.6)
+        XCTAssertEqual(scrolled, -24.0, accuracy: 0.01)
+    }
 }
