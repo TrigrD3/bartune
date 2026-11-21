@@ -469,35 +469,50 @@ private struct MarqueeTrackLabelView: View {
     let lowCPUMode: Bool
 
     @State private var textWidth: CGFloat = 0
-    @State private var startDate: Date = .now
+    @State private var isScrolling: Bool = false
 
     private var needsScroll: Bool {
         textWidth > maxWidth + 1
     }
 
+    private var travelDistance: CGFloat {
+        textWidth + MarqueeScrollCalculator.gap
+    }
+
+    private var scrollDuration: Double {
+        max(3.0, Double(travelDistance) / 24.0)
+    }
+
     var body: some View {
         let displayWidth = needsScroll ? maxWidth : max(1, textWidth)
-        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 12.0) : (1.0 / 30.0), paused: !isPlaying || !needsScroll)) { timeline in
-            let elapsed = max(0, timeline.date.timeIntervalSince(startDate))
-            let xOffset = MarqueeScrollCalculator.offset(
-                at: elapsed,
-                textWidth: textWidth,
-                containerWidth: maxWidth
-            )
 
-            HStack(spacing: MarqueeScrollCalculator.gap) {
+        HStack(spacing: MarqueeScrollCalculator.gap) {
+            labelText
+                .background(widthReader)
+            if needsScroll {
                 labelText
-                    .background(widthReader)
-                if needsScroll {
-                    labelText
-                }
             }
-            .offset(x: xOffset)
-            .frame(width: displayWidth, alignment: .leading)
-            .clipped()
         }
-        .onChange(of: text) { _ in
-            startDate = .now
+        .offset(x: isScrolling && needsScroll ? -travelDistance : 0)
+        .frame(width: displayWidth, alignment: .leading)
+        .clipped()
+        .onAppear { restartMarquee() }
+        .onChange(of: text) { _ in restartMarquee() }
+        .onChange(of: textWidth) { _ in restartMarquee() }
+        .onChange(of: isPlaying) { _ in restartMarquee() }
+    }
+
+    private func restartMarquee() {
+        var reset = Transaction()
+        reset.disablesAnimations = true
+        withTransaction(reset) {
+            isScrolling = false
+        }
+        guard isPlaying, needsScroll else { return }
+        DispatchQueue.main.async {
+            withAnimation(.linear(duration: scrollDuration).repeatForever(autoreverses: false)) {
+                isScrolling = true
+            }
         }
     }
 
