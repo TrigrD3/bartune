@@ -43,4 +43,14 @@ final class LRCParserTests: XCTestCase {
         XCTAssertEqual(clamped[0].timestamp, 0, accuracy: 0.001)
         XCTAssertEqual(clamped[0].words[0].timestamp, 0, accuracy: 0.001)
     }
+
+    func testEnhancedPrefixAndTerminalBoundary() {
+        let lines = LRCParser.parse("[00:10.00]Hello <00:10.50>world<00:11.00>")
+
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(lines[0].text, "Hello world")
+        XCTAssertEqual(lines[0].words.map(\.text), ["Hello ", "world"])
+        XCTAssertEqual(lines[0].words.map(\.timestamp), [10.0, 10.5])
+        XCTAssertEqual(lines[0].words.last?.duration ?? 0, 0.5, accuracy: 0.001)
+    }
 }
