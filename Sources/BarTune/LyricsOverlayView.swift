@@ -215,6 +215,8 @@ struct CursorCutoutMask: View {
 
 struct LyricsOverlayView: View {
     @ObservedObject var state: LyricsState
+    @State private var hideSyncedBadge: Bool = false
+    @State private var badgeDismissTask: Task<Void, Never>?
 
     private var activeBackdropColor: Color {
         if state.themeMode == .albumTint, let colors = state.albumColors {
@@ -269,6 +271,21 @@ struct LyricsOverlayView: View {
         return state.themeMode == .albumTint ? Color.white.opacity(0.12) : Color.primary.opacity(0.08)
     }
 
+    private func handleBadgeAutoDismiss(for status: AudioSyncStatus) {
+        badgeDismissTask?.cancel()
+        badgeDismissTask = nil
+        if case .cached = status {
+            hideSyncedBadge = false
+            badgeDismissTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                guard !Task.isCancelled else { return }
+                hideSyncedBadge = true
+            }
+        } else {
+            hideSyncedBadge = false
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .leading) {
             activeBackdropColor
@@ -304,7 +321,9 @@ struct LyricsOverlayView: View {
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
 
-                if state.showSyncBadge, let badge = state.audioSyncStatus.overlayBadge {
+                if state.showSyncBadge,
+                   let badge = state.audioSyncStatus.overlayBadge,
+                   !(badge.isSynced && hideSyncedBadge) {
                     SyncStatusBadgeView(
                         badge: badge,
                         foreground: syncBadgeForegroundColor(isSynced: badge.isSynced),
@@ -312,11 +331,32 @@ struct LyricsOverlayView: View {
                         lowCPUMode: state.lowCPUMode
                     )
                     .fixedSize()
-                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                    .transition(.asymmetric(
+                        insertion: .opacity.combined(with: .scale(scale: 0.85)),
+                        removal: .opacity.combined(with: .scale(scale: 0.92))
+                    ))
+                } else if !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
+                    Text(state.trackSummary)
+                        .font(.system(size: 10.5, weight: .regular))
+                        .foregroundStyle(activeUnsungColor)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .layoutPriority(-1)
+                        .transition(.opacity)
                 }
             }
             .padding(.horizontal, 10)
-            .animation(.easeInOut(duration: 0.2), value: state.audioSyncStatus.overlayBadge)
+            .animation(.spring(response: 0.32, dampingFraction: 0.82), value: state.audioSyncStatus.overlayBadge)
+            .animation(.easeOut(duration: 0.35), value: hideSyncedBadge)
+            .onChange(of: state.audioSyncStatus) { newStatus in
+                handleBadgeAutoDismiss(for: newStatus)
+            }
+            .onChange(of: state.trackSummary) { _ in
+                handleBadgeAutoDismiss(for: state.audioSyncStatus)
+            }
+            .onAppear {
+                handleBadgeAutoDismiss(for: state.audioSyncStatus)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))

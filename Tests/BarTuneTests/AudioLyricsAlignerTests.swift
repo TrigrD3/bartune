@@ -248,7 +248,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
     func testAlignReplacesTextWithTranscribedWordsWhenEnabled() {
         let lines = [
-            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "Original written kanji"),
+            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "Original written words"),
         ]
         let recognized = [
             RecognizedAudioWord(text: "actual", startTime: 10.1, duration: 0.4, confidence: 0.92),
@@ -387,5 +387,32 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+    }
+
+    func testTranscriptionOverwriteRejectsUnrelatedExternalSpeech() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "We are the champions"),
+        ]
+        let unrelatedVoice = [
+            RecognizedAudioWord(text: "checking", startTime: 10.1, duration: 0.4, confidence: 0.95),
+            RecognizedAudioWord(text: "pipeline", startTime: 10.6, duration: 0.4, confidence: 0.95),
+            RecognizedAudioWord(text: "status", startTime: 11.1, duration: 0.4, confidence: 0.95),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: unrelatedVoice,
+            replaceTextWithTranscription: true
+        )
+
+        XCTAssertEqual(result.matchedLineCount, 0)
+        XCTAssertEqual(result.lines[0].text, "We are the champions")
+    }
+
+    func testTargetBundleIdentifiersMapToActiveMediaPlayer() {
+        XCTAssertEqual(AudioSyncManager.targetBundleIdentifiers(for: "spotify:track:123"), ["com.spotify.client"])
+        XCTAssertEqual(AudioSyncManager.targetBundleIdentifiers(for: "music:abc"), ["com.apple.Music"])
+        XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "browser:yt:xyz").contains("com.google.Chrome"))
+        XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "unknown:1").isEmpty)
     }
 }
