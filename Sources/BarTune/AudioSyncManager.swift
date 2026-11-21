@@ -235,6 +235,7 @@ final class AudioSyncManager {
     private let capture = SystemAudioCapture()
 
     private var activeTrackId: String?
+    private var activeSourceBundleId: String?
     private var baseLines: [LyricLine] = []
     private var recognizedWords: [RecognizedAudioWord] = []
     private(set) var isLiveSyncActive: Bool = false
@@ -277,6 +278,7 @@ final class AudioSyncManager {
     func handleTrackLoaded(track: TrackInfo, rawLines: [LyricLine], forceResync: Bool = false) {
         stop()
         activeTrackId = track.id
+        activeSourceBundleId = track.sourceBundleId
         baseLines = rawLines
         recognizedWords = []
 
@@ -315,8 +317,14 @@ final class AudioSyncManager {
         return wordSyncedCount * 2 >= nonEmpty.count
     }
 
-    /// Maps a BarTune track ID prefix to the exact media player bundle ID(s) for isolated ScreenCaptureKit audio capture.
-    nonisolated static func targetBundleIdentifiers(for trackId: String) -> Set<String> {
+    /// Maps a BarTune track to the exact media player bundle ID(s) for isolated ScreenCaptureKit audio capture.
+    nonisolated static func targetBundleIdentifiers(for track: TrackInfo) -> Set<String> {
+        targetBundleIdentifiers(for: track.id, sourceBundleId: track.sourceBundleId)
+    }
+
+    /// Maps a BarTune track ID prefix (and optional originating browser bundle ID) to the exact media player bundle ID(s) for isolated ScreenCaptureKit audio
+    /// capture.
+    nonisolated static func targetBundleIdentifiers(for trackId: String, sourceBundleId: String? = nil) -> Set<String> {
         if trackId.hasPrefix("spotify:") {
             return ["com.spotify.client"]
         }
@@ -324,6 +332,9 @@ final class AudioSyncManager {
             return ["com.apple.Music"]
         }
         if trackId.hasPrefix("browser:") {
+            if let sourceBundleId, !sourceBundleId.isEmpty {
+                return [sourceBundleId]
+            }
             return [
                 "com.google.Chrome",
                 "company.thebrowser.Browser",
@@ -343,7 +354,15 @@ final class AudioSyncManager {
 
     func resyncCurrentTrack() {
         guard let trackId = activeTrackId, !baseLines.isEmpty else { return }
-        let track = TrackInfo(id: trackId, title: "", artist: "", album: "", duration: 0, artworkURL: nil)
+        let track = TrackInfo(
+            id: trackId,
+            title: "",
+            artist: "",
+            album: "",
+            duration: 0,
+            artworkURL: nil,
+            sourceBundleId: activeSourceBundleId
+        )
         handleTrackLoaded(track: track, rawLines: baseLines, forceResync: true)
     }
 
@@ -469,7 +488,7 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
-        let targetBundles = Self.targetBundleIdentifiers(for: track.id)
+        let targetBundles = Self.targetBundleIdentifiers(for: track)
         Task { [weak self] in
             do {
                 try await self?.capture.start(targetBundleIds: targetBundles)
@@ -541,7 +560,7 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
-        let targetBundles = Self.targetBundleIdentifiers(for: track.id)
+        let targetBundles = Self.targetBundleIdentifiers(for: track)
         Task { [weak self] in
             do {
                 try await self?.capture.start(targetBundleIds: targetBundles)
