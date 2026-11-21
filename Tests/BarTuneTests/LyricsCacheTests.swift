@@ -322,4 +322,32 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertEqual(afterClear.map(\.text), ["newer"])
         XCTAssertEqual(translatedAfterClear.map(\.text), ["newer en"])
     }
+
+    func testMemoryCachesEvictOldEntries() async {
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let offline: LyricsFetcher.DataLoader = { _ in throw URLError(.notConnectedToInternet) }
+        let fetcher = LyricsFetcher(diskCache: diskCache, memoryCapacity: 2, dataLoader: offline)
+        let translator = LyricsTranslator(diskCache: diskCache, memoryCapacity: 2, dataLoader: offline)
+        let source = [LyricLine(id: 0, timestamp: 1, text: "source")]
+
+        func seed(_ id: String, _ text: String) {
+            diskCache.save(trackId: id, lines: [LyricLine(id: 0, timestamp: 1, text: text)], title: id, artist: "Artist")
+            diskCache.save(trackId: "\(id):tr:en", lines: [LyricLine(id: 0, timestamp: 1, text: "\(text) en")])
+        }
+        func track(_ id: String) -> TrackInfo {
+            TrackInfo(id: id, title: id, artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        }
+
+        for id in ["a", "b", "c"] {
+            seed(id, "old")
+            _ = await fetcher.fetchLyrics(for: track(id))
+            _ = await translator.translate(lines: source, trackId: id, targetLanguage: .english)
+        }
+        seed("a", "new")
+
+        let raw = await fetcher.fetchLyrics(for: track("a"))
+        let translated = await translator.translate(lines: source, trackId: "a", targetLanguage: .english)
+        XCTAssertEqual(raw.map(\.text), ["new"])
+        XCTAssertEqual(translated.map(\.text), ["new en"])
+    }
 }

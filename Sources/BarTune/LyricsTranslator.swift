@@ -64,14 +64,16 @@ actor LyricsTranslator {
 
     private let diskCache: LyricsDiskCache
     private let dataLoader: DataLoader
-    private var memoryCache: [String: [LyricLine]] = [:]
+    private var memoryCache: LRUMemoryCache<[LyricLine]>
 
     init(
         diskCache: LyricsDiskCache = .default,
+        memoryCapacity: Int = LRUMemoryCache<[LyricLine]>.defaultCapacity,
         dataLoader: @escaping DataLoader = { try await URLSession.shared.data(for: $0) }
     ) {
         self.diskCache = diskCache
         self.dataLoader = dataLoader
+        memoryCache = LRUMemoryCache(capacity: memoryCapacity)
     }
 
     func clearCache() {
@@ -84,7 +86,7 @@ actor LyricsTranslator {
             memoryCache.removeAll()
             return
         }
-        memoryCache = memoryCache.filter { key, _ in key != trackId && !key.hasPrefix("\(trackId):tr:") }
+        memoryCache.removeAll { $0 == trackId || $0.hasPrefix("\(trackId):tr:") }
     }
 
     func translate(

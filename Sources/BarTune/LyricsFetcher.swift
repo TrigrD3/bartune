@@ -219,6 +219,52 @@ struct LyricsDiskCache: Sendable {
     }
 }
 
+/// Small least-recently-used dictionary that keeps at most `capacity` values in memory.
+struct LRUMemoryCache<Value> {
+    static var defaultCapacity: Int { 32 }
+
+    let capacity: Int
+    private var values: [String: Value] = [:]
+    private var order: [String] = []
+
+    init(capacity: Int = defaultCapacity) {
+        self.capacity = max(1, capacity)
+    }
+
+    subscript(key: String) -> Value? {
+        mutating get {
+            guard let value = values[key] else { return nil }
+            touch(key)
+            return value
+        }
+        set {
+            guard let newValue else {
+                removeValue(forKey: key)
+                return
+            }
+            values[key] = newValue
+            touch(key)
+            while order.count > capacity {
+                values.removeValue(forKey: order.removeFirst())
+            }
+        }
+    }
+
+    mutating func removeValue(forKey key: String) {
+        removeAll { $0 == key }
+    }
+
+    mutating func removeAll(where shouldRemove: (String) -> Bool = { _ in true }) {
+        order.removeAll(where: shouldRemove)
+        values = values.filter { !shouldRemove($0.key) }
+    }
+
+    private mutating func touch(_ key: String) {
+        order.removeAll { $0 == key }
+        order.append(key)
+    }
+}
+
 /// Removes cached songs from disk and from the live fetcher and translator memory caches.
 struct OfflineCacheRemover: Sendable {
     let fetcher: LyricsFetcher
@@ -463,16 +509,18 @@ actor LyricsFetcher {
         let lrc: LyricBlock?
     }
 
-    private var cache: [String: [LyricLine]] = [:]
+    private var cache: LRUMemoryCache<[LyricLine]>
     private let diskCache: LyricsDiskCache
     private let dataLoader: DataLoader
 
     init(
         diskCache: LyricsDiskCache = .default,
+        memoryCapacity: Int = LRUMemoryCache<[LyricLine]>.defaultCapacity,
         dataLoader: @escaping DataLoader = { try await URLSession.shared.data(for: $0) }
     ) {
         self.diskCache = diskCache
         self.dataLoader = dataLoader
+        cache = LRUMemoryCache(capacity: memoryCapacity)
     }
 
     func clearCache() {
