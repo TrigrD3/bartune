@@ -123,27 +123,13 @@ final class SpotifyMonitor {
         )
         let activeTrackId = lastSnapshot?.track?.id ?? ""
 
-        scriptQueue.async { [weak self] in
-            let scriptSource: String?
-            if activeTrackId.hasPrefix("music:")
-                || (!runningBundleIds.contains("com.spotify.client") && runningBundleIds.contains("com.apple.Music")) {
-                let verb = switch command {
-                case .playPause: "playpause"
-                case .nextTrack: "next track"
-                case .previousTrack: "previous track"
-                }
-                scriptSource = "tell application \"Music\" to \(verb)"
-            } else if runningBundleIds.contains("com.spotify.client") {
-                let verb = switch command {
-                case .playPause: "playpause"
-                case .nextTrack: "next track"
-                case .previousTrack: "previous track"
-                }
-                scriptSource = "tell application \"Spotify\" to \(verb)"
-            } else {
-                scriptSource = nil
-            }
+        let scriptSource = Self.transportScriptSource(
+            for: command,
+            activeTrackId: activeTrackId,
+            runningBundleIds: runningBundleIds
+        )
 
+        scriptQueue.async { [weak self] in
             if let source = scriptSource, let script = NSAppleScript(source: source) {
                 var error: NSDictionary?
                 script.executeAndReturnError(&error)
@@ -153,6 +139,28 @@ final class SpotifyMonitor {
                 self?.poll()
             }
         }
+    }
+
+    nonisolated static func transportScriptSource(
+        for command: PlaybackCommand,
+        activeTrackId: String,
+        runningBundleIds: Set<String>
+    ) -> String? {
+        // Browser tabs can't be controlled yet; never fall back to a native player that isn't displayed.
+        guard !activeTrackId.hasPrefix("browser:") else { return nil }
+        let verb = switch command {
+        case .playPause: "playpause"
+        case .nextTrack: "next track"
+        case .previousTrack: "previous track"
+        }
+        if activeTrackId.hasPrefix("music:")
+            || (!runningBundleIds.contains("com.spotify.client") && runningBundleIds.contains("com.apple.Music")) {
+            return "tell application \"Music\" to \(verb)"
+        }
+        if runningBundleIds.contains("com.spotify.client") {
+            return "tell application \"Spotify\" to \(verb)"
+        }
+        return nil
     }
 
     func start(lowCPUMode: Bool = true, browserMusicEnabled: Bool = true) {
