@@ -32,7 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusBarMenu()
         overlayController = OverlayWindowController(state: state)
-        settingsController = SettingsWindowController(state: state)
+        settingsController = SettingsWindowController(
+            state: state,
+            cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator)
+        )
 
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)

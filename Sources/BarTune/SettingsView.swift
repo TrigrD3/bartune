@@ -39,6 +39,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
 
 struct SettingsView: View {
     @ObservedObject var state: LyricsState
+    let cacheRemover: OfflineCacheRemover
     @State private var selectedTab: SettingsTab = .general
     @State private var cachedSongCount: Int = 0
     @State private var cachedBytes: Int64 = 0
@@ -700,10 +701,7 @@ struct SettingsView: View {
         .alert("Clear Offline Cache?", isPresented: $showClearCacheConfirmation) {
             Button("Clear All Cache", role: .destructive) {
                 Task {
-                    await Task.detached(priority: .utility) {
-                        LyricsDiskCache.default.clear()
-                        AudioSyncedLyricsCache.default.clear()
-                    }.value
+                    await cacheRemover.removeAll()
                     refreshCacheStats()
                 }
             }
@@ -785,9 +783,10 @@ struct SettingsView: View {
     }
 
     private func deleteCachedSong(_ song: CachedSongSummary) {
-        LyricsDiskCache.default.removeByCacheKey(song.cacheKey)
-        AudioSyncedLyricsCache.default.removeByCacheKey(song.cacheKey)
-        refreshCacheStats()
+        Task {
+            await cacheRemover.remove(song)
+            refreshCacheStats()
+        }
     }
 
     private func refreshCacheStats() {
@@ -1217,10 +1216,12 @@ private struct VisualizerPreviewStrip: View {
 @MainActor
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let state: LyricsState
+    private let cacheRemover: OfflineCacheRemover
     private var window: NSWindow?
 
-    init(state: LyricsState) {
+    init(state: LyricsState, cacheRemover: OfflineCacheRemover) {
         self.state = state
+        self.cacheRemover = cacheRemover
         super.init()
     }
 
@@ -1231,7 +1232,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView(state: state))
+        let hosting = NSHostingController(rootView: SettingsView(state: state, cacheRemover: cacheRemover))
         let win = NSWindow(contentViewController: hosting)
         win.title = "BarTune Settings"
         win.styleMask = [.titled, .closable]

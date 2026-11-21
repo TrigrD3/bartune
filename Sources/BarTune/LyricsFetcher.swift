@@ -219,6 +219,28 @@ struct LyricsDiskCache: Sendable {
     }
 }
 
+/// Removes cached songs from disk and from the live fetcher and translator memory caches.
+struct OfflineCacheRemover: Sendable {
+    let fetcher: LyricsFetcher
+    let translator: LyricsTranslator
+    var lyricsCache: LyricsDiskCache = .default
+    var syncCache: AudioSyncedLyricsCache = .default
+
+    func remove(_ song: CachedSongSummary) async {
+        lyricsCache.removeByCacheKey(song.cacheKey)
+        syncCache.removeByCacheKey(song.cacheKey)
+        await fetcher.invalidateMemoryCache(trackId: song.trackId)
+        await translator.invalidateMemoryCache(trackId: song.trackId)
+    }
+
+    func removeAll() async {
+        lyricsCache.clear()
+        syncCache.clear()
+        await fetcher.invalidateMemoryCache(trackId: nil)
+        await translator.clearCache()
+    }
+}
+
 struct NetEaseSongCandidate: Equatable {
     let id: Int
     let name: String
