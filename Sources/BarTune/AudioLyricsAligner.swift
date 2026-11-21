@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import NaturalLanguage
 
 enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     case off = "off"
@@ -421,6 +422,39 @@ enum WhisperJSONParser {
     }
 }
 
+enum LyricsLanguageDetector {
+    /// Detects the best speech recognition locale from fetched lyrics so Apple Speech
+    /// doesn't default to English on Japanese, Korean, Chinese, or other non-English songs.
+    static func detectSpeechLocale(for lines: [LyricLine]) -> Locale {
+        guard !lines.isEmpty else { return .current }
+        if JapaneseRomanizer.isJapaneseTrack(lines) {
+            return Locale(identifier: "ja-JP")
+        }
+        if KoreanRomanizer.isKoreanTrack(lines) {
+            return Locale(identifier: "ko-KR")
+        }
+        if ChineseRomanizer.isChineseTrack(lines) {
+            return Locale(identifier: "zh-CN")
+        }
+
+        let sample = lines.prefix(12).map(\.text).joined(separator: " ")
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(sample)
+        if let dominant = recognizer.dominantLanguage, dominant != .undetermined {
+            let code = dominant.rawValue
+            switch code {
+            case "ja": return Locale(identifier: "ja-JP")
+            case "ko": return Locale(identifier: "ko-KR")
+            case "zh-Hans", "zh-Hant", "zh": return Locale(identifier: "zh-CN")
+            case "id": return Locale(identifier: "id-ID")
+            case "en": return Locale(identifier: "en-US")
+            default: return Locale(identifier: code)
+            }
+        }
+        return .current
+    }
+}
+
 enum LyricsAudioAligner {
     struct DisplayToken: Equatable {
         let display: String
@@ -433,9 +467,24 @@ enum LyricsAudioAligner {
         return String(String.UnicodeScalarView(scalars))
     }
 
-    /// Splits a lyric line into tokens while preserving trailing whitespace so joining `.display` reproduces `text`.
+    private static func containsCJKWithoutSpaces(_ text: String) -> Bool {
+        let hasCJK = text.unicodeScalars.contains { scalar in
+            let v = scalar.value
+            return (0x3040...0x30FF).contains(v) || (0x4E00...0x9FFF).contains(v)
+        }
+        guard hasCJK else { return false }
+        let spaceCount = text.filter(\.isWhitespace).count
+        return spaceCount * 4 < text.count
+    }
+
+    /// Splits a lyric line into tokens while preserving exact text so joining `.display` reproduces `text`.
+    /// Uses `CFStringTokenizer` for CJK text without spaces so Japanese/Chinese words align accurately.
     static func tokenizeLine(_ text: String) -> [DisplayToken] {
         guard !text.isEmpty else { return [] }
+        if containsCJKWithoutSpaces(text) {
+            return tokenizeCJKLine(text)
+        }
+
         var tokens: [DisplayToken] = []
         var idx = text.startIndex
 
@@ -454,6 +503,54 @@ enum LyricsAudioAligner {
         }
 
         return tokens
+    }
+
+    private static func tokenizeCJKLine(_ text: String) -> [DisplayToken] {
+        let cfText = text as CFString
+        let range = CFRange(location: 0, length: CFStringGetLength(cfText))
+        let locale = Locale(identifier: "ja_JP") as CFLocale
+        guard let tokenizer = CFStringTokenizerCreate(
+            kCFAllocatorDefault,
+            cfText,
+            range,
+            kCFStringTokenizerUnitWord,
+            locale
+        ) else {
+            return [DisplayToken(display: text, normalized: normalizeToken(text))]
+        }
+
+        let nsText = text as NSString
+        var tokens: [DisplayToken] = []
+        var cursor = 0
+
+        while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
+            let tokenRange = CFStringTokenizerGetCurrentTokenRange(tokenizer)
+            guard tokenRange.location != kCFNotFound, tokenRange.length > 0 else { continue }
+            if tokenRange.location > cursor {
+                let gap = nsText.substring(with: NSRange(location: cursor, length: tokenRange.location - cursor))
+                if let last = tokens.popLast() {
+                    let merged = last.display + gap
+                    tokens.append(DisplayToken(display: merged, normalized: normalizeToken(merged)))
+                } else {
+                    tokens.append(DisplayToken(display: gap, normalized: normalizeToken(gap)))
+                }
+            }
+            let word = nsText.substring(with: NSRange(location: tokenRange.location, length: tokenRange.length))
+            tokens.append(DisplayToken(display: word, normalized: normalizeToken(word)))
+            cursor = tokenRange.location + tokenRange.length
+        }
+
+        if cursor < nsText.length {
+            let tail = nsText.substring(from: cursor)
+            if let last = tokens.popLast() {
+                let merged = last.display + tail
+                tokens.append(DisplayToken(display: merged, normalized: normalizeToken(merged)))
+            } else {
+                tokens.append(DisplayToken(display: tail, normalized: normalizeToken(tail)))
+            }
+        }
+
+        return tokens.isEmpty ? [DisplayToken(display: text, normalized: normalizeToken(text))] : tokens
     }
 
     /// Aligns fetched lyric lines against recognized audio words to produce precise word-level karaoke timings.

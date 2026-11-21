@@ -218,9 +218,19 @@ final class AudioSyncManager {
             state.applyAudioSyncedLines(cached.lines)
             state.audioSyncStatus = .cached(cached.engine)
             return
+        } else if !state.replaceLyricsWithTranscription, Self.hasPreexistingWordSync(rawLines) {
+            state.audioSyncStatus = .cached(engine)
+            return
         }
 
         startLiveSync(for: track, lines: rawLines, engine: engine)
+    }
+
+    static func hasPreexistingWordSync(_ lines: [LyricLine]) -> Bool {
+        let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard !nonEmpty.isEmpty else { return false }
+        let wordSyncedCount = nonEmpty.filter { $0.words.count > 1 }.count
+        return wordSyncedCount * 2 >= nonEmpty.count
     }
 
     func handlePlaybackStateChanged(isPlaying: Bool) {
@@ -277,7 +287,11 @@ final class AudioSyncManager {
     }
 
     private func beginAppleSpeechSession(track: TrackInfo, lines: [LyricLine]) {
-        guard let recognizer = SFSpeechRecognizer(), recognizer.isAvailable else {
+        let detectedLocale = LyricsLanguageDetector.detectSpeechLocale(for: lines)
+        let preferredRecognizer = SFSpeechRecognizer(locale: detectedLocale)
+        guard let recognizer = (preferredRecognizer?.isAvailable == true ? preferredRecognizer : SFSpeechRecognizer()),
+              recognizer.isAvailable
+        else {
             state.audioSyncStatus = .unavailable("Apple Speech recognizer is unavailable for this locale")
             return
         }
@@ -322,14 +336,23 @@ final class AudioSyncManager {
         capture.onAudioSamples = { [weak self] samples, sampleRate in
             Task { @MainActor in
                 guard let self, self.isLiveSyncActive, let req = self.speechRequest else { return }
-                guard let format = AVAudioFormat(
+                let format: AVAudioFormat
+                if let cached = self.speechAudioFormat, cached.sampleRate == sampleRate {
+                    format = cached
+                } else if let created = AVAudioFormat(
                     commonFormat: .pcmFormatFloat32,
                     sampleRate: sampleRate,
                     channels: 1,
                     interleaved: false
-                ),
-                    let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count))
-                else { return }
+                ) {
+                    self.speechAudioFormat = created
+                    format = created
+                } else {
+                    return
+                }
+                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
+                    return
+                }
 
                 buffer.frameLength = AVAudioFrameCount(samples.count)
                 if let channelData = buffer.floatChannelData?[0] {
@@ -464,11 +487,19 @@ final class AudioSyncManager {
             totalLines: baseLines.count
         )
 
-        if result.matchedLineCount >= baseLines.count {
+        let nonEmptyCount = max(
+            1,
+            baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        )
+        let confidentThreshold = state.replaceLyricsWithTranscription
+            ? nonEmptyCount
+            : min(nonEmptyCount, result.medianOffset != nil ? 2 : 3)
+
+        if result.matchedLineCount >= confidentThreshold {
             persistAlignment(result, engine: engine)
             stop()
             state.audioSyncStatus = .cached(engine)
-        } else if result.matchedLineCount >= 2 {
+        } else if result.matchedLineCount >= 1 {
             persistAlignment(result, engine: engine)
         }
     }
