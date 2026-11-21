@@ -1,0 +1,137 @@
+name: Issue Severity Labeler
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Optional issue number to classify (leave blank to backfill all open issues missing a severity label)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  label-severity:
+    name: Label Issue Severity
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Classify and apply severity label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {
+              SEVERITY_LABELS,
+              resolveIssueSeverity,
+            } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/classify-issue-severity.mjs`);
+
+            const { owner, repo } = context.repo;
+
+            async function ensureLabelExists(level) {
+              const meta = SEVERITY_LABELS[level];
+              if (!meta) return;
+              try {
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: meta.label,
+                  color: meta.color,
+                  description: meta.description,
+                });
+                core.info(`Created missing label "${meta.label}"`);
+              } catch (err) {
+                // 422 means the label already exists.
+                if (err.status !== 422) {
+                  throw err;
+                }
+              }
+            }
+
+            async function processIssue(issue) {
+              if (issue.pull_request) {
+                return;
+              }
+              const labels = (issue.labels || []).map((l) =>
+                typeof l === 'string' ? l : l.name,
+              );
+              const result = resolveIssueSeverity({
+                title: issue.title || '',
+                body: issue.body || '',
+                labels,
+              });
+
+              if (!result.changed) {
+                core.info(
+                  `#${issue.number}: no change (source=${result.source})`,
+                );
+                return;
+              }
+
+              if (result.shouldAdd && result.level) {
+                await ensureLabelExists(result.level);
+                await github.rest.issues.addLabels({
+                  owner,
+                  repo,
+                  issue_number: issue.number,
+                  labels: [result.targetLabel],
+                });
+                core.info(
+                  `#${issue.number}: added "${result.targetLabel}" (source=${result.source})`,
+                );
+              }
+
+              for (const staleLabel of result.labelsToRemove) {
+                try {
+                  await github.rest.issues.removeLabel({
+                    owner,
+                    repo,
+                    issue_number: issue.number,
+                    name: staleLabel,
+                  });
+                  core.info(`#${issue.number}: removed stale "${staleLabel}"`);
+                } catch (err) {
+                  if (err.status !== 404) {
+                    throw err;
+                  }
+                }
+              }
+            }
+
+            if (context.eventName === 'workflow_dispatch') {
+              const rawNumber = context.payload.inputs?.issue_number?.trim();
+              if (rawNumber) {
+                const issueNumber = Number.parseInt(rawNumber, 10);
+                if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                  core.setFailed(`Invalid issue_number input: "${rawNumber}"`);
+                  return;
+                }
+                const { data: issue } = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+                await processIssue(issue);
+              } else {
+                const issues = await github.paginate(
+                  github.rest.issues.listForRepo,
+                  {
+                    owner,
+                    repo,
+                    state: 'open',
+                    per_page: 100,
+                  },
+                );
+                for (const issue of issues) {
+                  await processIssue(issue);
+                }
+              }
+            } else if (context.payload.issue) {
+              await processIssue(context.payload.issue);
+            }
