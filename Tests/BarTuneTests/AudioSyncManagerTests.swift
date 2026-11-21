@@ -665,6 +665,35 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(manager.recognizedWords.last?.startTime ?? -1, 91.0, accuracy: 0.01)
     }
 
+    // MARK: - #65: Terminal recognition error ends the session
+
+    @MainActor
+    func testTerminalSpeechErrorStopsCapture() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+        let stopsBeforeError = fakeCapture.stopCount
+
+        let error = NSError(domain: "kAFAssistantErrorDomain", code: 1110, userInfo: [
+            NSLocalizedDescriptionKey: "No speech detected",
+        ])
+        recognizer.resultHandlers.first?(nil, error)
+        let ended = await waitUntil { !manager.isLiveSyncActive }
+
+        XCTAssertTrue(ended)
+        XCTAssertEqual(fakeCapture.stopCount, stopsBeforeError + 1)
+        XCTAssertNil(fakeCapture.onAudioSamples)
+        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
+        XCTAssertEqual(state.audioSyncStatus, .unavailable("Apple Speech recognition stopped: No speech detected"))
+    }
+
     // MARK: - Helpers
 
     @MainActor

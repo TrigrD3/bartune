@@ -631,8 +631,10 @@ final class AudioSyncManager {
                     self.recognizedWords = words
                     self.applyAlignment(engine: .appleSpeech)
                 }
-                if error != nil, self.isLiveSyncActive {
+                if let error, self.isLiveSyncActive {
                     self.persistCurrentAlignmentIfReady()
+                    self.stop()
+                    self.state.audioSyncStatus = .unavailable("Apple Speech recognition stopped: \(error.localizedDescription)")
                 }
             }
         }
