@@ -314,4 +314,78 @@ final class AudioLyricsAlignerTests: XCTestCase {
         let reloaded = LyricsState(userDefaults: ud)
         XCTAssertFalse(reloaded.showSyncBadge)
     }
+
+    func testDetectsSpeechLocaleFromLyricsLanguage() {
+        let jaLines = [LyricLine(id: 0, timestamp: 1.0, text: "闇夜を駆け抜けて どこへ向かう")]
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: jaLines).identifier, "ja-JP")
+
+        let koLines = [LyricLine(id: 0, timestamp: 1.0, text: "사랑해요 오늘 밤 별이 빛나")]
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: koLines).identifier, "ko-KR")
+
+        let zhLines = [LyricLine(id: 0, timestamp: 1.0, text: "天青色等烟雨而我在等你")]
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: zhLines).identifier, "zh-CN")
+
+        let enLines = [LyricLine(id: 0, timestamp: 1.0, text: "We are the champions my friend")]
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: enLines).identifier, "en-US")
+    }
+
+    func testTokenizesAndAlignsJapaneseLyricsWithoutSpaces() {
+        let text = "闇夜を駆け抜けて"
+        let tokens = LyricsAudioAligner.tokenizeLine(text)
+        XCTAssertGreaterThan(tokens.count, 1)
+        XCTAssertEqual(tokens.map(\.display).joined(), text)
+
+        let lines = [LyricLine(id: 0, timestamp: 5.0, text: text)]
+        let recognized = tokens.enumerated().map { idx, tok in
+            RecognizedAudioWord(
+                text: tok.display,
+                startTime: 5.2 + Double(idx) * 0.4,
+                duration: 0.35,
+                confidence: 0.9
+            )
+        }
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines[0].words.map(\.text).joined(), text)
+    }
+
+    @MainActor
+    func testSkipsLiveSyncWhenTrackAlreadyHasWordLevelTimestamps() throws {
+        let suiteName = "bartune.test.wordsyncskip.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let state = LyricsState(userDefaults: ud)
+        state.audioSyncEngine = .appleSpeech
+        state.replaceLyricsWithTranscription = false
+
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let track = TrackInfo(
+            id: "spotify:track:yrc-already-synced",
+            title: "YRC Track",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            artworkURL: nil
+        )
+        let yrcLines = [
+            LyricLine(
+                id: 0,
+                timestamp: 1.0,
+                duration: 2.0,
+                text: "Hello world",
+                words: [
+                    WordTimestamp(timestamp: 1.0, duration: 0.9, text: "Hello "),
+                    WordTimestamp(timestamp: 1.9, duration: 1.1, text: "world"),
+                ]
+            ),
+        ]
+
+        state.setTrack(track, lyrics: yrcLines)
+        let manager = AudioSyncManager(state: state, cache: cache)
+        manager.handleTrackLoaded(track: track, rawLines: yrcLines)
+
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+    }
 }

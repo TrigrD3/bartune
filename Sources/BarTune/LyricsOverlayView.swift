@@ -14,16 +14,25 @@ struct EqualizerIconView: View {
             let w = CGFloat(width)
             switch style {
             case .bars:
-                let barCount = max(3, min(8, Int((w / 4.2).rounded())))
-                HStack(alignment: .bottom, spacing: 2) {
-                    ForEach(0..<barCount, id: \.self) { idx in
+                Canvas { context, size in
+                    let barCount = max(3, min(8, Int((Double(size.width) / 4.2).rounded())))
+                    let barW: CGFloat = 2.2
+                    let spacing: CGFloat = 2.0
+                    let totalW = CGFloat(barCount) * barW + CGFloat(max(0, barCount - 1)) * spacing
+                    let startX = max(0, (size.width - totalW) / 2)
+                    for idx in 0..<barCount {
                         let wave = isPlaying ? (0.28 + 0.72 * abs(sin(t * 4.8 + Double(idx) * 1.15))) : 0.25
-                        Capsule()
-                            .fill(tint)
-                            .frame(width: 2.2, height: max(3, 11 * wave))
+                        let h = max(3.0, 11.0 * wave)
+                        let rect = CGRect(
+                            x: startX + CGFloat(idx) * (barW + spacing),
+                            y: size.height - h,
+                            width: barW,
+                            height: h
+                        )
+                        context.fill(Path(roundedRect: rect, cornerRadius: barW / 2), with: .color(tint))
                     }
                 }
-                .frame(width: w, height: 12, alignment: .bottom)
+                .frame(width: w, height: 12)
 
             case .wave:
                 Canvas { context, size in
@@ -47,14 +56,19 @@ struct EqualizerIconView: View {
                 .frame(width: w, height: 12)
 
             case .dots:
-                let dotCount = max(3, min(7, Int((w / 5.5).rounded())))
-                HStack(spacing: 2.5) {
-                    ForEach(0..<dotCount, id: \.self) { idx in
+                Canvas { context, size in
+                    let dotCount = max(3, min(7, Int((Double(size.width) / 5.5).rounded())))
+                    let baseSize: CGFloat = 3.2
+                    let spacing: CGFloat = 2.5
+                    let totalW = CGFloat(dotCount) * baseSize + CGFloat(max(0, dotCount - 1)) * spacing
+                    let startX = max(0, (size.width - totalW) / 2)
+                    let midY = size.height / 2
+                    for idx in 0..<dotCount {
                         let scale = isPlaying ? (0.52 + 0.48 * abs(sin(t * 4.4 + Double(idx) * 1.05))) : 0.55
-                        Circle()
-                            .fill(tint)
-                            .frame(width: 3.2, height: 3.2)
-                            .scaleEffect(scale)
+                        let d = baseSize * scale
+                        let cx = startX + CGFloat(idx) * (baseSize + spacing) + baseSize / 2
+                        let rect = CGRect(x: cx - d / 2, y: midY - d / 2, width: d, height: d)
+                        context.fill(Path(ellipseIn: rect), with: .color(tint))
                     }
                 }
                 .frame(width: w, height: 12)
@@ -85,7 +99,6 @@ struct EqualizerIconView: View {
                     .frame(width: w, height: 12)
             }
         }
-        .drawingGroup()
     }
 }
 
@@ -102,11 +115,12 @@ struct KaraokeLineView: View {
     @State private var textWidth: CGFloat = 0
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
-            let progress = karaokeEnabled ? state.liveProgress(at: timeline.date) : 1.0
-            GeometryReader { container in
-                let availableWidth = container.size.width
-                let overflow = max(0, textWidth - availableWidth)
+        GeometryReader { container in
+            let availableWidth = container.size.width
+            let overflow = max(0, textWidth - availableWidth)
+
+            TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
+                let progress = karaokeEnabled ? state.liveProgress(at: timeline.date) : 1.0
                 let scrollOffset: CGFloat = overflow > 0
                     ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
                     : 0
@@ -150,8 +164,8 @@ struct KaraokeLineView: View {
                 .offset(x: scrollOffset)
                 .frame(maxHeight: .infinity, alignment: .center)
             }
-            .clipped()
         }
+        .clipped()
     }
 
     private var widthReader: some View {
@@ -306,9 +320,8 @@ struct LyricsOverlayView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .compositingGroup()
-        .mask(
-            CursorCutoutMask(
+        .modifier(
+            SpotlightMaskModifier(
                 cursorX: state.hoverMode == .spotlight ? state.cursorLocalX : nil,
                 spotlightWidth: state.spotlightWidth
             )
@@ -362,6 +375,21 @@ private struct SyncStatusBadgeView: View {
                 Capsule(style: .continuous)
                     .strokeBorder(foreground.opacity(badge.isSynced ? 0.28 : (0.18 + 0.22 * pulse)), lineWidth: 0.5)
             )
+        }
+    }
+}
+
+private struct SpotlightMaskModifier: ViewModifier {
+    let cursorX: CGFloat?
+    let spotlightWidth: Double
+
+    func body(content: Content) -> some View {
+        if let cursorX {
+            content
+                .compositingGroup()
+                .mask(CursorCutoutMask(cursorX: cursorX, spotlightWidth: spotlightWidth))
+        } else {
+            content
         }
     }
 }
