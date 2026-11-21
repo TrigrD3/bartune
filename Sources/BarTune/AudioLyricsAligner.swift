@@ -120,10 +120,14 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     }
 
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
-    /// Rejects single-line partial matches on multi-line tracks (including transcript-only
-    /// caches that omit untranscribed lines), extreme outlier offsets (> 5s), and
+    /// Rejects incomplete transcript-only caches (fewer non-empty lines than the source lyrics),
+    /// single-line partial matches on multi-line tracks, extreme outlier offsets (> 5s), and
     /// duplicate/inverted line timestamps from cross-line bleed.
     var isReliable: Bool {
+        isReliable(expectedSourceLineCount: nil)
+    }
+
+    func isReliable(expectedSourceLineCount: Int?) -> Bool {
         let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !nonEmpty.isEmpty else { return false }
         if let offset = medianOffset, abs(offset) > 5.0 {
@@ -132,7 +136,15 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         for idx in 1..<nonEmpty.count where nonEmpty[idx].timestamp < nonEmpty[idx - 1].timestamp + 0.15 {
             return false
         }
-        let referenceCount = max(nonEmpty.count, sourceLineCount ?? 0)
+        // Playback lookup binary-searches every line, so blank markers must be in order too.
+        for idx in 1..<lines.count where lines[idx].timestamp < lines[idx - 1].timestamp {
+            return false
+        }
+        let resolvedSourceCount = sourceLineCount ?? expectedSourceLineCount
+        if let sourceCount = resolvedSourceCount, nonEmpty.count < sourceCount {
+            return false
+        }
+        let referenceCount = max(nonEmpty.count, resolvedSourceCount ?? 0)
         let minRequired = min(2, referenceCount)
         return alignedLineCount >= minRequired
     }
@@ -682,6 +694,7 @@ enum LyricsAudioAligner {
         var lastConsumedWordEnd: Double = 0.0
         var previousLineEnd: Double = 0.0
         var previousEmittedTimestamp: Double?
+        var previousBlankTimestamp: Double?
 
         // Pass 2: align each line inside a tight, monotonic window so adjacent lines never steal words or overlap.
         for (lineIdx, line) in lines.enumerated() {
@@ -692,9 +705,11 @@ enum LyricsAudioAligner {
             let shiftedStart = max(0, line.timestamp + shift)
             let shiftedEnd = shiftedStart + rawLineDur
             let nextShiftedStart = (lineIdx + 1 < lines.count) ? max(0, nextTs + shift) : (shiftedEnd + localPadding)
+            // A blank marker only needs to stay ordered, so it adds no lyric spacing.
             let minAllowedStart = max(
                 previousEmittedTimestamp.map { $0 + 0.25 } ?? 0,
-                previousLineEnd
+                previousLineEnd,
+                previousBlankTimestamp.map { $0 + 0.01 } ?? 0
             )
 
             let windowStart = max(0, max(lastConsumedWordEnd, shiftedStart - localPadding))
@@ -787,7 +802,7 @@ enum LyricsAudioAligner {
             }
 
             let baseStart = (medianOffset.map { abs($0) >= 0.15 ? max(0, line.timestamp + $0) : line.timestamp }) ?? line.timestamp
-            let fallbackStart: Double = if isNonEmpty, previousEmittedTimestamp != nil, baseStart < minAllowedStart {
+            let fallbackStart: Double = if previousEmittedTimestamp != nil || previousBlankTimestamp != nil, baseStart < minAllowedStart {
                 minAllowedStart
             } else {
                 baseStart
@@ -810,6 +825,8 @@ enum LyricsAudioAligner {
                 } else {
                     previousLineEnd = max(previousLineEnd, fallbackStart + 0.25)
                 }
+            } else {
+                previousBlankTimestamp = fallbackStart
             }
             alignedLines.append(
                 LyricLine(
@@ -972,18 +989,18 @@ enum LyricsAudioAligner {
             for i in 0..<firstAnchor {
                 let offsetFromAnchor = Double(firstAnchor - i) * step
                 starts[i] = max(0, anchorStart - offsetFromAnchor)
-                ends[i] = max(starts[i] + 0.05, anchorStart - Double(firstAnchor - i - 1) * step)
+                ends[i] = max(starts[i], anchorStart - Double(firstAnchor - i - 1) * step)
             }
         }
 
-        // Fill gaps between consecutive anchors.
+        // Fill gaps between consecutive anchors without pushing words past the following anchor.
         for pairIdx in 0..<max(0, anchorIndices.count - 1) {
             let left = anchorIndices[pairIdx]
             let right = anchorIndices[pairIdx + 1]
             let gapCount = right - left - 1
             guard gapCount > 0 else { continue }
-            let gapStart = ends[left]
-            let gapEnd = max(gapStart + 0.05 * Double(gapCount), starts[right])
+            let gapEnd = starts[right]
+            let gapStart = min(ends[left], gapEnd)
             let step = (gapEnd - gapStart) / Double(gapCount)
             for offset in 1...gapCount {
                 let idx = left + offset
@@ -1006,7 +1023,14 @@ enum LyricsAudioAligner {
 
         return tokens.enumerated().map { idx, token in
             let s = starts[idx]
-            let dur = max(0.05, ends[idx] - s)
+            let rawDur = max(0, ends[idx] - s)
+            let dur: Double
+            if idx + 1 < tokens.count {
+                let available = max(0, starts[idx + 1] - s)
+                dur = min(max(0.05, rawDur), available)
+            } else {
+                dur = max(0.05, rawDur)
+            }
             return WordTimestamp(timestamp: s, duration: dur, text: token.display)
         }
     }
