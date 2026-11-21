@@ -181,8 +181,8 @@ enum YRCParser {
     private static let lineHeaderRegex = try! NSRegularExpression(
         pattern: #"^\[(\d+),(\d+)\](.*)$"#
     )
-    private static let wordRegex = try! NSRegularExpression(
-        pattern: #"\((\d+),(\d+),\d+\)([^(]*)"#
+    private static let wordMarkerRegex = try! NSRegularExpression(
+        pattern: #"\((\d+),(\d+),\d+\)"#
     )
 
     static func parse(_ yrc: String) -> [LyricLine] {
@@ -202,16 +202,19 @@ enum YRCParser {
             let body = nsLine.substring(with: header.range(at: 3))
             let nsBody = body as NSString
             let bodyRange = NSRange(location: 0, length: nsBody.length)
-            let wordMatches = wordRegex.matches(in: body, range: bodyRange)
+            let wordMatches = wordMarkerRegex.matches(in: body, range: bodyRange)
             guard !wordMatches.isEmpty else { continue }
 
             var words: [WordTimestamp] = []
             var joined = ""
 
-            for wm in wordMatches {
+            // Slice text between markers so literal parentheses stay part of the word.
+            for (i, wm) in wordMatches.enumerated() {
                 guard let wStartMs = Double(nsBody.substring(with: wm.range(at: 1))),
                       let wDurMs = Double(nsBody.substring(with: wm.range(at: 2))) else { continue }
-                let segment = nsBody.substring(with: wm.range(at: 3))
+                let textStart = wm.range.location + wm.range.length
+                let textEnd = (i + 1 < wordMatches.count) ? wordMatches[i + 1].range.location : nsBody.length
+                let segment = nsBody.substring(with: NSRange(location: textStart, length: textEnd - textStart))
                 if !segment.isEmpty {
                     words.append(WordTimestamp(
                         timestamp: wStartMs / 1000.0,
