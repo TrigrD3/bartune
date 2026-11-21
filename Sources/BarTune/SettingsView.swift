@@ -1,6 +1,9 @@
 import AppKit
+import ApplicationServices
 import Combine
+import CoreGraphics
 import Darwin
+import Speech
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -48,6 +51,7 @@ struct SettingsView: View {
     @State private var isDownloadingModel: Bool = false
     @State private var modelDownloadError: String?
     @State private var metricsTracker = ResourceMetricsTracker()
+    @State private var permissions = AppPermissionsSnapshot.empty
     private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -122,6 +126,35 @@ struct SettingsView: View {
                 Toggle("Launch BarTune at Login", isOn: $state.launchAtLogin)
             }
 
+            Section("Permissions") {
+                permissionRow(
+                    title: "Screen & System Audio",
+                    status: permissions.screenAudio,
+                    settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                )
+                permissionRow(
+                    title: "Speech Recognition",
+                    status: permissions.speechRecognition,
+                    settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
+                )
+                permissionRow(
+                    title: "Spotify Automation",
+                    status: permissions.spotifyAutomation,
+                    settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"
+                )
+
+                HStack {
+                    Text("macOS Privacy & Security permissions used for playback tracking and audio sync.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Refresh") {
+                        refreshPermissions()
+                    }
+                    .controlSize(.small)
+                }
+            }
+
             Section("App Performance") {
                 HStack {
                     Text("CPU Usage")
@@ -168,6 +201,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .onAppear {
             refreshResourceMetrics()
+            refreshPermissions()
         }
         .onReceive(resourceTimer) { _ in
             if selectedTab == .general {
@@ -680,6 +714,118 @@ struct SettingsView: View {
     private func refreshResourceMetrics() {
         let metrics = AppResourceMetrics.sample()
         metricsTracker.record(cpuPercent: metrics.cpuPercent, memoryBytes: metrics.memoryBytes)
+    }
+
+    private func refreshPermissions() {
+        permissions = AppPermissionsChecker.current()
+    }
+
+    private func permissionRow(title: String, status: PermissionAuthorizationState, settingsURL: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title)
+            Spacer()
+            Label(status.title, systemImage: status.symbolName)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(status.isGranted ? Color.green : Color.orange)
+            if !status.isGranted {
+                Button("Open") {
+                    if let url = URL(string: settingsURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+}
+
+enum PermissionAuthorizationState: Equatable, Sendable {
+    case granted
+    case notRequested
+    case denied
+    case targetNotRunning
+
+    var isGranted: Bool { self == .granted }
+
+    var title: String {
+        switch self {
+        case .granted: return "Granted"
+        case .notRequested: return "Not Granted"
+        case .denied: return "Denied"
+        case .targetNotRunning: return "App Idle"
+        }
+    }
+
+    var symbolName: String {
+        switch self {
+        case .granted: return "checkmark.circle.fill"
+        case .notRequested, .targetNotRunning: return "exclamationmark.circle"
+        case .denied: return "xmark.circle.fill"
+        }
+    }
+
+    static func fromScreenCapture(_ granted: Bool) -> PermissionAuthorizationState {
+        granted ? .granted : .notRequested
+    }
+
+    static func fromSpeechStatus(_ status: SFSpeechRecognizerAuthorizationStatus) -> PermissionAuthorizationState {
+        switch status {
+        case .authorized: return .granted
+        case .notDetermined: return .notRequested
+        case .denied, .restricted: return .denied
+        @unknown default: return .notRequested
+        }
+    }
+
+    static func fromAutomationStatus(_ status: OSStatus) -> PermissionAuthorizationState {
+        switch status {
+        case noErr:
+            return .granted
+        case OSStatus(errAEEventNotPermitted):
+            return .denied
+        case OSStatus(procNotFound):
+            return .targetNotRunning
+        default:
+            return .notRequested
+        }
+    }
+}
+
+struct AppPermissionsSnapshot: Equatable, Sendable {
+    let screenAudio: PermissionAuthorizationState
+    let speechRecognition: PermissionAuthorizationState
+    let spotifyAutomation: PermissionAuthorizationState
+
+    static let empty = AppPermissionsSnapshot(
+        screenAudio: .notRequested,
+        speechRecognition: .notRequested,
+        spotifyAutomation: .targetNotRunning
+    )
+}
+
+private enum AppPermissionsChecker {
+    static func current() -> AppPermissionsSnapshot {
+        let screenAudio = PermissionAuthorizationState.fromScreenCapture(CGPreflightScreenCaptureAccess())
+        let speech = PermissionAuthorizationState.fromSpeechStatus(SFSpeechRecognizer.authorizationStatus())
+        let automation = checkAutomation(bundleIdentifier: "com.spotify.client")
+        return AppPermissionsSnapshot(
+            screenAudio: screenAudio,
+            speechRecognition: speech,
+            spotifyAutomation: automation
+        )
+    }
+
+    private static func checkAutomation(bundleIdentifier: String) -> PermissionAuthorizationState {
+        guard let target = NSAppleEventDescriptor(bundleIdentifier: bundleIdentifier).aeDesc else {
+            return .notRequested
+        }
+        let status = AEDeterminePermissionToAutomateTarget(
+            target,
+            AEEventClass(typeWildCard),
+            AEEventID(typeWildCard),
+            false
+        )
+        return PermissionAuthorizationState.fromAutomationStatus(status)
     }
 }
 
