@@ -111,6 +111,7 @@ struct KaraokeLineView: View {
     let karaokeEnabled: Bool
     let isPlaying: Bool
     let lowCPUMode: Bool
+    var glowEnabled: Bool = false
 
     @State private var textWidth: CGFloat = 0
 
@@ -153,12 +154,20 @@ struct KaraokeLineView: View {
                                     endPoint: .trailing
                                 )
                             }
+                            .shadow(
+                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                                radius: glowEnabled ? 4 : 0
+                            )
                     } else {
                         Text(text)
                             .font(font)
                             .foregroundStyle(sungColor)
                             .fixedSize(horizontal: true, vertical: false)
                             .background(widthReader)
+                            .shadow(
+                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                                radius: glowEnabled ? 4 : 0
+                            )
                     }
                 }
                 .offset(x: scrollOffset)
@@ -235,17 +244,19 @@ struct LyricsOverlayView: View {
     }
 
     private var activeSungColor: Color {
-        switch state.themeMode {
+        let themeBase: Color = switch state.themeMode {
         case .system:
-            return Color.primary
+            Color.primary
         case .albumAccent:
             if let colors = state.albumColors {
-                return Color(nsColor: colors.accentNSColor)
+                Color(nsColor: colors.accentNSColor)
+            } else {
+                Color.primary
             }
-            return Color.primary
         case .albumTint:
-            return Color.white
+            Color.white
         }
+        return state.lyricsColorPreset.resolvedColor(fallback: themeBase, customHex: state.customLyricsColorHex)
     }
 
     private var activeUnsungColor: Color {
@@ -310,7 +321,8 @@ struct LyricsOverlayView: View {
                     sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled,
                     isPlaying: state.isEnabled && state.isPlaying,
-                    lowCPUMode: state.lowCPUMode
+                    lowCPUMode: state.lowCPUMode,
+                    glowEnabled: state.karaokeGlowEnabled
                 )
                 .id(
                     "\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)-\(state.translateLyrics)-\(state.translationLanguage.rawValue)"
@@ -321,7 +333,7 @@ struct LyricsOverlayView: View {
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
 
-                if !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
+                if state.showTrackTitle, !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
                     MarqueeTrackLabelView(
                         text: state.trackSummary,
                         color: activeUnsungColor,
@@ -364,7 +376,7 @@ struct LyricsOverlayView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: state.barCornerRadius, style: .continuous))
         .modifier(
             SpotlightMaskModifier(
                 cursorX: state.hoverMode == .spotlight ? state.cursorLocalX : nil,

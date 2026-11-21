@@ -214,6 +214,14 @@ struct SettingsView: View {
 
     private var appearanceTab: some View {
         Form {
+            Section("Preview") {
+                VisualizerPreviewStrip(
+                    state: state,
+                    isAnimating: selectedTab == .appearance && state.animateVisualizer
+                )
+                .padding(.vertical, 4)
+            }
+
             Section("Color Theme") {
                 Picker("Theme", selection: $state.themeMode) {
                     ForEach(ThemeMode.allCases) { mode in
@@ -240,6 +248,23 @@ struct SettingsView: View {
                     }
                 }
 
+                Picker("Sung Text Color", selection: $state.lyricsColorPreset) {
+                    ForEach(LyricsColorPreset.allCases) { preset in
+                        Text(preset.title).tag(preset)
+                    }
+                }
+
+                if state.lyricsColorPreset == .custom {
+                    ColorPicker(
+                        "Custom Highlight Color",
+                        selection: Binding(
+                            get: { HexColorCoder.color(from: state.customLyricsColorHex) ?? .yellow },
+                            set: { state.customLyricsColorHex = HexColorCoder.hex(from: $0) }
+                        ),
+                        supportsOpacity: false
+                    )
+                }
+
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Background Opacity")
@@ -249,6 +274,17 @@ struct SettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $state.backgroundOpacity, in: 0.70...1.0, step: 0.02)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Bar Corner Radius")
+                        Spacer()
+                        Text("\(Int(state.barCornerRadius)) pt")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $state.barCornerRadius, in: 0...12, step: 1)
                 }
             }
 
@@ -278,6 +314,8 @@ struct SettingsView: View {
                 }
 
                 Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
+                Toggle("Sung Text Glow", isOn: $state.karaokeGlowEnabled)
+                Toggle("Show Track Title in Bar", isOn: $state.showTrackTitle)
             }
         }
         .formStyle(.grouped)
@@ -1072,17 +1110,19 @@ private struct VisualizerPreviewStrip: View {
     }
 
     private var textColor: Color {
-        switch state.themeMode {
+        let base: Color = switch state.themeMode {
         case .system:
-            return Color.primary
+            Color.primary
         case .albumAccent:
             if let colors = state.albumColors {
-                return Color(nsColor: colors.accentNSColor)
+                Color(nsColor: colors.accentNSColor)
+            } else {
+                Color.primary
             }
-            return Color.primary
         case .albumTint:
-            return Color.white
+            Color.white
         }
+        return state.lyricsColorPreset.resolvedColor(fallback: base, customHex: state.customLyricsColorHex)
     }
 
     private var previewText: String {
@@ -1108,6 +1148,10 @@ private struct VisualizerPreviewStrip: View {
                     .font(state.fontOption.font(size: state.fontSize, weight: state.fontWeight))
                     .foregroundStyle(textColor)
                     .lineLimit(1)
+                    .shadow(
+                        color: state.karaokeGlowEnabled ? textColor.opacity(0.55) : .clear,
+                        radius: state.karaokeGlowEnabled ? 4 : 0
+                    )
 
                 Spacer(minLength: 0)
             }
@@ -1115,9 +1159,9 @@ private struct VisualizerPreviewStrip: View {
         }
         .frame(maxWidth: .infinity)
         .frame(height: 28)
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: state.barCornerRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
+            RoundedRectangle(cornerRadius: state.barCornerRadius, style: .continuous)
                 .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
         )
         .animation(.easeInOut(duration: 0.2), value: state.showEqualizer)
