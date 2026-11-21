@@ -121,6 +121,7 @@ swiftformat Sources Tests
 
 - Test each behaviour at the cheapest layer that can falsify it: pure parser/model/romanizer unit tests in `Tests/BarTuneTests/` first before manual UI verification.
 - A new test must fail without the production change it verifies; use non-default inputs when verifying settings.
+- **Destructive UI confirmation:** Any destructive or irreversible UI action (clearing caches, deleting saved files/entries, resetting multi-field configurations) must present a confirmation dialog (`.alert` / `.confirmationDialog`) explaining what will be removed before mutating state or disk.
 
 ## Critical Notes
 
