@@ -163,5 +163,9 @@ final class LyricsCacheTests: XCTestCase {
 
         cache.removeByCacheKey(legacyKey)
         XCTAssertEqual(cache.listEntries(audioSyncCache: syncCache).count, 1)
+
+        let modernKey = LyricsDiskCache.cacheKey(for: "spotify:track:modern")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: cache.fileURL(forCacheKey: modernKey).path))
+        XCTAssertEqual(cache.loadByCacheKey(modernKey)?.title, "Yoru ni Kakeru")
     }
 }

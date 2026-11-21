@@ -46,6 +46,7 @@ struct SettingsView: View {
     @State private var syncedBytes: Int64 = 0
     @State private var cachedSongs: [CachedSongSummary] = []
     @State private var cacheSearchQuery: String = ""
+    @State private var inspectingSong: CachedSongSummary?
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
     @State private var whisperCLIFound: Bool = false
     @State private var isDownloadingModel: Bool = false
@@ -585,6 +586,8 @@ struct SettingsView: View {
                                                     .truncationMode(.tail)
                                             }
                                             Text("\(song.lineCount) lines")
+                                            Text("·")
+                                            Text(ByteCountFormatter.string(fromByteCount: song.sizeBytes, countStyle: .file))
                                         }
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -600,6 +603,24 @@ struct SettingsView: View {
                                             .padding(.vertical, 2)
                                             .background(Capsule().fill(Color.green.opacity(0.14)))
                                     }
+
+                                    Button {
+                                        inspectingSong = song
+                                    } label: {
+                                        Image(systemName: "doc.text")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("Inspect cached file & lyrics")
+
+                                    Button {
+                                        revealCachedSongInFinder(song)
+                                    } label: {
+                                        Image(systemName: "folder")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("Reveal file in Finder")
 
                                     Button(role: .destructive) {
                                         deleteCachedSong(song)
@@ -622,6 +643,9 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .onAppear {
             refreshCacheStats()
+        }
+        .sheet(item: $inspectingSong) { song in
+            CachedSongFileSheet(song: song)
         }
     }
 
@@ -655,6 +679,21 @@ struct SettingsView: View {
         guard !query.isEmpty else { return cachedSongs }
         return cachedSongs.filter {
             $0.title.lowercased().contains(query) || $0.artist.lowercased().contains(query)
+        }
+    }
+
+    private func revealCachedSongInFinder(_ song: CachedSongSummary) {
+        let lyricsURL = LyricsDiskCache.default.fileURL(forCacheKey: song.cacheKey)
+        let syncURL = AudioSyncedLyricsCache.default.fileURL(forCacheKey: song.cacheKey)
+        var urls: [URL] = []
+        if FileManager.default.fileExists(atPath: lyricsURL.path) {
+            urls.append(lyricsURL)
+        }
+        if FileManager.default.fileExists(atPath: syncURL.path) {
+            urls.append(syncURL)
+        }
+        if !urls.isEmpty {
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
         }
     }
 
@@ -826,6 +865,99 @@ private enum AppPermissionsChecker {
             false
         )
         return PermissionAuthorizationState.fromAutomationStatus(status)
+    }
+}
+
+private struct CachedSongFileSheet: View {
+    let song: CachedSongSummary
+    @Environment(\.dismiss) private var dismiss
+
+    private var fileURL: URL {
+        LyricsDiskCache.default.fileURL(forCacheKey: song.cacheKey)
+    }
+
+    private var syncFileURL: URL {
+        AudioSyncedLyricsCache.default.fileURL(forCacheKey: song.cacheKey)
+    }
+
+    private var lines: [LyricLine] {
+        if let syncedData = try? Data(contentsOf: syncFileURL),
+           let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: syncedData),
+           !record.lines.isEmpty {
+            return record.lines
+        }
+        return LyricsDiskCache.default.loadByCacheKey(song.cacheKey)?.lines ?? []
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(song.title)
+                        .font(.headline)
+                        .lineLimit(1)
+                    if !song.artist.isEmpty {
+                        Text(song.artist)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                }
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Lyrics file: \(fileURL.lastPathComponent)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                if let engine = song.syncEngine {
+                    Text("Audio-synced via \(engine.title): \(syncFileURL.lastPathComponent)")
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.green)
+                        .textSelection(.enabled)
+                }
+            }
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(lines) { line in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text(formatTimestamp(line.timestamp))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 54, alignment: .leading)
+                            Text(line.text.isEmpty ? "♪" : line.text)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                            Spacer(minLength: 0)
+                            if !line.words.isEmpty {
+                                Text("\(line.words.count)w")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 520, height: 380)
+    }
+
+    private func formatTimestamp(_ seconds: Double) -> String {
+        let clamped = max(0, seconds)
+        let mins = Int(clamped) / 60
+        let secs = clamped - Double(mins * 60)
+        return String(format: "%02d:%05.2f", mins, secs)
     }
 }
 

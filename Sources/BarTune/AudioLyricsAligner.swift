@@ -117,8 +117,12 @@ struct AudioSyncedLyricsCache: Sendable {
         try? FileManager.default.removeItem(at: fileURL(for: trackId))
     }
 
+    func fileURL(forCacheKey cacheKey: String) -> URL {
+        directory.appendingPathComponent("\(cacheKey).json")
+    }
+
     func removeByCacheKey(_ cacheKey: String) {
-        try? FileManager.default.removeItem(at: directory.appendingPathComponent("\(cacheKey).json"))
+        try? FileManager.default.removeItem(at: fileURL(forCacheKey: cacheKey))
     }
 
     func syncEngine(forCacheKey cacheKey: String) -> AudioSyncEngine? {

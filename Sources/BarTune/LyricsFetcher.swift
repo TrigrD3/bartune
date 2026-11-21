@@ -59,7 +59,7 @@ struct LyricsDiskCache: Sendable {
         directory.appendingPathComponent("\(Self.cacheKey(for: trackId)).json")
     }
 
-    private func fileURL(forCacheKey cacheKey: String) -> URL {
+    func fileURL(forCacheKey cacheKey: String) -> URL {
         directory.appendingPathComponent("\(cacheKey).json")
     }
 
