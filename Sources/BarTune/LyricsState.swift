@@ -298,6 +298,7 @@ final class LyricsState: ObservableObject {
     @Published var activeLineNextTimestamp: Double = 0.0
     var playbackAnchorPosition: Double = 0.0
     var playbackAnchorDate: Date = .now
+    var playbackRate: Double = 1.0
     @Published var cursorLocalX: CGFloat? = nil
     @Published var trackSummary: String = "Not Playing"
     @Published var isPlaying: Bool = false
@@ -715,12 +716,13 @@ final class LyricsState: ObservableObject {
         }
     }
 
-    func updatePlayback(isPlaying: Bool, position: Double) {
+    func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0) {
         if self.isPlaying != isPlaying {
             self.isPlaying = isPlaying
         }
         playbackAnchorPosition = position
         playbackAnchorDate = Date()
+        self.playbackRate = playbackRate
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
             if !isPlaying {
@@ -771,7 +773,7 @@ final class LyricsState: ObservableObject {
     func liveProgress(at date: Date) -> Double {
         guard isPlaying, let line = activeLine else { return 0.0 }
         let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
-        let effectivePos = playbackAnchorPosition + elapsedSinceAnchor + offsetSeconds
+        let effectivePos = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
         return Self.computeLineProgress(line: line, nextTimestamp: activeLineNextTimestamp, position: effectivePos)
     }
 
