@@ -341,7 +341,9 @@ struct LyricsOverlayView: View {
                         .foregroundStyle(activeUnsungColor)
                         .lineLimit(1)
                         .truncationMode(.tail)
-                        .layoutPriority(-1)
+                        .frame(maxWidth: 150, alignment: .trailing)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .layoutPriority(1)
                         .transition(.opacity)
                 }
             }
