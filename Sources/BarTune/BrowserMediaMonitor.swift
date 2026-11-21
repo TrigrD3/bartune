@@ -6,6 +6,12 @@ struct YouTubeChapter: Equatable {
     let title: String
 }
 
+struct BrowserTabDescriptor: Equatable {
+    let windowIndex: Int
+    let tabIndex: Int
+    let url: String
+}
+
 enum BrowserMediaParser {
     static let supportedHosts: [String] = [
         "music.youtube.com",
@@ -16,17 +22,49 @@ enum BrowserMediaParser {
 
     static let minChapterVideoDuration: Double = 600.0
 
+    static func isSupportedMusicHost(_ host: String) -> Bool {
+        let normalized = host.lowercased()
+        if supportedHosts.contains(where: { normalized == $0 || normalized.hasSuffix("." + $0) }) {
+            return true
+        }
+        return normalized == "youtube.com" || normalized == "www.youtube.com"
+    }
+
     static func isSupportedMusicURL(_ urlString: String) -> Bool {
-        guard let url = URL(string: urlString), let host = url.host?.lowercased() else {
+        guard let url = URL(string: urlString),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http",
+              let host = url.host?.lowercased()
+        else {
             return false
         }
         if supportedHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) }) {
             return true
         }
-        if (host == "youtube.com" || host == "www.youtube.com") && url.path.hasPrefix("/watch") {
+        if (host == "youtube.com" || host == "www.youtube.com") &&
+            (url.path == "/watch" || url.path.hasPrefix("/watch/")) {
             return true
         }
         return false
+    }
+
+    static func parseTabList(_ raw: String) -> [BrowserTabDescriptor] {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        return trimmed.components(separatedBy: "\u{1E}").compactMap { entry in
+            let fields = entry.components(separatedBy: "\u{1F}")
+            guard fields.count >= 3,
+                  let windowIndex = Int(fields[0]),
+                  let tabIndex = Int(fields[1]),
+                  windowIndex > 0,
+                  tabIndex > 0
+            else {
+                return nil
+            }
+            let url = fields[2...].joined(separator: "\u{1F}").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !url.isEmpty else { return nil }
+            return BrowserTabDescriptor(windowIndex: windowIndex, tabIndex: tabIndex, url: url)
+        }
     }
 
     private static let youtubeNoisePatterns: [String] = [
@@ -122,15 +160,27 @@ enum BrowserMediaParser {
     static func parseTimestamp(_ raw: String) -> Double? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let seconds: Double
         if !trimmed.contains(":") {
-            return SpotifyMonitor.parseLocaleDouble(trimmed)
+            guard let parsed = SpotifyMonitor.parseLocaleDouble(trimmed) else { return nil }
+            seconds = parsed
+        } else {
+            let rawParts = trimmed.split(separator: ":", omittingEmptySubsequences: false)
+            guard rawParts.count == 2 || rawParts.count == 3 else { return nil }
+            let parts = rawParts.compactMap { Double($0) }
+            guard parts.count == rawParts.count,
+                  parts.allSatisfy({ $0.isFinite && $0 >= 0 })
+            else { return nil }
+            if parts.count == 2 {
+                seconds = parts[0] * 60.0 + parts[1]
+            } else {
+                seconds = parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+            }
         }
-        let parts = trimmed.split(separator: ":").compactMap { Double($0) }
-        guard parts.count == 2 || parts.count == 3 else { return nil }
-        if parts.count == 2 {
-            return parts[0] * 60.0 + parts[1]
+        guard seconds.isFinite, seconds >= 0, Int(exactly: seconds.rounded()) != nil else {
+            return nil
         }
-        return parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+        return seconds
     }
 
     static func parseChapters(_ raw: String) -> [YouTubeChapter] {
@@ -142,11 +192,10 @@ enum BrowserMediaParser {
             let fields = entry.components(separatedBy: "\u{1E}")
             guard fields.count >= 2,
                   let start = parseTimestamp(fields[0]),
-                  start >= 0
+                  let key = Int(exactly: start.rounded())
             else { continue }
             let title = fields[1].trimmingCharacters(in: .whitespacesAndNewlines)
             guard !title.isEmpty else { continue }
-            let key = Int(start.rounded())
             if bySecond[key] == nil {
                 bySecond[key] = YouTubeChapter(start: start, title: title)
             }
@@ -185,7 +234,7 @@ enum BrowserMediaParser {
         return (chapter: active, duration: chapterDuration, position: relativePosition)
     }
 
-    static func parsePayload(_ raw: String) -> PlaybackSnapshot? {
+    static func parsePayload(_ raw: String, sourceBundleId: String? = nil) -> PlaybackSnapshot? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "IDLE" else { return nil }
 
@@ -196,6 +245,12 @@ enum BrowserMediaParser {
         guard isPlaying else { return nil }
 
         var trackId = parts[2]
+        guard trackId.hasPrefix("browser:") else { return nil }
+        let afterPrefix = trackId.dropFirst("browser:".count)
+        guard let hostSeparator = afterPrefix.firstIndex(of: ":") else { return nil }
+        let payloadHost = String(afterPrefix[..<hostSeparator])
+        guard isSupportedMusicHost(payloadHost) else { return nil }
+
         var title = cleanTitle(parts[3])
         guard !title.isEmpty else { return nil }
 
@@ -217,13 +272,13 @@ enum BrowserMediaParser {
                currentTime: positionSec
            ) {
             let chapterTitle = cleanChapterTitle(resolved.chapter.title)
-            if !chapterTitle.isEmpty {
+            if !chapterTitle.isEmpty, let chapterSecond = Int(exactly: resolved.chapter.start.rounded()) {
                 let split = splitYouTubeArtistAndTitle(title: chapterTitle, fallbackArtist: "")
                 artist = split.artist
                 title = split.title
                 durationSec = resolved.duration
                 positionSec = resolved.position
-                trackId = "\(trackId):ch:\(Int(resolved.chapter.start.rounded()))"
+                trackId = "\(trackId):ch:\(chapterSecond)"
             }
         } else if isStandardYouTube {
             let split = splitYouTubeArtistAndTitle(title: title, fallbackArtist: artist)
@@ -237,7 +292,8 @@ enum BrowserMediaParser {
             artist: artist,
             album: album,
             duration: durationSec,
-            artworkURL: artworkURL
+            artworkURL: artworkURL,
+            sourceBundleId: sourceBundleId
         )
 
         return PlaybackSnapshot(
@@ -250,13 +306,13 @@ enum BrowserMediaParser {
 }
 
 final class BrowserMediaMonitor: @unchecked Sendable {
-    private struct BrowserTarget {
+    struct BrowserTarget: Equatable {
         let bundleId: String
         let appName: String
         let isSafari: Bool
     }
 
-    private static let browsers: [BrowserTarget] = [
+    static let browsers: [BrowserTarget] = [
         BrowserTarget(bundleId: "com.google.Chrome", appName: "Google Chrome", isSafari: false),
         BrowserTarget(bundleId: "company.thebrowser.Browser", appName: "Arc", isSafari: false),
         BrowserTarget(bundleId: "com.brave.Browser", appName: "Brave Browser", isSafari: false),
@@ -266,8 +322,9 @@ final class BrowserMediaMonitor: @unchecked Sendable {
 
     // Compact JS evaluated in matched music tabs using the standard Web Media Session API
     // plus active <video>/<audio> currentTime and duration, and YouTube chapter markers for long videos.
-    private static let jsProbe: String = """
-    (function(){try{var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';if((location.hostname==='www.youtube.com'||location.hostname==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}var id='browser:'+location.hostname+':'+t+'|'+a;var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch].join(s);}catch(e){return 'IDLE';}})()
+    // Re-validates location protocol/hostname/pathname inside the document to prevent TOCTOU navigation races.
+    static let jsProbe: String = """
+    (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})||((h==='youtube.com'||h==='www.youtube.com')&&(location.pathname==='/watch'||location.pathname.indexOf('/watch/')===0));if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}var id='browser:'+h+':'+t+'|'+a;var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch].join(s);}catch(e){return 'IDLE';}})()
     """
 
     private static let escapedJS: String = jsProbe
@@ -275,66 +332,126 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         .replacingOccurrences(of: "\"", with: "\\\"")
 
     // Compiled AppleScripts cached per browser bundle ID (accessed serially on SpotifyMonitor's scriptQueue).
-    private var compiledScripts: [String: NSAppleScript] = [:]
+    private var compiledListScripts: [String: NSAppleScript] = [:]
+    private var compiledProbeScripts: [String: (windowIndex: Int, tabIndex: Int, script: NSAppleScript)] = [:]
+
+    private let listTabsHandler: ((BrowserTarget) -> [BrowserTabDescriptor])?
+    private let probeTabHandler: ((BrowserTarget, BrowserTabDescriptor) -> String?)?
+
+    init(
+        listTabs: ((BrowserTarget) -> [BrowserTabDescriptor])? = nil,
+        probeTab: ((BrowserTarget, BrowserTabDescriptor) -> String?)? = nil
+    ) {
+        listTabsHandler = listTabs
+        probeTabHandler = probeTab
+    }
 
     func poll(runningBundleIds: Set<String>) -> PlaybackSnapshot? {
         for browser in Self.browsers where runningBundleIds.contains(browser.bundleId) {
-            if let raw = queryBrowser(browser),
-               let snapshot = BrowserMediaParser.parsePayload(raw) {
+            if let snapshot = pollBrowser(browser) {
                 return snapshot
             }
         }
         return nil
     }
 
-    private func script(for browser: BrowserTarget) -> NSAppleScript? {
-        if let cached = compiledScripts[browser.bundleId] {
+    func pollBrowser(_ browser: BrowserTarget) -> PlaybackSnapshot? {
+        let tabs = listTabs(for: browser)
+        for tab in tabs where BrowserMediaParser.isSupportedMusicURL(tab.url) {
+            if let raw = probeTab(tab, in: browser),
+               let snapshot = BrowserMediaParser.parsePayload(raw, sourceBundleId: browser.bundleId) {
+                return snapshot
+            }
+        }
+        return nil
+    }
+
+    static func listTabsScriptSource(for browser: BrowserTarget) -> String {
+        """
+        tell application "\(browser.appName)"
+            set outLines to {}
+            set wCount to count of windows
+            repeat with wi from 1 to wCount
+                try
+                    set tCount to count of tabs of window wi
+                    repeat with ti from 1 to tCount
+                        try
+                            set u to URL of tab ti of window wi
+                            if u is not missing value and u is not "" then
+                                set end of outLines to (wi as string) & (character id 31) & (ti as string) & (character id 31) & u
+                            end if
+                        end try
+                    end repeat
+                end try
+            end repeat
+            set AppleScript's text item delimiters to (character id 30)
+            set res to outLines as string
+            set AppleScript's text item delimiters to ""
+            return res
+        end tell
+        """
+    }
+
+    static func probeScriptSource(for browser: BrowserTarget, tab: BrowserTabDescriptor) -> String {
+        let escapedJS = Self.escapedJS
+        if browser.isSafari {
+            return """
+            tell application "Safari"
+                try
+                    set res to do JavaScript "\(escapedJS)" in tab \(tab.tabIndex) of window \(tab.windowIndex)
+                    if res is not missing value then return res
+                end try
+            end tell
+            return "IDLE"
+            """
+        }
+        return """
+        tell application "\(browser.appName)"
+            try
+                set res to execute tab \(tab.tabIndex) of window \(tab.windowIndex) javascript "\(escapedJS)"
+                if res is not missing value then return res
+            end try
+        end tell
+        return "IDLE"
+        """
+    }
+
+    private func listTabsScript(for browser: BrowserTarget) -> NSAppleScript? {
+        if let cached = compiledListScripts[browser.bundleId] {
             return cached
         }
-        let escapedJS = Self.escapedJS
-        let source: String = if browser.isSafari {
-            """
-            tell application "Safari"
-                repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            set u to URL of t
-                            if u contains "music.youtube.com" or u contains "youtube.com/watch" or u contains "open.spotify.com" or u contains "soundcloud.com" or u contains "music.apple.com" then
-                                set res to do JavaScript "\(escapedJS)" in t
-                                if res is not "IDLE" and res is not "" then return res
-                            end if
-                        end try
-                    end repeat
-                end repeat
-            end tell
-            return "IDLE"
-            """
-        } else {
-            """
-            tell application "\(browser.appName)"
-                repeat with w in windows
-                    repeat with t in tabs of w
-                        try
-                            set u to URL of t
-                            if u contains "music.youtube.com" or u contains "youtube.com/watch" or u contains "open.spotify.com" or u contains "soundcloud.com" or u contains "music.apple.com" then
-                                set res to execute t javascript "\(escapedJS)"
-                                if res is not "IDLE" and res is not "" then return res
-                            end if
-                        end try
-                    end repeat
-                end repeat
-            end tell
-            return "IDLE"
-            """
-        }
-
-        guard let compiled = NSAppleScript(source: source) else { return nil }
-        compiledScripts[browser.bundleId] = compiled
+        guard let compiled = NSAppleScript(source: Self.listTabsScriptSource(for: browser)) else { return nil }
+        compiledListScripts[browser.bundleId] = compiled
         return compiled
     }
 
-    private func queryBrowser(_ browser: BrowserTarget) -> String? {
-        guard let script = script(for: browser) else { return nil }
+    private func probeScript(for browser: BrowserTarget, tab: BrowserTabDescriptor) -> NSAppleScript? {
+        if let cached = compiledProbeScripts[browser.bundleId],
+           cached.windowIndex == tab.windowIndex,
+           cached.tabIndex == tab.tabIndex {
+            return cached.script
+        }
+        guard let compiled = NSAppleScript(source: Self.probeScriptSource(for: browser, tab: tab)) else { return nil }
+        compiledProbeScripts[browser.bundleId] = (tab.windowIndex, tab.tabIndex, compiled)
+        return compiled
+    }
+
+    private func listTabs(for browser: BrowserTarget) -> [BrowserTabDescriptor] {
+        if let listTabsHandler {
+            return listTabsHandler(browser)
+        }
+        guard let script = listTabsScript(for: browser) else { return [] }
+        var error: NSDictionary?
+        let result = script.executeAndReturnError(&error)
+        guard error == nil, let raw = result.stringValue else { return [] }
+        return BrowserMediaParser.parseTabList(raw)
+    }
+
+    private func probeTab(_ tab: BrowserTabDescriptor, in browser: BrowserTarget) -> String? {
+        if let probeTabHandler {
+            return probeTabHandler(browser, tab)
+        }
+        guard let script = probeScript(for: browser, tab: tab) else { return nil }
         var error: NSDictionary?
         let result = script.executeAndReturnError(&error)
         guard error == nil else { return nil }

@@ -203,4 +203,132 @@ final class BrowserMediaParserTests: XCTestCase {
         XCTAssertEqual(snapshot?.track?.artist, "美波")
         XCTAssertEqual(snapshot?.track?.title, "Crying for Rain")
     }
+
+    func testChapterTimestampRequiresRepresentableSecond() {
+        XCTAssertNil(BrowserMediaParser.parseTimestamp(String(Double.greatestFiniteMagnitude)))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("inf"))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("nan"))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("1e20:00"))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("9223372036854775808"))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("-5"))
+        XCTAssertNil(BrowserMediaParser.parseTimestamp("1:abc:30"))
+        XCTAssertEqual(BrowserMediaParser.parseTimestamp("1:05.5") ?? -1, 65.5, accuracy: 0.001)
+    }
+
+    func testParseChaptersSkipsOutOfRangeAndMalformedTimestampsWithoutCrashing() {
+        let gs = "\u{1D}"
+        let rs = "\u{1E}"
+        let raw = [
+            "0:00\(rs)Intro",
+            "\(Double.greatestFiniteMagnitude)\(rs)Overflow Float",
+            "inf\(rs)Infinite",
+            "nan\(rs)Not a Number",
+            "1e20:00\(rs)Overflow Minutes",
+            "9223372036854775808\(rs)IntMax Plus One",
+            "1:05.5\(rs)Chorus",
+        ].joined(separator: gs)
+
+        let chapters = BrowserMediaParser.parseChapters(raw)
+        XCTAssertEqual(chapters.count, 2)
+        XCTAssertEqual(chapters[0], YouTubeChapter(start: 0.0, title: "Intro"))
+        XCTAssertEqual(chapters[1].start, 65.5, accuracy: 0.001)
+        XCTAssertEqual(chapters[1].title, "Chorus")
+    }
+
+    func testRejectsSpoofedMusicURLsAndUnsupportedPayloadHosts() {
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://private.invalid/watch?ref=music.youtube.com"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://private.invalid/youtube.com/watch?v=abc"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://music.youtube.com.evil.invalid/watch?v=abc"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://notmusic.youtube.com/watch?v=abc"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://music.youtube.com@evil.invalid/watch?v=abc"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://www.youtube.com/watch-later"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("javascript:music.youtube.com"))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("file://music.youtube.com/track"))
+
+        let sep = "\u{1F}"
+        let spoofedPayload = [
+            "BROWSER",
+            "playing",
+            "browser:private.invalid:Confidential Call|Internal",
+            "Confidential Call",
+            "Internal",
+            "",
+            "180.0",
+            "12.0",
+            "",
+        ].joined(separator: sep)
+        XCTAssertNil(BrowserMediaParser.parsePayload(spoofedPayload))
+    }
+
+    func testAdaptersProbeOnlyAllowedOrigins() {
+        let sep = "\u{1F}"
+        let validPayload = [
+            "BROWSER",
+            "playing",
+            "browser:music.youtube.com:Night Dancer|imase",
+            "Night Dancer",
+            "imase",
+            "Bonsai",
+            "210.0",
+            "30.0",
+            "",
+        ].joined(separator: sep)
+
+        let tabs = [
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 1, url: "https://private.invalid/music.youtube.com/watch?v=1"),
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 2, url: "https://private.invalid/call?next=https://open.spotify.com/track/1"),
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 3, url: "https://music.youtube.com.evil.invalid/watch?v=1"),
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 4, url: "https://music.youtube.com/watch?v=abc123"),
+        ]
+
+        let targets = BrowserMediaMonitor.browsers.filter {
+            $0.bundleId == "com.apple.Safari" || $0.bundleId == "com.google.Chrome"
+        }
+        XCTAssertEqual(targets.count, 2)
+
+        for target in targets {
+            var probedTabs: [BrowserTabDescriptor] = []
+            let monitor = BrowserMediaMonitor(
+                listTabs: { _ in tabs },
+                probeTab: { _, tab in
+                    probedTabs.append(tab)
+                    return validPayload
+                }
+            )
+
+            let snapshot = monitor.poll(runningBundleIds: [target.bundleId])
+            XCTAssertEqual(probedTabs, [tabs[3]], "Only the allowed origin tab should be probed for \(target.appName)")
+            XCTAssertEqual(snapshot?.track?.sourceBundleId, target.bundleId)
+            XCTAssertEqual(snapshot?.track?.title, "Night Dancer")
+
+            let listScript = BrowserMediaMonitor.listTabsScriptSource(for: target)
+            XCTAssertFalse(listScript.contains("u contains"))
+            let probeScript = BrowserMediaMonitor.probeScriptSource(for: target, tab: tabs[3])
+            XCTAssertFalse(probeScript.contains("u contains"))
+            if target.isSafari {
+                XCTAssertTrue(probeScript.contains("do JavaScript"))
+            } else {
+                XCTAssertTrue(probeScript.contains("execute tab 4 of window 1 javascript"))
+            }
+        }
+
+        XCTAssertTrue(BrowserMediaMonitor.jsProbe.contains("location.hostname"))
+        XCTAssertTrue(BrowserMediaMonitor.jsProbe.contains("location.protocol"))
+    }
+
+    func testParseTabListHandlesValidAndMalformedEntries() {
+        let us = "\u{1F}"
+        let rs = "\u{1E}"
+        let raw = [
+            "1\(us)1\(us)https://music.youtube.com/watch?v=abc",
+            "bad\(us)2\(us)https://open.spotify.com/track/1",
+            "2\(us)3\(us)https://private.invalid/path?a=1",
+        ].joined(separator: rs)
+
+        let parsed = BrowserMediaParser.parseTabList(raw)
+        XCTAssertEqual(parsed, [
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 1, url: "https://music.youtube.com/watch?v=abc"),
+            BrowserTabDescriptor(windowIndex: 2, tabIndex: 3, url: "https://private.invalid/path?a=1"),
+        ])
+    }
 }

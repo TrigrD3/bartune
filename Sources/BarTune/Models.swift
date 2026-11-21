@@ -7,6 +7,25 @@ struct TrackInfo: Equatable {
     let album: String
     let duration: Double // seconds
     let artworkURL: String?
+    let sourceBundleId: String?
+
+    init(
+        id: String,
+        title: String,
+        artist: String,
+        album: String,
+        duration: Double,
+        artworkURL: String?,
+        sourceBundleId: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.artist = artist
+        self.album = album
+        self.duration = duration
+        self.artworkURL = artworkURL
+        self.sourceBundleId = sourceBundleId
+    }
 }
 
 struct WordTimestamp: Equatable, Codable {

@@ -413,8 +413,43 @@ final class AudioLyricsAlignerTests: XCTestCase {
     func testTargetBundleIdentifiersMapToActiveMediaPlayer() {
         XCTAssertEqual(AudioSyncManager.targetBundleIdentifiers(for: "spotify:track:123"), ["com.spotify.client"])
         XCTAssertEqual(AudioSyncManager.targetBundleIdentifiers(for: "music:abc"), ["com.apple.Music"])
-        XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "browser:yt:xyz").contains("com.google.Chrome"))
+        XCTAssertEqual(
+            AudioSyncManager.targetBundleIdentifiers(for: "browser:music.youtube.com:xyz", sourceBundleId: "com.google.Chrome"),
+            ["com.google.Chrome"]
+        )
         XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "unknown:1").isEmpty)
+    }
+
+    func testSafariTrackTargetsOnlySafari() throws {
+        let sep = "\u{1F}"
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:music.youtube.com:Night Dancer|imase",
+            "Night Dancer",
+            "imase",
+            "",
+            "210.0",
+            "15.0",
+            "",
+        ].joined(separator: sep)
+
+        let monitor = BrowserMediaMonitor(
+            listTabs: { browser in
+                if browser.bundleId == "com.apple.Safari" {
+                    return [BrowserTabDescriptor(windowIndex: 1, tabIndex: 1, url: "https://music.youtube.com/watch?v=abc")]
+                }
+                return []
+            },
+            probeTab: { browser, _ in
+                browser.bundleId == "com.apple.Safari" ? payload : nil
+            }
+        )
+
+        let snapshot = monitor.poll(runningBundleIds: ["com.google.Chrome", "com.apple.Safari"])
+        let track = try XCTUnwrap(snapshot?.track)
+        XCTAssertEqual(track.sourceBundleId, "com.apple.Safari")
+        XCTAssertEqual(AudioSyncManager.targetBundleIdentifiers(for: track), ["com.apple.Safari"])
     }
 
     func testSingleMatchedLineDoesNotShiftGlobalOffset() {
