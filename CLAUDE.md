@@ -95,6 +95,7 @@ swiftformat Sources Tests
 ## Git Workflow
 
 - **Branch protection:** `main` is protected — never push directly to `main`. Always open a pull request and merge after required checks (`lint`, `test`, `Conventional PR Title`) pass.
+- **Issue tracking:** before starting work on a new feature, create a GitHub issue for it and link the pull request to that issue (e.g., `Closes #<number>`).
 - **Conventional Commits:** `<type>(<scope>): <description>` — types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`, `build`, `ci`, `revert`. Enforced in CI (`pr-title.yml`) and locally (`scripts/hooks/commit-msg`).
 - **Scopes:** `app`, `test`, `build`, `ci`, `docs`, `deps`.
 - **Atomic commits:** one logical change per commit. Fold review fixes into the commit they belong to (`git commit --fixup` + `git rebase --autosquash`).

@@ -8,8 +8,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let lyricsFetcher = LyricsFetcher()
     private let lyricsTranslator = LyricsTranslator()
     private let colorExtractor = AlbumArtColorExtractor()
+    private lazy var audioSyncManager = AudioSyncManager(state: state)
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
+    private var lastLoadedTrack: TrackInfo?
 
     private var statusItem: NSStatusItem?
     private var trackMenuItem: NSMenuItem?
@@ -99,9 +101,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.translateCurrentTrack()
             }
             .store(in: &cancellables)
+
+        state.onResyncCurrentTrack = { [weak self] in
+            self?.audioSyncManager.resyncCurrentTrack()
+        }
+
+        state.$audioSyncEngine
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.restartAudioSyncForCurrentTrack()
+            }
+            .store(in: &cancellables)
+
+        state.$whisperModelPath
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, self.state.audioSyncEngine == .whisper else { return }
+                self.restartAudioSyncForCurrentTrack()
+            }
+            .store(in: &cancellables)
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        audioSyncManager.stop()
         spotifyMonitor.stop()
         fetchTask?.cancel()
         translateTask?.cancel()
@@ -199,9 +223,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard snapshot.isRunning, let track = snapshot.track else {
             if lastFetchedTrackId != nil {
                 lastFetchedTrackId = nil
+                lastLoadedTrack = nil
                 fetchTask?.cancel()
                 translateTask?.cancel()
                 colorTask?.cancel()
+                audioSyncManager.stop()
+                state.audioSyncStatus = .idle
                 state.setTrack(nil, lyrics: [])
             }
             state.updatePlayback(isPlaying: false, position: 0)
@@ -210,9 +237,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if track.id != lastFetchedTrackId {
             lastFetchedTrackId = track.id
+            lastLoadedTrack = track
             fetchTask?.cancel()
             translateTask?.cancel()
             colorTask?.cancel()
+            audioSyncManager.stop()
+            state.audioSyncStatus = .idle
             state.setTrack(track, lyrics: [])
 
             fetchTask = Task { [weak self] in
@@ -220,6 +250,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let lyrics = await self.lyricsFetcher.fetchLyrics(for: track)
                 guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
                 self.state.setTrack(track, lyrics: lyrics)
+                self.audioSyncManager.handleTrackLoaded(track: track, rawLines: lyrics)
                 if self.state.translateLyrics, !lyrics.isEmpty {
                     self.translateCurrentTrack()
                 }
@@ -234,6 +265,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         state.updatePlayback(isPlaying: snapshot.isPlaying, position: snapshot.position)
+        audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying)
+    }
+
+    private func restartAudioSyncForCurrentTrack() {
+        guard let track = lastLoadedTrack, !state.rawLyricLines.isEmpty else {
+            audioSyncManager.stop()
+            state.audioSyncStatus = .idle
+            return
+        }
+        audioSyncManager.handleTrackLoaded(track: track, rawLines: state.rawLyricLines)
     }
 
     private func translateCurrentTrack() {
