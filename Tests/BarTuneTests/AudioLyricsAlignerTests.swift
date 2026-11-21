@@ -468,12 +468,24 @@ final class AudioLyricsAlignerTests: XCTestCase {
         )
         XCTAssertFalse(outlierOffset.isReliable)
 
+        let singleLineTranscriptOnly = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:transcript-partial",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: 0.1,
+            alignedLineCount: 1,
+            sourceLineCount: lines.count,
+            lines: [lines[0]]
+        )
+        XCTAssertFalse(singleLineTranscriptOnly.isReliable)
+
         let reliable = AudioSyncedLyricsRecord(
             trackId: "spotify:track:good",
             engine: .whisper,
             syncedAt: Date(),
             medianOffset: -0.45,
             alignedLineCount: 2,
+            sourceLineCount: lines.count,
             lines: lines
         )
         XCTAssertTrue(reliable.isReliable)
