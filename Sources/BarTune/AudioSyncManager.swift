@@ -19,11 +19,12 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
             ])
         }
 
-        let matchedApps = content.applications.filter { targetBundleIds.contains($0.bundleIdentifier) }
-        let filter: SCContentFilter = if !matchedApps.isEmpty {
-            SCContentFilter(display: display, including: matchedApps, exceptingWindows: [])
+        let filter: SCContentFilter
+        if !targetBundleIds.isEmpty {
+            let excludedApps = content.applications.filter { !targetBundleIds.contains($0.bundleIdentifier) }
+            filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
         } else {
-            SCContentFilter(display: display, excludingWindows: [])
+            filter = SCContentFilter(display: display, excludingWindows: [])
         }
         let config = SCStreamConfiguration()
         config.capturesAudio = true

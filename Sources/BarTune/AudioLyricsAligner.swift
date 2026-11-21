@@ -695,8 +695,9 @@ enum LyricsAudioAligner {
                             words: transcribedWords
                         )
                     )
-                    continue
                 }
+                // In transcript-only mode, omit untranscribed static fallback lines.
+                continue
             }
 
             if matches.count >= minMatches {
