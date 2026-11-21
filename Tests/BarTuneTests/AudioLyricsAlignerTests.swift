@@ -564,4 +564,22 @@ final class AudioLyricsAlignerTests: XCTestCase {
             XCTAssertGreaterThanOrEqual(secondFirstWord.timestamp, firstLastWord.timestamp + (firstLastWord.duration ?? 0))
         }
     }
+
+    func testAlignFallbackLineRespectsPreviousLineEnd() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 1.0, text: "alpha"),
+            LyricLine(id: 1, timestamp: 11.0, duration: 1.0, text: "unmatched first"),
+            LyricLine(id: 2, timestamp: 12.0, duration: 1.0, text: "unmatched second"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 11.2, duration: 0.2, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        let firstEnd = result.lines[0].timestamp + (result.lines[0].duration ?? 0)
+        let secondEnd = result.lines[1].timestamp + (result.lines[1].duration ?? 0)
+
+        XCTAssertGreaterThanOrEqual(result.lines[1].timestamp, firstEnd)
+        XCTAssertGreaterThanOrEqual(result.lines[2].timestamp, secondEnd)
+    }
 }

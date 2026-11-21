@@ -786,8 +786,8 @@ enum LyricsAudioAligner {
             }
 
             let baseStart = (medianOffset.map { abs($0) >= 0.15 ? max(0, line.timestamp + $0) : line.timestamp }) ?? line.timestamp
-            let fallbackStart: Double = if isNonEmpty, let prevTs = previousEmittedTimestamp, baseStart < prevTs + 0.25 {
-                prevTs + 0.25
+            let fallbackStart: Double = if isNonEmpty, previousEmittedTimestamp != nil, baseStart < minAllowedStart {
+                minAllowedStart
             } else {
                 baseStart
             }
