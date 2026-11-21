@@ -104,7 +104,12 @@ enum LRCParser {
             let (cleanText, wordTimestamps) = parseEnhancedWords(rawBody, lineStart: lineStart)
 
             for ts in timestamps {
-                entries.append((ts, cleanText, wordTimestamps))
+                // Word tags are absolute to the first listed occurrence; shift them for repeats.
+                let delta = ts - lineStart
+                let words = delta == 0 ? wordTimestamps : wordTimestamps.map {
+                    WordTimestamp(timestamp: $0.timestamp + delta, duration: $0.duration, text: $0.text)
+                }
+                entries.append((ts, cleanText, words))
             }
         }
 
