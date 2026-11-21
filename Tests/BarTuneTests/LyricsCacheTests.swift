@@ -280,4 +280,46 @@ final class LyricsCacheTests: XCTestCase {
         let onlineResult = await fetcher.fetchLyrics(for: track)
         XCTAssertEqual(onlineResult.map(\.text), ["Online lyric"])
     }
+
+    func testSettingsDeletionInvalidatesWarmLyrics() async throws {
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
+        let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
+        let offline: LyricsFetcher.DataLoader = { _ in throw URLError(.notConnectedToInternet) }
+        let fetcher = LyricsFetcher(diskCache: diskCache, dataLoader: offline)
+        let translator = LyricsTranslator(diskCache: diskCache, dataLoader: offline)
+        let remover = OfflineCacheRemover(
+            fetcher: fetcher,
+            translator: translator,
+            lyricsCache: diskCache,
+            syncCache: syncCache
+        )
+        let track = TrackInfo(id: "spotify:track:wrong-match", title: "Song", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = [LyricLine(id: 0, timestamp: 1, text: "source")]
+        let translationKey = "\(track.id):tr:en"
+
+        func seed(_ text: String) {
+            diskCache.save(trackId: track.id, lines: [LyricLine(id: 0, timestamp: 1, text: text)], title: track.title, artist: track.artist)
+            diskCache.save(trackId: translationKey, lines: [LyricLine(id: 0, timestamp: 1, text: "\(text) en")])
+        }
+
+        // Single-row deletion.
+        seed("old")
+        _ = await fetcher.fetchLyrics(for: track)
+        _ = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        let song = try XCTUnwrap(diskCache.listEntries(audioSyncCache: syncCache).first { $0.trackId == track.id })
+        await remover.remove(song)
+        seed("new")
+        let afterRemove = await fetcher.fetchLyrics(for: track)
+        let translatedAfterRemove = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        XCTAssertEqual(afterRemove.map(\.text), ["new"])
+        XCTAssertEqual(translatedAfterRemove.map(\.text), ["new en"])
+
+        // Clear All.
+        await remover.removeAll()
+        seed("newer")
+        let afterClear = await fetcher.fetchLyrics(for: track)
+        let translatedAfterClear = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        XCTAssertEqual(afterClear.map(\.text), ["newer"])
+        XCTAssertEqual(translatedAfterClear.map(\.text), ["newer en"])
+    }
 }

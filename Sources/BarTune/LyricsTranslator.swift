@@ -78,6 +78,15 @@ actor LyricsTranslator {
         memoryCache.removeAll()
     }
 
+    /// Drops a track's translations, or a single translation row's key; `nil` clears everything.
+    func invalidateMemoryCache(trackId: String?) {
+        guard let trackId else {
+            memoryCache.removeAll()
+            return
+        }
+        memoryCache = memoryCache.filter { key, _ in key != trackId && !key.hasPrefix("\(trackId):tr:") }
+    }
+
     func translate(
         lines: [LyricLine],
         trackId: String,
