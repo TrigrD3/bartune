@@ -111,6 +111,7 @@ struct KaraokeLineView: View {
     let karaokeEnabled: Bool
     let isPlaying: Bool
     let lowCPUMode: Bool
+    var glowEnabled: Bool = false
 
     @State private var textWidth: CGFloat = 0
 
@@ -153,12 +154,20 @@ struct KaraokeLineView: View {
                                     endPoint: .trailing
                                 )
                             }
+                            .shadow(
+                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                                radius: glowEnabled ? 4 : 0
+                            )
                     } else {
                         Text(text)
                             .font(font)
                             .foregroundStyle(sungColor)
                             .fixedSize(horizontal: true, vertical: false)
                             .background(widthReader)
+                            .shadow(
+                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                                radius: glowEnabled ? 4 : 0
+                            )
                     }
                 }
                 .offset(x: scrollOffset)
@@ -312,7 +321,8 @@ struct LyricsOverlayView: View {
                     sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled,
                     isPlaying: state.isEnabled && state.isPlaying,
-                    lowCPUMode: state.lowCPUMode
+                    lowCPUMode: state.lowCPUMode,
+                    glowEnabled: state.karaokeGlowEnabled
                 )
                 .id(
                     "\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)-\(state.translateLyrics)-\(state.translationLanguage.rawValue)"
@@ -322,10 +332,6 @@ struct LyricsOverlayView: View {
                     removal: .opacity.combined(with: .offset(y: -6))
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
-                .shadow(
-                    color: state.karaokeGlowEnabled ? activeSungColor.opacity(0.55) : .clear,
-                    radius: state.karaokeGlowEnabled ? 4 : 0
-                )
 
                 if state.showTrackTitle, !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
                     MarqueeTrackLabelView(
