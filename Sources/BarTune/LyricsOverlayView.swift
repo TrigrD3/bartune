@@ -235,17 +235,19 @@ struct LyricsOverlayView: View {
     }
 
     private var activeSungColor: Color {
-        switch state.themeMode {
+        let themeBase: Color = switch state.themeMode {
         case .system:
-            return Color.primary
+            Color.primary
         case .albumAccent:
             if let colors = state.albumColors {
-                return Color(nsColor: colors.accentNSColor)
+                Color(nsColor: colors.accentNSColor)
+            } else {
+                Color.primary
             }
-            return Color.primary
         case .albumTint:
-            return Color.white
+            Color.white
         }
+        return state.lyricsColorPreset.resolvedColor(fallback: themeBase, customHex: state.customLyricsColorHex)
     }
 
     private var activeUnsungColor: Color {
@@ -320,8 +322,12 @@ struct LyricsOverlayView: View {
                     removal: .opacity.combined(with: .offset(y: -6))
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
+                .shadow(
+                    color: state.karaokeGlowEnabled ? activeSungColor.opacity(0.55) : .clear,
+                    radius: state.karaokeGlowEnabled ? 4 : 0
+                )
 
-                if !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
+                if state.showTrackTitle, !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
                     MarqueeTrackLabelView(
                         text: state.trackSummary,
                         color: activeUnsungColor,
@@ -364,7 +370,7 @@ struct LyricsOverlayView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: state.barCornerRadius, style: .continuous))
         .modifier(
             SpotlightMaskModifier(
                 cursorX: state.hoverMode == .spotlight ? state.cursorLocalX : nil,

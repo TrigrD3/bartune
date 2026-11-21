@@ -143,6 +143,62 @@ enum VisualizerStyle: String, CaseIterable, Identifiable {
     }
 }
 
+enum LyricsColorPreset: String, CaseIterable, Identifiable {
+    case matchTheme
+    case goldenHour
+    case electricCyan
+    case mintNeon
+    case roseQuartz
+    case pureWhite
+    case custom
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .matchTheme: return "Match Theme"
+        case .goldenHour: return "Golden Hour"
+        case .electricCyan: return "Electric Cyan"
+        case .mintNeon: return "Mint Neon"
+        case .roseQuartz: return "Rose Quartz"
+        case .pureWhite: return "Pure White"
+        case .custom: return "Custom Color"
+        }
+    }
+
+    func resolvedColor(fallback: Color, customHex: String) -> Color {
+        switch self {
+        case .matchTheme: return fallback
+        case .goldenHour: return Color(red: 1.0, green: 0.78, blue: 0.30)
+        case .electricCyan: return Color(red: 0.20, green: 0.90, blue: 1.0)
+        case .mintNeon: return Color(red: 0.30, green: 0.95, blue: 0.65)
+        case .roseQuartz: return Color(red: 1.0, green: 0.48, blue: 0.68)
+        case .pureWhite: return .white
+        case .custom:
+            return HexColorCoder.color(from: customHex) ?? fallback
+        }
+    }
+}
+
+enum HexColorCoder {
+    static func color(from hex: String) -> Color? {
+        let cleaned = hex.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        guard cleaned.count == 6, let value = UInt64(cleaned, radix: 16) else { return nil }
+        let r = Double((value >> 16) & 0xFF) / 255.0
+        let g = Double((value >> 8) & 0xFF) / 255.0
+        let b = Double(value & 0xFF) / 255.0
+        return Color(red: r, green: g, blue: b)
+    }
+
+    static func hex(from color: Color) -> String {
+        let nsColor = NSColor(color).usingColorSpace(.sRGB) ?? NSColor.white
+        let r = Int(round(max(0, min(1, nsColor.redComponent)) * 255.0))
+        let g = Int(round(max(0, min(1, nsColor.greenComponent)) * 255.0))
+        let b = Int(round(max(0, min(1, nsColor.blueComponent)) * 255.0))
+        return String(format: "#%02X%02X%02X", r, g, b)
+    }
+}
+
 enum VisualizerColorTheme: String, CaseIterable, Identifiable {
     case matchTheme
     case systemAccent
@@ -226,6 +282,11 @@ final class LyricsState: ObservableObject {
         static let whisperModelPath = "bartune.whisperModelPath"
         static let replaceLyricsWithTranscription = "bartune.replaceLyricsWithTranscription"
         static let showSyncBadge = "bartune.showSyncBadge"
+        static let lyricsColorPreset = "bartune.lyricsColorPreset"
+        static let customLyricsColorHex = "bartune.customLyricsColorHex"
+        static let karaokeGlowEnabled = "bartune.karaokeGlowEnabled"
+        static let barCornerRadius = "bartune.barCornerRadius"
+        static let showTrackTitle = "bartune.showTrackTitle"
     }
 
     private static let maxStoredOffsets = 500
@@ -378,6 +439,26 @@ final class LyricsState: ObservableObject {
         didSet { userDefaults.set(showSyncBadge, forKey: Keys.showSyncBadge) }
     }
 
+    @Published var lyricsColorPreset: LyricsColorPreset {
+        didSet { userDefaults.set(lyricsColorPreset.rawValue, forKey: Keys.lyricsColorPreset) }
+    }
+
+    @Published var customLyricsColorHex: String {
+        didSet { userDefaults.set(customLyricsColorHex, forKey: Keys.customLyricsColorHex) }
+    }
+
+    @Published var karaokeGlowEnabled: Bool {
+        didSet { userDefaults.set(karaokeGlowEnabled, forKey: Keys.karaokeGlowEnabled) }
+    }
+
+    @Published var barCornerRadius: Double {
+        didSet { userDefaults.set(barCornerRadius, forKey: Keys.barCornerRadius) }
+    }
+
+    @Published var showTrackTitle: Bool {
+        didSet { userDefaults.set(showTrackTitle, forKey: Keys.showTrackTitle) }
+    }
+
     @Published var lyricsCacheLimit: LyricsCacheLimit {
         didSet {
             userDefaults.set(lyricsCacheLimit.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
@@ -517,6 +598,16 @@ final class LyricsState: ObservableObject {
         self.whisperModelPath = ud.string(forKey: Keys.whisperModelPath) ?? ""
         self.replaceLyricsWithTranscription = ud.object(forKey: Keys.replaceLyricsWithTranscription) as? Bool ?? false
         self.showSyncBadge = ud.object(forKey: Keys.showSyncBadge) as? Bool ?? true
+        if let rawPreset = ud.string(forKey: Keys.lyricsColorPreset),
+           let parsedPreset = LyricsColorPreset(rawValue: rawPreset) {
+            self.lyricsColorPreset = parsedPreset
+        } else {
+            self.lyricsColorPreset = .matchTheme
+        }
+        self.customLyricsColorHex = ud.string(forKey: Keys.customLyricsColorHex) ?? "#FFD166"
+        self.karaokeGlowEnabled = ud.object(forKey: Keys.karaokeGlowEnabled) as? Bool ?? false
+        self.barCornerRadius = ud.object(forKey: Keys.barCornerRadius) as? Double ?? 6.0
+        self.showTrackTitle = ud.object(forKey: Keys.showTrackTitle) as? Bool ?? true
         let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
         self.lyricsCacheLimit = LyricsCacheLimit(rawValue: storedLimit) ?? .songs1000
         self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
