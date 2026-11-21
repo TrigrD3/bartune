@@ -694,6 +694,84 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(state.audioSyncStatus, .unavailable("Apple Speech recognition stopped: No speech detected"))
     }
 
+    // MARK: - #63: Late Whisper completion after a same-track restart
+
+    @MainActor
+    func testLateWhisperCompletionCannotMutateRestart() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+
+        let chunkAStarted = expectation(description: "Whisper chunk A started")
+        let chunkBStarted = expectation(description: "Whisper chunk B started")
+        let releaseA = DispatchSemaphore(value: 0)
+        let releaseB = DispatchSemaphore(value: 0)
+        let requestCount = LockedBox<Int>(0)
+        let matchingWords = ["Hello", "world", "from", "test"].enumerated().map { index, text in
+            RecognizedAudioWord(text: text, startTime: 10.0 + Double(index) * 0.4, duration: 0.3, confidence: 0.9)
+        }
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperCLI: { "/usr/local/bin/whisper-cli" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { _ in
+                let count = requestCount.withLock { value -> Int in
+                    value += 1
+                    return value
+                }
+                if count == 1 {
+                    chunkAStarted.fulfill()
+                    releaseA.wait()
+                    return matchingWords
+                }
+                if count == 2 {
+                    chunkBStarted.fulfill()
+                    releaseB.wait()
+                }
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let track = sampleTrack()
+        let lines = sampleLines()
+        manager.handleTrackLoaded(track: track, rawLines: lines)
+        let firstStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(firstStarted)
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        await fulfillment(of: [chunkAStarted], timeout: 2.0)
+
+        // Force resync on the same track and start chunk B while A is still running.
+        manager.resyncCurrentTrack()
+        let restarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 2 }
+        XCTAssertTrue(restarted)
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        await fulfillment(of: [chunkBStarted], timeout: 2.0)
+
+        // A completes with matching words while B is pending.
+        releaseA.signal()
+        for _ in 0..<50 {
+            await Task.yield()
+        }
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(manager.recognizedWords.isEmpty)
+        XCTAssertTrue(manager.isWhisperProcessing, "A must not clear B's processing slot")
+        XCTAssertEqual(requestCount.withLock { $0 }, 2, "A third worker must not start while B is pending")
+        XCTAssertNil(cache.load(trackId: track.id))
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count))
+
+        releaseB.signal()
+    }
+
     // MARK: - Helpers
 
     @MainActor
