@@ -24,12 +24,13 @@ Most desktop lyrics apps float over your editor, browser tabs, or terminal. **Ba
 
 ## Highlights
 
-- **Left-of-Notch Native Placement** — Sits strictly within the macOS menu bar height so your workspace stays 100% unobstructed.
-- **Hover-to-Reveal App Menus** — Choose between **Cursor Spotlight** (peeks only the menu item under your pointer with an adjustable cutout width) or **Hide Entire Bar** on hover.
-- **Spotify, Apple Music & Browser Music** — Works out of the box with desktop **Spotify** and **Apple Music**, and automatically falls back to **YouTube Music, YouTube, Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari.
-- **Zero-Lag 60fps Karaoke Sweep** — Fetches word-by-word **NetEase YRC** lyrics (with cross-script Kanji/Romaji matching and cover/karaoke filtering) and falls back to **LRCLIB**, rendered via a local `TimelineView` with background AppleScript polling and a `-5.0s` to `+5.0s` **Timing Offset**.
-- **Offline Japanese & Korean Romanization** — Built-in offline **Japanese → Romaji** (`CFStringTokenizer`) and **Korean → Romanized** (Revised Romanization) toggles for instant sing-along readability.
-- **Customizable Visualizers & Album Art Themes** — Pick from 5 visualizer styles (**Bars, Wave, Dots, Vinyl, Note**), sync highlight or backdrop colors to album artwork, and fine-tune typography, font size, weight, and opacity in a clean 3-tab Settings window (`⌘,`).
+- **Tucked beside the notch.** BarTune occupies only the unused menu bar space to the left of your MacBook notch (`NSScreen.auxiliaryTopLeftArea`), so it never floats over your editor, browser, or terminal.
+- **Steps aside on hover.** Pick **Cursor Spotlight** to peek only the menu item under your pointer, or **Hide Entire Bar** to reveal the full app menu bar on hover.
+- **Works across desktop and web players.** Tracks **Spotify** and **Apple Music** natively, and falls back to **YouTube Music, YouTube (including Chapters), Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari.
+- **Word-level karaoke sync and audio alignment.** Pulls millisecond **NetEase YRC** lyrics with **LRCLIB** fallback, and can optionally align lyrics to the playing audio using on-device **Apple Speech** (with automatic language detection) or **Local Whisper** (`whisper-cli`, reusing shared GGML models from `~/.cache/whisper` and `~/.cache/huggingface`). Synced timings are cached on disk so repeat plays load without recalculating, with a toggleable sync badge in the lyrics bar.
+- **Translation and offline romanization.** Translate lyrics into your preferred language (cached locally) or turn on offline **Japanese → Romaji**, **Korean → Romanized**, and **Chinese → Pinyin** for sing-along readability.
+- **Offline cache you can inspect.** Stores fetched lyrics, translations, audio-synced timings, and per-track timing offsets locally with a configurable cache limit and a searchable **Cached Songs** list in Settings.
+- **Custom themes, visualizers, and live diagnostics.** Choose from 5 visualizer styles (**Bars, Wave, Dots, Vinyl, Note**), album-art accent or backdrop themes, custom typography, Launch at Login, macOS permission status indicators, and live/average CPU and memory metrics in a 5-tab Settings window (`⌘,`).
 
 ## Install
 
@@ -53,17 +54,20 @@ open -a BarTune
 
 ## Settings (`⌘,`)
 
-BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 3-tab native macOS Settings window:
+BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 5-tab native macOS Settings window:
 
 | Tab | Options |
 | :--- | :--- |
-| **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music toggle |
-| **Appearance** | Color Theme (*System*, *Album Accent*, *Album Tint*), Background Opacity, Font Family, Weight, Size, Karaoke Sweep, Visualizer Style (*Bars / Wave / Dots / Vinyl / Note*) |
-| **Lyrics & Sync** | Japanese → Romaji, Korean → Romanized, Karaoke Precision (*Low CPU* vs *High Precision*), Timing Offset stepper |
+| **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music toggle, Launch at Login, macOS Permission Status, Live & Average CPU/Memory Usage |
+| **Appearance** | Color Theme (*System*, *Album Accent*, *Album Tint*), Background Opacity, Font Family, Weight, Size, Karaoke Sweep Highlight |
+| **Visualizer** | Live Preview, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width, Animation toggle |
+| **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Audio Karaoke Sync (*Off / Apple Speech / Local Whisper*, shared model picker, transcribed-audio overwrite, lyrics-bar sync badge), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
+| **Offline Cache** | Cached song & audio-synced counts, storage usage, cache limit, searchable **Cached Songs** list, Reveal in Finder, Clear Cache |
 
 ## Permissions
 
 - **Automation (Spotify / Apple Music / Browsers):** On first launch, macOS prompts for Automation access so BarTune can read the current track and playback position. Manage this anytime under **System Settings → Privacy & Security → Automation**.
+- **Screen & System Audio Recording & Speech Recognition (Optional):** Only needed if you enable **Audio Karaoke Sync** (*Apple Speech* or *Local Whisper*). BarTune captures system playback audio only — never your microphone.
 - **Browser Music (Optional):** To read playback from YouTube Music or web players, enable **Allow JavaScript from Apple Events** once in your browser:
   - **Chrome / Arc / Brave / Edge:** *View → Developer → Allow JavaScript from Apple Events*
   - **Safari:** *Safari → Settings → Advanced → Show features for web developers*, then *Develop → Allow JavaScript from Apple Events*
