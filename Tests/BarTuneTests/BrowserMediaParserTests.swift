@@ -134,7 +134,7 @@ final class BrowserMediaParserTests: XCTestCase {
         XCTAssertEqual(snapshot?.track?.title, "KICK BACK")
         XCTAssertEqual(snapshot?.track?.duration ?? 0, 195.0, accuracy: 0.001)
         XCTAssertEqual(snapshot?.position ?? 0, 19.0, accuracy: 0.001)
-        XCTAssertEqual(snapshot?.track?.id, "browser:www.youtube.com:Kenshi Yonezu Playlist|CuratorChannel:ch:431")
+        XCTAssertEqual(snapshot?.track?.id, "browser:www.youtube.com:Kenshi Yonezu Playlist|CuratorChannel|d:3600:ch:431")
     }
 
     func testIgnoresChaptersOnShortSingleSongVideos() {
@@ -364,5 +364,29 @@ final class BrowserMediaParserTests: XCTestCase {
             position: 21.0
         )
         XCTAssertEqual(state.liveProgress(at: state.playbackAnchorDate.addingTimeInterval(0.5)), expected, accuracy: 0.001)
+    }
+
+    func testDistinctRecordingsHaveDistinctIDs() throws {
+        let sep = "\u{1F}"
+        func payload(mediaId: String?, duration: String, position: String) -> String {
+            var fields = [
+                "BROWSER", "playing", "browser:www.youtube.com:Example|A", "Example", "A", "", duration, position, "", "", "1",
+            ]
+            if let mediaId { fields.append(mediaId) }
+            return fields.joined(separator: sep)
+        }
+        func id(_ raw: String) throws -> String {
+            try XCTUnwrap(BrowserMediaParser.parsePayload(raw)?.track?.id)
+        }
+
+        let first = try id(payload(mediaId: "aaaaaaaaaaa", duration: "180", position: "10"))
+        let second = try id(payload(mediaId: "bbbbbbbbbbb", duration: "240", position: "10"))
+        XCTAssertNotEqual(first, second)
+        XCTAssertEqual(first, try id(payload(mediaId: "aaaaaaaaaaa", duration: "180", position: "95.5")))
+
+        // Without a media id (e.g. legacy payloads), the rounded duration distinguishes recordings.
+        let shortTake = try id(payload(mediaId: nil, duration: "180.2", position: "10"))
+        XCTAssertNotEqual(shortTake, try id(payload(mediaId: nil, duration: "240", position: "10")))
+        XCTAssertEqual(shortTake, try id(payload(mediaId: nil, duration: "180.2", position: "120")))
     }
 }
