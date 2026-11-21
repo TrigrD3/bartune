@@ -598,7 +598,10 @@ struct SettingsView: View {
                         refreshCacheStats()
                     }
                     Button("Clear Cache", role: .destructive) {
-                        showClearCacheConfirmation = true
+                        refreshCacheStats()
+                        if cachedSongCount > 0 || syncedSongCount > 0 {
+                            showClearCacheConfirmation = true
+                        }
                     }
                     .disabled(cachedSongCount == 0 && syncedSongCount == 0)
                 }
