@@ -617,4 +617,260 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(result.lines[1].timestamp, firstEnd)
         XCTAssertGreaterThanOrEqual(result.lines[2].timestamp, secondEnd)
     }
+
+    func testCachedRecordReliabilityRejectsIncompleteTranscriptCache() {
+        let twoMatchedLines = [
+            LyricLine(id: 0, timestamp: 1.0, text: "First matched line"),
+            LyricLine(id: 1, timestamp: 5.0, text: "Second matched line"),
+        ]
+
+        // Transcript-only mode omits unmatched lines; 2 matched lines of a 40-line song must NOT be reliable.
+        let partialTranscript = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:partial-transcript-2-of-40",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: 0.1,
+            alignedLineCount: 2,
+            sourceLineCount: 40,
+            lines: twoMatchedLines
+        )
+        XCTAssertFalse(partialTranscript.isReliable)
+
+        // Complete transcript covering all source lines remains reliable.
+        let completeTranscript = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:complete-transcript",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: 0.1,
+            alignedLineCount: 2,
+            sourceLineCount: 2,
+            lines: twoMatchedLines
+        )
+        XCTAssertTrue(completeTranscript.isReliable)
+
+        // Legacy cache (sourceLineCount == nil) with fewer lines than raw source must be rejected when validated.
+        let legacyPartial = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:legacy-partial",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: 0.1,
+            alignedLineCount: 2,
+            sourceLineCount: nil,
+            lines: twoMatchedLines
+        )
+        XCTAssertFalse(legacyPartial.isReliable(expectedSourceLineCount: 10))
+        XCTAssertTrue(legacyPartial.isReliable(expectedSourceLineCount: 2))
+    }
+
+    @MainActor
+    func testAlignClampsBlankFallbackLinesMonotonically() throws {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "alpha beta"),
+            LyricLine(id: 1, timestamp: 11.0, text: ""),
+            LyricLine(id: 2, timestamp: 11.05, text: "   "),
+            LyricLine(id: 3, timestamp: 14.0, text: "gamma delta"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 11.2, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "beta", startTime: 11.5, duration: 0.2, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        XCTAssertEqual(result.lines.count, 4)
+
+        let firstEnd = result.lines[0].timestamp + (result.lines[0].duration ?? 0)
+        XCTAssertGreaterThanOrEqual(result.lines[1].timestamp, firstEnd)
+        XCTAssertGreaterThan(result.lines[1].timestamp, result.lines[0].timestamp)
+        XCTAssertGreaterThan(result.lines[2].timestamp, result.lines[1].timestamp)
+        XCTAssertGreaterThan(result.lines[3].timestamp, result.lines[2].timestamp)
+
+        // Binary search in LyricsState must select line 0 at 11.25s instead of the blank line.
+        let suiteName = "bartune.test.blankmonotonic.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let state = LyricsState(userDefaults: ud)
+        let track = TrackInfo(
+            id: "spotify:track:blank-monotonic",
+            title: "Song",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            artworkURL: nil
+        )
+        state.setTrack(track, lyrics: result.lines)
+        state.updatePlayback(isPlaying: true, position: 11.25)
+        XCTAssertEqual(state.currentLineId, 0)
+        XCTAssertEqual(state.currentText, "alpha beta")
+    }
+
+    func testAlignWordInterpolationStaysMonotonicInTightAndOverlappingGaps() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "We are the champions"),
+        ]
+
+        // Tight gap: 0.04s between "we" end (10.20) and "champions" start (10.24) for 2 missing words.
+        let tightRecognized = [
+            RecognizedAudioWord(text: "we", startTime: 10.0, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "champions", startTime: 10.24, duration: 0.5, confidence: 0.95),
+        ]
+        let tightResult = LyricsAudioAligner.align(lines: lines, recognizedWords: tightRecognized)
+        let tightWords = tightResult.lines[0].words
+        XCTAssertEqual(tightWords.count, 4)
+        for idx in 0..<(tightWords.count - 1) {
+            XCTAssertLessThanOrEqual(tightWords[idx].timestamp, tightWords[idx + 1].timestamp + 0.0001)
+        }
+        // Interpolated words must not extend past the following word's start.
+        XCTAssertLessThanOrEqual(tightWords[1].timestamp + (tightWords[1].duration ?? 0), tightWords[2].timestamp + 0.0001)
+        XCTAssertLessThanOrEqual(tightWords[2].timestamp + (tightWords[2].duration ?? 0), tightWords[3].timestamp + 0.0001)
+
+        // Overlapping anchors: "we" ends at 10.35 while "champions" starts at 10.20.
+        let overlappingRecognized = [
+            RecognizedAudioWord(text: "we", startTime: 10.0, duration: 0.35, confidence: 0.9),
+            RecognizedAudioWord(text: "champions", startTime: 10.20, duration: 0.5, confidence: 0.95),
+        ]
+        let overlapResult = LyricsAudioAligner.align(lines: lines, recognizedWords: overlappingRecognized)
+        let overlapWords = overlapResult.lines[0].words
+        XCTAssertEqual(overlapWords.count, 4)
+        for idx in 0..<(overlapWords.count - 1) {
+            XCTAssertLessThanOrEqual(overlapWords[idx].timestamp, overlapWords[idx + 1].timestamp + 0.0001)
+        }
+        XCTAssertLessThanOrEqual(overlapWords[2].timestamp + (overlapWords[2].duration ?? 0), overlapWords[3].timestamp + 0.0001)
+        // The first anchor's recognized duration must be capped by the next word's start.
+        XCTAssertLessThanOrEqual(overlapWords[0].timestamp + (overlapWords[0].duration ?? 0), overlapWords[1].timestamp + 0.0001)
+    }
+
+    func testCachedRecordReliabilityRejectsOutOfOrderBlankLines() {
+        // Caches written before blank lines were clamped can hold a blank marker behind the previous lyric.
+        let record = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:legacy-blank-order",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 2,
+            sourceLineCount: 2,
+            lines: [
+                LyricLine(id: 0, timestamp: 10.0, text: "first lyric"),
+                LyricLine(id: 1, timestamp: 9.0, text: ""),
+                LyricLine(id: 2, timestamp: 14.0, text: "second lyric"),
+            ]
+        )
+        XCTAssertFalse(record.isReliable)
+    }
+
+    func testAlignKeepsRecognizedStartAfterClampedBlankLine() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "alpha"),
+            LyricLine(id: 1, timestamp: 10.1, text: ""),
+            LyricLine(id: 2, timestamp: 10.45, text: "beta"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 10.0, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "beta", startTime: 10.45, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        XCTAssertEqual(result.lines.count, 3)
+        XCTAssertEqual(result.matchedLineCount, 2)
+        XCTAssertGreaterThan(result.lines[1].timestamp, result.lines[0].timestamp)
+        XCTAssertGreaterThan(result.lines[2].timestamp, result.lines[1].timestamp)
+        // The blank marker keeps order without imposing full lyric spacing on the next recognized line.
+        XCTAssertEqual(result.lines[2].timestamp, 10.45, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testOfflineRecoveryUsesCachedAudioSyncedLyricsWhenRawLyricsEvicted() throws {
+        let suiteName = "bartune.test.offlinerecovery.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let state = LyricsState(userDefaults: ud)
+        state.audioSyncEngine = .whisper
+
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let track = TrackInfo(
+            id: "spotify:track:offline-synced-recovery",
+            title: "Night Run",
+            artist: "Artist",
+            album: "Album",
+            duration: 180,
+            artworkURL: nil
+        )
+        let cachedLines = [
+            LyricLine(
+                id: 0,
+                timestamp: 5.0,
+                duration: 2.0,
+                text: "闇夜を駆け抜けて",
+                words: [
+                    WordTimestamp(timestamp: 5.0, duration: 1.0, text: "闇夜を"),
+                    WordTimestamp(timestamp: 6.0, duration: 1.0, text: "駆け抜けて"),
+                ]
+            ),
+            LyricLine(
+                id: 1,
+                timestamp: 9.0,
+                duration: 2.0,
+                text: "どこへ向かう",
+                words: [
+                    WordTimestamp(timestamp: 9.0, duration: 1.0, text: "どこへ"),
+                    WordTimestamp(timestamp: 10.0, duration: 1.0, text: "向かう"),
+                ]
+            ),
+        ]
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: track.id,
+                engine: .whisper,
+                syncedAt: Date(),
+                medianOffset: 0.2,
+                alignedLineCount: 2,
+                sourceLineCount: 2,
+                lines: cachedLines
+            )
+        )
+
+        // Simulate raw lyrics evicted from disk cache while offline.
+        state.romanizeJapanese = true
+        state.setTrack(track, lyrics: [])
+        XCTAssertFalse(state.hasLyrics)
+
+        let manager = AudioSyncManager(state: state, cache: cache)
+        manager.handleTrackLoaded(track: track, rawLines: [])
+
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
+        XCTAssertEqual(state.rawLyricLines, cachedLines)
+        XCTAssertTrue(state.hasLyrics)
+        state.updatePlayback(isPlaying: true, position: 5.5)
+        XCTAssertEqual(state.currentLineId, 0)
+        XCTAssertFalse(state.currentText.isEmpty)
+        XCTAssertNotEqual(state.currentText, cachedLines[0].text)
+
+        // When engine is .off, offline cache recovery must not run.
+        state.audioSyncEngine = .off
+        state.setTrack(track, lyrics: [])
+        manager.handleTrackLoaded(track: track, rawLines: [])
+        XCTAssertEqual(state.audioSyncStatus, .idle)
+        XCTAssertFalse(state.hasLyrics)
+
+        // Unreliable surviving cache (e.g. partial transcript) must be evicted rather than applied offline.
+        state.audioSyncEngine = .whisper
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: track.id,
+                engine: .whisper,
+                syncedAt: Date(),
+                medianOffset: 0.2,
+                alignedLineCount: 2,
+                sourceLineCount: 20,
+                lines: cachedLines
+            )
+        )
+        state.setTrack(track, lyrics: [])
+        manager.handleTrackLoaded(track: track, rawLines: [])
+        XCTAssertEqual(state.audioSyncStatus, .idle)
+        XCTAssertFalse(state.hasLyrics)
+        XCTAssertNil(cache.load(trackId: track.id))
+    }
 }

@@ -754,15 +754,19 @@ final class LyricsState: ObservableObject {
     func applyAudioSyncedLines(_ lines: [LyricLine]) {
         guard !lines.isEmpty else { return }
         rawLines = lines
-        if isJapaneseSong {
-            romanizedLines = Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine)
-        }
-        if isKoreanSong {
-            koreanRomanizedLines = Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
-        }
-        if isChineseSong {
-            chineseRomanizedLines = Self.romanizeLines(lines, using: ChineseRomanizer.romanizeLine)
-        }
+        hasLyrics = true
+        isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lines)
+        isKoreanSong = KoreanRomanizer.isKoreanTrack(lines)
+        isChineseSong = ChineseRomanizer.isChineseTrack(lines)
+        romanizedLines = isJapaneseSong
+            ? Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine)
+            : []
+        koreanRomanizedLines = isKoreanSong
+            ? Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
+            : []
+        chineseRomanizedLines = isChineseSong
+            ? Self.romanizeLines(lines, using: ChineseRomanizer.romanizeLine)
+            : []
         if !translationsById.isEmpty {
             translatedLines = Self.projectTranslatedLines(
                 translationsById,

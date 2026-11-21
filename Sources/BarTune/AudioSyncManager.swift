@@ -282,27 +282,37 @@ final class AudioSyncManager {
         baseLines = rawLines
         recognizedWords = []
 
-        guard !rawLines.isEmpty else {
-            state.audioSyncStatus = .idle
-            return
-        }
-
         let engine = state.audioSyncEngine
         guard engine != .off else {
             state.audioSyncStatus = .idle
             return
         }
 
+        let rawNonEmptyCount = rawLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        let expectedSourceLineCount = rawNonEmptyCount > 0 ? rawNonEmptyCount : nil
+
         if forceResync {
-            cache.remove(trackId: track.id)
+            if !rawLines.isEmpty {
+                cache.remove(trackId: track.id)
+            }
         } else if let cached = cache.load(trackId: track.id) {
-            if cached.isReliable {
+            if cached.isReliable(expectedSourceLineCount: expectedSourceLineCount) {
+                if baseLines.isEmpty {
+                    baseLines = cached.lines
+                }
                 state.applyAudioSyncedLines(cached.lines)
                 state.audioSyncStatus = .cached(cached.engine)
                 return
             }
             cache.remove(trackId: track.id)
-        } else if !state.replaceLyricsWithTranscription, Self.hasPreexistingWordSync(rawLines) {
+        }
+
+        guard !rawLines.isEmpty else {
+            state.audioSyncStatus = .idle
+            return
+        }
+
+        if !forceResync, !state.replaceLyricsWithTranscription, Self.hasPreexistingWordSync(rawLines) {
             state.audioSyncStatus = .cached(engine)
             return
         }
