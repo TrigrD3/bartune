@@ -240,6 +240,16 @@ enum BrowserMediaParser {
         return min(max(rate, 0), maxPlaybackRate)
     }
 
+    /// Appends a recording-specific part (media URL id, else rounded duration) so same-titled recordings differ.
+    static func recordingTrackId(baseId: String, mediaId: String, duration: Double) -> String {
+        let media = mediaId.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !media.isEmpty {
+            return "\(baseId)|v:\(media)"
+        }
+        guard duration.isFinite, duration > 0, let seconds = Int(exactly: duration.rounded()) else { return baseId }
+        return "\(baseId)|d:\(seconds)"
+    }
+
     static func parsePayload(_ raw: String, sourceBundleId: String? = nil) -> PlaybackSnapshot? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "IDLE" else { return nil }
@@ -269,6 +279,8 @@ enum BrowserMediaParser {
 
         let isStandardYouTube = trackId.hasPrefix("browser:www.youtube.com:")
             || trackId.hasPrefix("browser:youtube.com:")
+        let mediaId = parts.count >= 12 ? parts[11] : ""
+        trackId = recordingTrackId(baseId: trackId, mediaId: mediaId, duration: durationSec)
 
         if isStandardYouTube,
            parts.count >= 10,
@@ -332,7 +344,7 @@ final class BrowserMediaMonitor: @unchecked Sendable {
     // plus active <video>/<audio> currentTime and duration, and YouTube chapter markers for long videos.
     // Re-validates location protocol/hostname/pathname inside the document to prevent TOCTOU navigation races.
     static let jsProbe: String = """
-    (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})||((h==='youtube.com'||h==='www.youtube.com')&&(location.pathname==='/watch'||location.pathname.indexOf('/watch/')===0));if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}var id='browser:'+h+':'+t+'|'+a;var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate)].join(s);}catch(e){return 'IDLE';}})()
+    (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})||((h==='youtube.com'||h==='www.youtube.com')&&(location.pathname==='/watch'||location.pathname.indexOf('/watch/')===0));if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}var id='browser:'+h+':'+t+'|'+a;var rid=new URLSearchParams(location.search).get('v')||'';var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate),rid].join(s);}catch(e){return 'IDLE';}})()
     """
 
     private static let escapedJS: String = jsProbe
