@@ -10,7 +10,12 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/TrigrD3/bartune/releases/latest"><img src="https://img.shields.io/github/v/release/TrigrD3/bartune?label=Release" alt="Latest Release" /></a>
   <a href="https://github.com/TrigrD3/bartune/actions/workflows/ci.yml"><img src="https://github.com/TrigrD3/bartune/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/TrigrD3/bartune/actions/workflows/codeql.yml"><img src="https://github.com/TrigrD3/bartune/actions/workflows/codeql.yml/badge.svg" alt="CodeQL" /></a>
+  <a href="https://github.com/TrigrD3/bartune/actions/workflows/secret-scan.yml"><img src="https://github.com/TrigrD3/bartune/actions/workflows/secret-scan.yml/badge.svg" alt="Secret Scan" /></a>
+  <a href="https://coderabbit.ai"><img src="https://img.shields.io/coderabbit/prs/github/TrigrD3/bartune?utm_source=oss&utm_medium=github&utm_campaign=TrigrD3%2Fbartune&labelColor=171717&color=FF570A&label=CodeRabbit" alt="CodeRabbit Pull Request Reviews" /></a>
+  <br/>
   <img src="https://img.shields.io/badge/macOS-13.0%2B-black?logo=apple" alt="macOS 13+" />
   <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white" alt="Swift 5.9+" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
