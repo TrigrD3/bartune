@@ -14,6 +14,11 @@ permissions:
   contents: read
   issues: write
 
+# One run at a time per issue; each run re-reads the issue, so a superseded pending run loses nothing.
+concurrency:
+  group: issue-severity-${{ github.event.issue.number || inputs.issue_number || 'backfill' }}
+  cancel-in-progress: false
+
 jobs:
   label-severity:
     name: Label Issue Severity
@@ -28,6 +33,7 @@ jobs:
         with:
           script: |
             const {
+              ALL_SEVERITY_LABEL_NAMES,
               SEVERITY_LABELS,
               resolveIssueSeverity,
             } = await import(`${process.env.GITHUB_WORKSPACE}/.github/scripts/classify-issue-severity.mjs`);
@@ -54,13 +60,26 @@ jobs:
               }
             }
 
-            async function processIssue(issue) {
+            async function processIssue(issueNumber, { skipIfLabeled = false } = {}) {
+              // Classify the current state, not the event payload, which may be stale.
+              const { data: issue } = await github.rest.issues.get({
+                owner,
+                repo,
+                issue_number: issueNumber,
+              });
               if (issue.pull_request) {
                 return;
               }
               const labels = (issue.labels || []).map((l) =>
                 typeof l === 'string' ? l : l.name,
               );
+              if (
+                skipIfLabeled &&
+                labels.some((l) => ALL_SEVERITY_LABEL_NAMES.includes(l.toLowerCase()))
+              ) {
+                core.info(`#${issue.number}: already has a severity label, skipped`);
+                return;
+              }
               const result = resolveIssueSeverity({
                 title: issue.title || '',
                 body: issue.body || '',
@@ -107,17 +126,12 @@ jobs:
             if (context.eventName === 'workflow_dispatch') {
               const rawNumber = context.payload.inputs?.issue_number?.trim();
               if (rawNumber) {
-                const issueNumber = Number.parseInt(rawNumber, 10);
-                if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
+                const issueNumber = /^\d+$/.test(rawNumber) ? Number(rawNumber) : NaN;
+                if (!Number.isSafeInteger(issueNumber) || issueNumber <= 0) {
                   core.setFailed(`Invalid issue_number input: "${rawNumber}"`);
                   return;
                 }
-                const { data: issue } = await github.rest.issues.get({
-                  owner,
-                  repo,
-                  issue_number: issueNumber,
-                });
-                await processIssue(issue);
+                await processIssue(issueNumber);
               } else {
                 const issues = await github.paginate(
                   github.rest.issues.listForRepo,
@@ -129,9 +143,11 @@ jobs:
                   },
                 );
                 for (const issue of issues) {
-                  await processIssue(issue);
+                  if (!issue.pull_request) {
+                    await processIssue(issue.number, { skipIfLabeled: true });
+                  }
                 }
               }
             } else if (context.payload.issue) {
-              await processIssue(context.payload.issue);
+              await processIssue(context.payload.issue.number);
             }
