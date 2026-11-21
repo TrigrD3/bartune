@@ -241,6 +241,20 @@ struct LyricsOverlayView: View {
         }
     }
 
+    private func syncBadgeForegroundColor(isSynced: Bool) -> Color {
+        if isSynced {
+            return state.themeMode == .albumTint ? Color.white : Color.green
+        }
+        return state.themeMode == .albumTint ? Color.white.opacity(0.85) : Color.secondary
+    }
+
+    private func syncBadgeBackgroundColor(isSynced: Bool) -> Color {
+        if isSynced {
+            return state.themeMode == .albumTint ? Color.white.opacity(0.18) : Color.green.opacity(0.14)
+        }
+        return state.themeMode == .albumTint ? Color.white.opacity(0.12) : Color.primary.opacity(0.08)
+    }
+
     var body: some View {
         ZStack(alignment: .leading) {
             activeBackdropColor
@@ -275,8 +289,20 @@ struct LyricsOverlayView: View {
                     removal: .opacity.combined(with: .offset(y: -6))
                 ))
                 .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
+
+                if state.showSyncBadge, let badge = state.audioSyncStatus.overlayBadge {
+                    SyncStatusBadgeView(
+                        badge: badge,
+                        foreground: syncBadgeForegroundColor(isSynced: badge.isSynced),
+                        background: syncBadgeBackgroundColor(isSynced: badge.isSynced),
+                        lowCPUMode: state.lowCPUMode
+                    )
+                    .fixedSize()
+                    .transition(.opacity.combined(with: .scale(scale: 0.92)))
+                }
             }
             .padding(.horizontal, 10)
+            .animation(.easeInOut(duration: 0.2), value: state.audioSyncStatus.overlayBadge)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -288,5 +314,54 @@ struct LyricsOverlayView: View {
             )
         )
         .animation(.easeOut(duration: 0.08), value: state.cursorLocalX == nil)
+    }
+}
+
+private struct SyncStatusBadgeView: View {
+    let badge: OverlaySyncBadge
+    let foreground: Color
+    let background: Color
+    let lowCPUMode: Bool
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: lowCPUMode ? 0.30 : 0.12, paused: badge.isSynced)) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            let pulse = badge.isSynced ? 1.0 : (0.55 + 0.45 * abs(sin(t * 3.2)))
+            let iconScale = badge.isSynced ? 1.0 : (0.88 + 0.16 * abs(sin(t * 3.2)))
+            let dotPhase = Int(t * 2.2) % 3
+
+            HStack(spacing: 3) {
+                Image(systemName: badge.symbolName)
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .scaleEffect(iconScale)
+                    .opacity(pulse)
+
+                Text(badge.text)
+                    .font(.system(size: 10, weight: .medium))
+
+                if !badge.isSynced {
+                    HStack(spacing: 1.5) {
+                        ForEach(0..<3, id: \.self) { idx in
+                            Circle()
+                                .fill(foreground)
+                                .frame(width: 2.2, height: 2.2)
+                                .opacity(idx == dotPhase ? 1.0 : 0.30)
+                        }
+                    }
+                    .padding(.leading, 1)
+                }
+            }
+            .foregroundStyle(foreground)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(background)
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(foreground.opacity(badge.isSynced ? 0.28 : (0.18 + 0.22 * pulse)), lineWidth: 0.5)
+            )
+        }
     }
 }

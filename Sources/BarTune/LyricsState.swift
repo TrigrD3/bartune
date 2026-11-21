@@ -225,6 +225,7 @@ final class LyricsState: ObservableObject {
         static let audioSyncEngine = "bartune.audioSyncEngine"
         static let whisperModelPath = "bartune.whisperModelPath"
         static let replaceLyricsWithTranscription = "bartune.replaceLyricsWithTranscription"
+        static let showSyncBadge = "bartune.showSyncBadge"
     }
 
     private static let maxStoredOffsets = 500
@@ -373,6 +374,10 @@ final class LyricsState: ObservableObject {
         didSet { userDefaults.set(replaceLyricsWithTranscription, forKey: Keys.replaceLyricsWithTranscription) }
     }
 
+    @Published var showSyncBadge: Bool {
+        didSet { userDefaults.set(showSyncBadge, forKey: Keys.showSyncBadge) }
+    }
+
     @Published var lyricsCacheLimit: LyricsCacheLimit {
         didSet {
             userDefaults.set(lyricsCacheLimit.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
@@ -511,6 +516,7 @@ final class LyricsState: ObservableObject {
         }
         self.whisperModelPath = ud.string(forKey: Keys.whisperModelPath) ?? ""
         self.replaceLyricsWithTranscription = ud.object(forKey: Keys.replaceLyricsWithTranscription) as? Bool ?? false
+        self.showSyncBadge = ud.object(forKey: Keys.showSyncBadge) as? Bool ?? true
         let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
         self.lyricsCacheLimit = LyricsCacheLimit(rawValue: storedLimit) ?? .songs1000
         self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
