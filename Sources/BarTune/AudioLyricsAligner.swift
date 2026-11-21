@@ -731,16 +731,17 @@ enum LyricsAudioAligner {
                             )
                         }
                         let transcribedText = transcribedWords.map(\.text).joined()
-                        let actualWordEnd = windowWords.last?.endTime ?? shiftedEnd
+                        let actualWordEnd = windowWords.map(\.endTime).max() ?? shiftedEnd
                         let clampedEnd = nextShiftedStart > startTs + 0.3 ? min(actualWordEnd, nextShiftedStart) : actualWordEnd
+                        let emittedDuration = max(0.3, clampedEnd - startTs)
                         lastConsumedWordEnd = max(lastConsumedWordEnd, actualWordEnd + 0.01)
-                        previousLineEnd = max(previousLineEnd, clampedEnd)
+                        previousLineEnd = max(previousLineEnd, startTs + emittedDuration)
                         previousEmittedTimestamp = startTs
                         alignedLines.append(
                             LyricLine(
                                 id: line.id,
                                 timestamp: startTs,
-                                duration: max(0.3, clampedEnd - startTs),
+                                duration: emittedDuration,
                                 text: transcribedText,
                                 words: transcribedWords
                             )
@@ -768,7 +769,7 @@ enum LyricsAudioAligner {
                     matchedLineCount += 1
                     matchedWordCount += matches.count
                     lastConsumedWordEnd = max(lastConsumedWordEnd, actualMatchedEnd + 0.01)
-                    previousLineEnd = max(previousLineEnd, clampedEnd)
+                    previousLineEnd = max(previousLineEnd, newLineStart + newDuration)
                     previousEmittedTimestamp = newLineStart
 
                     alignedLines.append(
@@ -803,6 +804,11 @@ enum LyricsAudioAligner {
 
             if isNonEmpty {
                 previousEmittedTimestamp = fallbackStart
+                if let dur = line.duration {
+                    previousLineEnd = max(previousLineEnd, fallbackStart + max(0.25, dur))
+                } else {
+                    previousLineEnd = max(previousLineEnd, fallbackStart + 0.25)
+                }
             }
             alignedLines.append(
                 LyricLine(
