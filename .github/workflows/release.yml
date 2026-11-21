@@ -15,6 +15,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   # Fail-closed docs-only PR filter (adapted from pasrom/meeting-transcriber).
   changes:
