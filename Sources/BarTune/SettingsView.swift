@@ -41,6 +41,8 @@ struct SettingsView: View {
     @State private var cachedBytes: Int64 = 0
     @State private var syncedSongCount: Int = 0
     @State private var syncedBytes: Int64 = 0
+    @State private var cachedSongs: [CachedSongSummary] = []
+    @State private var cacheSearchQuery: String = ""
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
     @State private var whisperCLIFound: Bool = false
     @State private var isDownloadingModel: Bool = false
@@ -331,6 +333,14 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
 
                 if state.audioSyncEngine != .off {
+                    Toggle("Replace Lyrics with Transcribed Audio", isOn: $state.replaceLyricsWithTranscription)
+
+                    Text(
+                        "Permanently saves the words recognized from audio (e.g. actual Japanese pronunciation) into the sync cache so repeat plays load with zero recalculation."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                     HStack {
                         Text("Status")
                         Spacer()
@@ -515,6 +525,65 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            Section("Cached Songs (\(filteredCachedSongs.count))") {
+                if cachedSongs.isEmpty {
+                    Text("No cached songs yet. Songs appear here automatically as you play them.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    TextField("Filter cached songs…", text: $cacheSearchQuery)
+                        .textFieldStyle(.roundedBorder)
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(filteredCachedSongs) { song in
+                                HStack(spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(song.title)
+                                            .font(.callout.weight(.medium))
+                                            .lineLimit(1)
+                                            .truncationMode(.tail)
+                                        HStack(spacing: 6) {
+                                            if !song.artist.isEmpty {
+                                                Text(song.artist)
+                                                    .lineLimit(1)
+                                                    .truncationMode(.tail)
+                                            }
+                                            Text("\(song.lineCount) lines")
+                                        }
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    }
+
+                                    Spacer(minLength: 4)
+
+                                    if let engine = song.syncEngine {
+                                        Label(engine.title, systemImage: "checkmark.circle.fill")
+                                            .font(.caption2.weight(.medium))
+                                            .foregroundStyle(.green)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.green.opacity(0.14)))
+                                    }
+
+                                    Button(role: .destructive) {
+                                        deleteCachedSong(song)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.caption)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .help("Remove from cache")
+                                }
+                                .padding(.vertical, 2)
+                                Divider()
+                            }
+                        }
+                    }
+                    .frame(height: 170)
+                }
+            }
         }
         .formStyle(.grouped)
         .onAppear {
@@ -547,6 +616,20 @@ struct SettingsView: View {
         return ByteCountFormatter.string(fromByteCount: syncedBytes, countStyle: .file)
     }
 
+    private var filteredCachedSongs: [CachedSongSummary] {
+        let query = cacheSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return cachedSongs }
+        return cachedSongs.filter {
+            $0.title.lowercased().contains(query) || $0.artist.lowercased().contains(query)
+        }
+    }
+
+    private func deleteCachedSong(_ song: CachedSongSummary) {
+        LyricsDiskCache.default.removeByCacheKey(song.cacheKey)
+        AudioSyncedLyricsCache.default.removeByCacheKey(song.cacheKey)
+        refreshCacheStats()
+    }
+
     private func refreshCacheStats() {
         let stats = LyricsDiskCache.default.stats()
         cachedSongCount = stats.count
@@ -554,6 +637,7 @@ struct SettingsView: View {
         let syncStats = AudioSyncedLyricsCache.default.stats()
         syncedSongCount = syncStats.count
         syncedBytes = syncStats.bytes
+        cachedSongs = LyricsDiskCache.default.listEntries(audioSyncCache: .default)
     }
 
     private func refreshWhisperDiscovery() {
