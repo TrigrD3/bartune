@@ -61,4 +61,13 @@ final class LRCParserTests: XCTestCase {
         XCTAssertEqual(lines[0].words.map(\.timestamp), [10.25, 10.75])
         XCTAssertEqual(lines[1].words.map(\.timestamp), [30.25, 30.75])
     }
+
+    func testYRCWordPreservesLiteralParentheses() {
+        let lines = YRCParser.parse("[1000,1000](1000,500,0)Hi (echo) (1500,500,0)there")
+
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(lines[0].words.map(\.text), ["Hi (echo) ", "there"])
+        XCTAssertEqual(lines[0].words.map(\.timestamp), [1.0, 1.5])
+        XCTAssertEqual(lines[0].text, "Hi (echo) there")
+    }
 }
