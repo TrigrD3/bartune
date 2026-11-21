@@ -1,0 +1,43 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+early_access: false
+
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  collapse_walkthrough: true
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - main
+  path_instructions:
+    - path: "Sources/BarTune/**/*.swift"
+      instructions: |
+        Target macOS 13+ with Swift 5.9+. Flag any destructive or irreversible UI
+        action that lacks a confirmation alert, any non-locale-safe AppleScript
+        number parsing (comma decimals), main-thread blocking I/O, or Swift 6
+        concurrency/Sendable hazards.
+    - path: "Tests/BarTuneTests/**/*.swift"
+      instructions: |
+        Ensure tests verify behavior with non-default inputs and do not depend
+        on local machine paths or live network access.
+    - path: ".github/workflows/**/*.yml"
+      instructions: |
+        Verify explicit least-privilege permissions blocks and pinned action
+        versions, and ensure no secrets or local paths can leak.
+  tools:
+    gitleaks:
+      enabled: true
+    actionlint:
+      enabled: true
+    shellcheck:
+      enabled: true
+    yamllint:
+      enabled: true
+
+chat:
+  auto_reply: true
