@@ -63,9 +63,14 @@ enum LRCParser {
     private static let wordTagRegex = try! NSRegularExpression(
         pattern: #"<(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?>"#
     )
+    private static let offsetTagRegex = try! NSRegularExpression(
+        pattern: #"^\[offset:\s*([+-]?\d+)\s*\]$"#,
+        options: .caseInsensitive
+    )
 
     static func parse(_ lrc: String) -> [LyricLine] {
         var entries: [(Double, String, [WordTimestamp])] = []
+        var offsetSeconds = 0.0
 
         for rawLine in lrc.components(separatedBy: .newlines) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -73,6 +78,12 @@ enum LRCParser {
 
             let nsLine = line as NSString
             let fullRange = NSRange(location: 0, length: nsLine.length)
+            if let offsetMatch = offsetTagRegex.firstMatch(in: line, range: fullRange),
+               let offsetMs = Double(nsLine.substring(with: offsetMatch.range(at: 1))) {
+                offsetSeconds = offsetMs / 1000.0
+                continue
+            }
+
             let matches = lineTagRegex.matches(in: line, range: fullRange)
             guard !matches.isEmpty else { continue }
 
@@ -98,8 +109,11 @@ enum LRCParser {
 
         entries.sort { $0.0 < $1.0 }
 
+        // A positive [offset:] makes lyrics appear sooner, per LRC convention.
+        let shift = { (ts: Double) in max(0, ts - offsetSeconds) }
         return entries.enumerated().map { idx, item in
-            LyricLine(id: idx, timestamp: item.0, text: item.1, words: item.2)
+            let words = item.2.map { WordTimestamp(timestamp: shift($0.timestamp), duration: $0.duration, text: $0.text) }
+            return LyricLine(id: idx, timestamp: shift(item.0), text: item.1, words: words)
         }
     }
 
