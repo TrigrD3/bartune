@@ -356,7 +356,7 @@ final class AudioSyncManager {
     private var activeTrackId: String?
     private var activeSourceBundleId: String?
     private var baseLines: [LyricLine] = []
-    private var recognizedWords: [RecognizedAudioWord] = []
+    private(set) var recognizedWords: [RecognizedAudioWord] = []
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
 
@@ -364,7 +364,10 @@ final class AudioSyncManager {
     private var speechRecognizer: SpeechRecognizing?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SpeechRecognitionTaskHandling?
-    private var speechStreamAnchorPos: Double = 0
+    /// Track position at each stream time where playback (re)started; a same-track seek appends one.
+    private var speechTimelineAnchors: [(streamTime: Double, trackPosition: Double)] = []
+    private var speechStreamDuration: Double = 0
+    private static let seekTolerance: Double = 2.0
     private var speechAudioFormat: AVAudioFormat?
 
     // Whisper chunk state
@@ -489,10 +492,26 @@ final class AudioSyncManager {
         return []
     }
 
-    func handlePlaybackStateChanged(isPlaying: Bool) {
+    func handlePlaybackStateChanged(isPlaying: Bool, position: Double) {
+        if isPlaying {
+            reanchorSpeechTimelineIfSeeked(to: position)
+        }
         guard !isPlaying, isLiveSyncActive else { return }
         // Persist whatever alignment we gathered before pausing/stopping.
         persistCurrentAlignmentIfReady()
+    }
+
+    private func reanchorSpeechTimelineIfSeeked(to position: Double) {
+        guard isLiveSyncActive, speechRequest != nil, let anchor = speechTimelineAnchors.last else { return }
+        let expected = anchor.trackPosition + (speechStreamDuration - anchor.streamTime)
+        guard abs(position - expected) > Self.seekTolerance else { return }
+        speechTimelineAnchors.append((streamTime: speechStreamDuration, trackPosition: position))
+    }
+
+    private func trackPosition(forSpeechStreamTime streamTime: Double) -> Double {
+        guard let anchor = speechTimelineAnchors.last(where: { $0.streamTime <= streamTime }) ?? speechTimelineAnchors.first
+        else { return streamTime }
+        return anchor.trackPosition + (streamTime - anchor.streamTime)
     }
 
     func resyncCurrentTrack() {
@@ -587,7 +606,8 @@ final class AudioSyncManager {
         let anchorPos = currentPlaybackPosition()
         speechRecognizer = recognizer
         speechRequest = request
-        speechStreamAnchorPos = anchorPos
+        speechTimelineAnchors = [(streamTime: 0, trackPosition: anchorPos)]
+        speechStreamDuration = 0
         speechAudioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
 
         state.audioSyncStatus = .syncing(engine: .appleSpeech, alignedLines: 0, totalLines: lines.count)
@@ -603,7 +623,7 @@ final class AudioSyncManager {
                     let words: [RecognizedAudioWord] = segments.map { seg in
                         RecognizedAudioWord(
                             text: seg.substring,
-                            startTime: self.speechStreamAnchorPos + seg.timestamp,
+                            startTime: self.trackPosition(forSpeechStreamTime: seg.timestamp),
                             duration: max(0.05, seg.duration),
                             confidence: Double(seg.confidence)
                         )
@@ -652,6 +672,9 @@ final class AudioSyncManager {
                     }
                 }
                 req.append(buffer)
+                if sampleRate > 0 {
+                    self.speechStreamDuration += Double(samples.count) / sampleRate
+                }
             }
         }
 

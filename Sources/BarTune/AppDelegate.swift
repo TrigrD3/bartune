@@ -273,7 +273,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             position: snapshot.position,
             playbackRate: snapshot.playbackRate
         )
-        audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying)
+        audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying, position: snapshot.position)
     }
 
     private func restartAudioSyncForCurrentTrack() {
