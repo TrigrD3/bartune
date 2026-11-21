@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1](https://github.com/TrigrD3/bartune/compare/v0.4.0...v0.4.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* **ci:** read fresh issue state and validate input in severity labeler ([f72b9c0](https://github.com/TrigrD3/bartune/commit/f72b9c03a9d78227fc255167ab2e813748ce9cae))
+
+
+### Documentation
+
+* **docs:** standardize issue forms on [Bug]/[Feature] titles ([913267c](https://github.com/TrigrD3/bartune/commit/913267c6dfff6bc2b9ba00b100d63c0d390a6d05))
+
 ## [0.4.0](https://github.com/TrigrD3/bartune/compare/v0.3.0...v0.4.0) (2026-11-21)
 
 
