@@ -26,4 +26,33 @@ final class SpotifyMonitorTests: XCTestCase {
         XCTAssertEqual(try run(source), "SPOTIFY")
         XCTAssertEqual(try run(SpotifyMonitor.nativePlayerScriptSource(playerBlocks: [])), "IDLE")
     }
+
+    func testBrowserSnapshotNeverTargetsNativeTransport() {
+        let runningSets: [Set<String>] = [
+            ["com.apple.Music"],
+            ["com.spotify.client"],
+            ["com.spotify.client", "com.apple.Music"],
+        ]
+        for command in [PlaybackCommand.playPause, .nextTrack, .previousTrack] {
+            for running in runningSets {
+                XCTAssertNil(SpotifyMonitor.transportScriptSource(
+                    for: command,
+                    activeTrackId: "browser:www.youtube.com:Example|A",
+                    runningBundleIds: running
+                ))
+            }
+        }
+    }
+
+    func testNativeTracksRouteToTheirOwnPlayer() {
+        let both: Set<String> = ["com.spotify.client", "com.apple.Music"]
+        XCTAssertEqual(
+            SpotifyMonitor.transportScriptSource(for: .nextTrack, activeTrackId: "music:ABC", runningBundleIds: both),
+            "tell application \"Music\" to next track"
+        )
+        XCTAssertEqual(
+            SpotifyMonitor.transportScriptSource(for: .playPause, activeTrackId: "spotify:track:1", runningBundleIds: both),
+            "tell application \"Spotify\" to playpause"
+        )
+    }
 }
