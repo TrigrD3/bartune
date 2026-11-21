@@ -45,8 +45,7 @@ struct SettingsView: View {
     @State private var whisperCLIFound: Bool = false
     @State private var isDownloadingModel: Bool = false
     @State private var modelDownloadError: String?
-    @State private var cpuPercent: Double = 0
-    @State private var memoryBytes: UInt64 = 0
+    @State private var metricsTracker = ResourceMetricsTracker()
     private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -125,17 +124,42 @@ struct SettingsView: View {
                 HStack {
                     Text("CPU Usage")
                     Spacer()
-                    Text(String(format: "%.1f%%", cpuPercent))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                    Text(String(
+                        format: "%.1f%% (avg %.1f%%)",
+                        metricsTracker.latestCPUPercent,
+                        metricsTracker.averageCPUPercent
+                    ))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
                 }
 
                 HStack {
                     Text("Memory Usage")
                     Spacer()
-                    Text(ByteCountFormatter.string(fromByteCount: Int64(memoryBytes), countStyle: .memory))
+                    let currentMem = ByteCountFormatter.string(
+                        fromByteCount: Int64(metricsTracker.latestMemoryBytes),
+                        countStyle: .memory
+                    )
+                    let avgMem = ByteCountFormatter.string(
+                        fromByteCount: Int64(metricsTracker.averageMemoryBytes),
+                        countStyle: .memory
+                    )
+                    Text("\(currentMem) (avg \(avgMem))")
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Averaged over \(metricsTracker.sampleCount) \(metricsTracker.sampleCount == 1 ? "sample" : "samples")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Reset Average") {
+                        metricsTracker.reset()
+                        refreshResourceMetrics()
+                    }
+                    .controlSize(.small)
+                    .disabled(metricsTracker.sampleCount <= 1)
                 }
             }
         }
@@ -571,8 +595,41 @@ struct SettingsView: View {
 
     private func refreshResourceMetrics() {
         let metrics = AppResourceMetrics.sample()
-        cpuPercent = metrics.cpuPercent
-        memoryBytes = metrics.memoryBytes
+        metricsTracker.record(cpuPercent: metrics.cpuPercent, memoryBytes: metrics.memoryBytes)
+    }
+}
+
+struct ResourceMetricsTracker: Equatable {
+    private(set) var sampleCount: Int = 0
+    private(set) var latestCPUPercent: Double = 0
+    private(set) var latestMemoryBytes: UInt64 = 0
+    private var totalCPUPercent: Double = 0
+    private var totalMemoryBytes: Double = 0
+
+    var averageCPUPercent: Double {
+        guard sampleCount > 0 else { return 0 }
+        return totalCPUPercent / Double(sampleCount)
+    }
+
+    var averageMemoryBytes: UInt64 {
+        guard sampleCount > 0 else { return 0 }
+        return UInt64((totalMemoryBytes / Double(sampleCount)).rounded())
+    }
+
+    mutating func record(cpuPercent: Double, memoryBytes: UInt64) {
+        sampleCount += 1
+        latestCPUPercent = cpuPercent
+        latestMemoryBytes = memoryBytes
+        totalCPUPercent += cpuPercent
+        totalMemoryBytes += Double(memoryBytes)
+    }
+
+    mutating func reset() {
+        sampleCount = 0
+        latestCPUPercent = 0
+        latestMemoryBytes = 0
+        totalCPUPercent = 0
+        totalMemoryBytes = 0
     }
 }
 
