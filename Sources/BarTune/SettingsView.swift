@@ -47,6 +47,7 @@ struct SettingsView: View {
     @State private var cachedSongs: [CachedSongSummary] = []
     @State private var cacheSearchQuery: String = ""
     @State private var inspectingSong: CachedSongSummary?
+    @State private var songPendingDeletion: CachedSongSummary?
     @State private var showClearCacheConfirmation: Bool = false
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
     @State private var whisperCLIFound: Bool = false
@@ -669,7 +670,7 @@ struct SettingsView: View {
                                     .help("Reveal file in Finder")
 
                                     Button(role: .destructive) {
-                                        deleteCachedSong(song)
+                                        songPendingDeletion = song
                                     } label: {
                                         Image(systemName: "trash")
                                             .font(.caption)
@@ -706,6 +707,25 @@ struct SettingsView: View {
                     + "\(cachedSongCount == 1 ? "song" : "songs") and \(syncedSongCount) audio-synced "
                     + "\(syncedSongCount == 1 ? "track" : "tracks") from disk."
             )
+        }
+        .alert(
+            "Remove Cached Song?",
+            isPresented: Binding(
+                get: { songPendingDeletion != nil },
+                set: { if !$0 { songPendingDeletion = nil } }
+            ),
+            presenting: songPendingDeletion
+        ) { song in
+            Button("Remove", role: .destructive) {
+                deleteCachedSong(song)
+                songPendingDeletion = nil
+            }
+            Button("Cancel", role: .cancel) {
+                songPendingDeletion = nil
+            }
+        } message: { song in
+            let label = song.artist.isEmpty ? song.title : "\(song.title) — \(song.artist)"
+            Text("This will permanently delete the cached lyrics and audio sync data for \"\(label)\".")
         }
     }
 
