@@ -21,6 +21,18 @@ body:
     validations:
       required: true
   - type: dropdown
+    id: severity
+    attributes:
+      label: Severity
+      description: How severely does this issue impact your use of BarTune?
+      options:
+        - Critical — Crash, data loss, security issue, or app unusable
+        - High — Major feature broken with no easy workaround
+        - Medium — Noticeable issue with a workaround
+        - Low — Minor glitch, cosmetic issue, or edge case
+    validations:
+      required: false
+  - type: dropdown
     id: player
     attributes:
       label: Music Player

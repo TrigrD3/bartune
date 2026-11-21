@@ -33,6 +33,8 @@ build.sh                   # Release .app packager (--install for /Applications,
   workflows/codeql.yml     # CodeQL security analysis for Swift & GitHub Actions
   workflows/pr-title.yml   # Enforces Conventional Commits on PR titles
   workflows/dependabot-auto-merge.yml # Enables auto-merge for Dependabot patch/minor PRs
+  workflows/issue-severity-labeler.yml # Auto-labels issue severity from template dropdown or keyword fallback
+  scripts/classify-issue-severity.mjs # Pure issue severity classifier (tested with node --test)
 .codecov.yml               # Soft-gated Codecov coverage reporting config
 ```
 
