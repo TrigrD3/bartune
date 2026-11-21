@@ -110,7 +110,12 @@ A test counts when it fails without your change:
 
 ## Reporting Issues
 
-Use [GitHub Issues](https://github.com/TrigrD3/bartune/issues) with the Bug Report or Feature Request template.
+Open a [GitHub Issue](https://github.com/TrigrD3/bartune/issues/new/choose) with the **Bug Report** or **Feature Request** form; blank issues are disabled.
+
+- Title it `[Bug] <plain description>` or `[Feature] <plain description>`, e.g. `[Bug] LRC parser ignores the [offset:] header`. Conventional Commits are for PR titles and commits, not issue titles.
+- Bug reports need the BarTune version, install method, macOS version, steps to reproduce, and a severity. The severity you pick sets the `severity: *` label automatically.
+- Questions, setup help, and open-ended ideas go to [Discussions](https://github.com/TrigrD3/bartune/discussions).
+- Maintainers add `area: *` labels (e.g. `area: parser`, `area: audio-sync`) and `privacy` / `performance` where relevant, and remove `needs-triage` once an issue is reviewed. `needs-verification` marks findings from code reading that still need a failing test or repro.
 
 ## Code Style
 

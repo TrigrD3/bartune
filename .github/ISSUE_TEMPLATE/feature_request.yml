@@ -1,17 +1,45 @@
 name: Feature Request
-description: Suggest an enhancement or new feature for BarTune
-title: "[Feature]: "
-labels: ["enhancement"]
+description: Suggest a new feature or an improvement for BarTune
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the suggestion! Give the title a plain description of the change,
+        e.g. `[Feature] Show lyrics for Tidal playback`.
+
+        Version matters: some requests are already covered by a newer release.
+
+  - type: input
+    id: app-version
+    attributes:
+      label: BarTune version
+      description: From Settings → About. If you have not installed it yet, write "not installed".
+      placeholder: "0.3.0"
+    validations:
+      required: true
+
   - type: textarea
     id: problem
     attributes:
-      label: What problem or use case does this solve?
+      label: What problem would this solve?
+      description: What are you trying to do today, and where does BarTune get in the way?
     validations:
       required: true
+
   - type: textarea
     id: proposal
     attributes:
-      label: Proposed solution
+      label: What would you like it to do?
+      description: A rough sketch is fine. If you considered other ways to solve it, mention them.
     validations:
       required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Did you observe something specific?
+      description: Fill this in only if the request came out of a concrete observation, such as a track whose lyrics never load or high CPU while the overlay is visible.
+    validations:
+      required: false
