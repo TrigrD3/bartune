@@ -1,1 +1,8 @@
-blank_issues_enabled: true
+# Blank issues are disabled so every report arrives with the BarTune version and,
+# for bugs, a severity that the issue-severity labeler reads.
+# Discussions is the route for anything that is not yet a concrete bug or feature.
+blank_issues_enabled: false
+contact_links:
+  - name: Question, setup help or an open-ended idea
+    url: https://github.com/TrigrD3/bartune/discussions
+    about: Not sure it is a bug or a concrete feature request yet? Start a discussion instead.
