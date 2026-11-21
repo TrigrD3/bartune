@@ -53,4 +53,12 @@ final class LRCParserTests: XCTestCase {
         XCTAssertEqual(lines[0].words.map(\.timestamp), [10.0, 10.5])
         XCTAssertEqual(lines[0].words.last?.duration ?? 0, 0.5, accuracy: 0.001)
     }
+
+    func testRepeatedEnhancedLineRebasesWordStarts() {
+        let lines = LRCParser.parse("[00:10.00][00:30.00]<00:10.25>A <00:10.75>B")
+
+        XCTAssertEqual(lines.map(\.timestamp), [10, 30])
+        XCTAssertEqual(lines[0].words.map(\.timestamp), [10.25, 10.75])
+        XCTAssertEqual(lines[1].words.map(\.timestamp), [30.25, 30.75])
+    }
 }
