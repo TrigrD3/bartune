@@ -51,8 +51,7 @@ final class SpotifyMonitor {
     private var spotifyObserver: NSObjectProtocol?
     private var musicObserver: NSObjectProtocol?
 
-    private static let scriptSource = """
-    set sep to character id 31
+    private static let spotifyBlock = """
     if application "Spotify" is running then
         tell application "Spotify"
             set pState to player state as string
@@ -71,6 +70,9 @@ final class SpotifyMonitor {
             end if
         end tell
     end if
+    """
+
+    private static let musicBlock = """
     if application "Music" is running then
         tell application "Music"
             set pState to player state as string
@@ -85,8 +87,15 @@ final class SpotifyMonitor {
             end if
         end tell
     end if
-    return "IDLE"
     """
+
+    nonisolated static func nativePlayerScriptSource(playerBlocks: [String]) -> String {
+        // Each player gets its own try so one app's Automation denial doesn't abort the rest.
+        let blocks = playerBlocks.map { "try\n\($0)\nend try" }
+        return (["set sep to character id 31"] + blocks + ["return \"IDLE\""]).joined(separator: "\n")
+    }
+
+    private static let scriptSource = nativePlayerScriptSource(playerBlocks: [spotifyBlock, musicBlock])
 
     private let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
 
