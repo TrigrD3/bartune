@@ -628,6 +628,43 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(fakeCapture.startCount, 0)
     }
 
+    // MARK: - #62: Same-track seek re-anchors Apple Speech segment timing
+
+    @MainActor
+    func testSameTrackSeekReanchorsSpeech() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // 2 s of audio at track time 10 s, then a seek to 90 s on the same playing track.
+        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
+
+        let segments = [
+            SpeechRecognizedSegment(substring: "before", timestamp: 1.0, duration: 0.3, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "after", timestamp: 3.0, duration: 0.3, confidence: 0.9),
+        ]
+        recognizer.resultHandlers.first?(segments, nil)
+        let delivered = await waitUntil { manager.recognizedWords.count == 2 }
+        XCTAssertTrue(delivered)
+
+        XCTAssertEqual(manager.recognizedWords.first?.startTime ?? -1, 11.0, accuracy: 0.01)
+        XCTAssertEqual(manager.recognizedWords.last?.startTime ?? -1, 91.0, accuracy: 0.01)
+    }
+
     // MARK: - Helpers
 
     @MainActor
