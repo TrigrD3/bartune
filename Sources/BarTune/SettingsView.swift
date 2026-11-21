@@ -368,6 +368,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
 
                 if state.audioSyncEngine != .off {
+                    Toggle("Show Sync Badge in Lyrics Bar", isOn: $state.showSyncBadge)
+
                     Toggle("Replace Lyrics with Transcribed Audio", isOn: $state.replaceLyricsWithTranscription)
 
                     Text(

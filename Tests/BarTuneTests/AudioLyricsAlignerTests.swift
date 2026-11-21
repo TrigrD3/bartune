@@ -269,6 +269,24 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.lines[0].words[2].timestamp, 11.1, accuracy: 0.01)
     }
 
+    func testOverlaySyncBadgeMapsStatusesCorrectly() {
+        XCTAssertNil(AudioSyncStatus.idle.overlayBadge)
+        XCTAssertNil(AudioSyncStatus.permissionRequired("Needed").overlayBadge)
+        XCTAssertNil(AudioSyncStatus.unavailable("Missing").overlayBadge)
+
+        let cachedBadge = AudioSyncStatus.cached(.whisper).overlayBadge
+        XCTAssertEqual(cachedBadge?.text, "Synced")
+        XCTAssertEqual(cachedBadge?.isSynced, true)
+
+        let listeningBadge = AudioSyncStatus.syncing(engine: .appleSpeech, alignedLines: 0, totalLines: 10).overlayBadge
+        XCTAssertEqual(listeningBadge?.text, "Listening")
+        XCTAssertEqual(listeningBadge?.isSynced, false)
+
+        let syncingBadge = AudioSyncStatus.syncing(engine: .whisper, alignedLines: 3, totalLines: 10).overlayBadge
+        XCTAssertEqual(syncingBadge?.text, "Syncing")
+        XCTAssertEqual(syncingBadge?.isSynced, false)
+    }
+
     @MainActor
     func testLyricsStatePersistsReplaceWithTranscriptionSetting() throws {
         let suiteName = "bartune.test.replacetranscript.\(UUID().uuidString)"
@@ -281,5 +299,19 @@ final class AudioLyricsAlignerTests: XCTestCase {
         state.replaceLyricsWithTranscription = true
         let reloaded = LyricsState(userDefaults: ud)
         XCTAssertTrue(reloaded.replaceLyricsWithTranscription)
+    }
+
+    @MainActor
+    func testLyricsStatePersistsShowSyncBadgeSetting() throws {
+        let suiteName = "bartune.test.syncbadge.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let state = LyricsState(userDefaults: ud)
+        XCTAssertTrue(state.showSyncBadge)
+
+        state.showSyncBadge = false
+        let reloaded = LyricsState(userDefaults: ud)
+        XCTAssertFalse(reloaded.showSyncBadge)
     }
 }

@@ -28,12 +28,33 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     }
 }
 
+struct OverlaySyncBadge: Equatable, Sendable {
+    let symbolName: String
+    let text: String
+    let isSynced: Bool
+}
+
 enum AudioSyncStatus: Equatable, Sendable {
     case idle
     case cached(AudioSyncEngine)
     case syncing(engine: AudioSyncEngine, alignedLines: Int, totalLines: Int)
     case permissionRequired(String)
     case unavailable(String)
+
+    var overlayBadge: OverlaySyncBadge? {
+        switch self {
+        case .cached:
+            return OverlaySyncBadge(symbolName: "checkmark.circle.fill", text: "Synced", isSynced: true)
+        case let .syncing(_, aligned, _):
+            return OverlaySyncBadge(
+                symbolName: "waveform",
+                text: aligned > 0 ? "Syncing" : "Listening",
+                isSynced: false
+            )
+        case .idle, .permissionRequired, .unavailable:
+            return nil
+        }
+    }
 
     var label: String {
         switch self {
