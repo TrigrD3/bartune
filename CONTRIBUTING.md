@@ -89,14 +89,16 @@ swift test
 ```
 
 A test counts when it fails without your change:
-- For a bug fix, verify the new test fails before the fix and passes after.
+- For a bug fix, revert the fix and confirm the new test goes red, then passes with the fix restored.
+- For something new (a type, a setting, a code path), a full revert is not that check: it also removes the new type, so its own tests fail even when nothing calls it. Replace the one line that carries the change into the running app (the argument that passes a new setting on, the condition that gates the new path) with a constant that still compiles, and confirm a test goes red; a build error does not count.
+- Name that line and the test that went red in the PR template's **Tests** section, and fill in its "Not checked" line. A change with no behaviour to test (docs, CI, a pure refactor) writes "n/a" there.
 - For a new feature, test the pure logic (parsers, romanizers, state/model helpers) at the cheapest layer first, using non-default inputs so a test cannot pass vacuously when a setting is ignored.
 - Never pipe a test run into `tail`/`head`/`grep` without `set -o pipefail` — the shell exits with the last command's status and can mask a red suite.
 
 ### Hygiene
 
 - No AI tool trailers (`Co-Authored-By:` for an assistant or session links) in commit messages; human co-authors are welcome.
-- If you used AI tools, mention it in the PR description if helpful for reviewers.
+- If you used AI tools, say so in the PR template's **AI assistance** section instead: which model wrote the change, and which ones you used to review or simplify it.
 - No machine-local absolute paths or personal credentials in code, tests, or PR descriptions.
 
 ## Submitting a PR
@@ -105,7 +107,7 @@ A test counts when it fails without your change:
 2. Rebase your branch onto `origin/main` before opening the PR.
 3. Ensure `swift test`, `bash scripts/lint.sh`, and `./build.sh` all pass locally.
 4. Use a Conventional Commit PR title (checked by `Conventional PR Title`).
-5. Explain **what** changed and **why** in the PR description, and link any related issues.
+5. Fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md): what changed and why with `Closes #<number>`, the Tests evidence, AI assistance (or delete it), and the checklist. This applies to PRs opened with `gh pr create --body` too: reproduce the template's headings.
 6. Docs-only PRs (`*.md`, `docs/**`) automatically skip macOS CI builds via `.github/filters.yml`.
 
 ## Reporting Issues

@@ -26,6 +26,7 @@ scripts/
   hooks/commit-msg         # Local Conventional Commits git hook
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
 .github/
+  PULL_REQUEST_TEMPLATE.md # PR body sections every PR fills in (see Git Workflow)
   filters.yml              # Shared dorny/paths-filter config (skips macOS jobs on docs-only PRs)
   dependabot.yml           # Weekly dependency updates for github-actions & swift
   workflows/ci.yml         # CI: changes -> lint + test + codecov + .app bundle verification (macos-26)
@@ -105,6 +106,7 @@ swiftformat Sources Tests
 - **Atomic commits:** one logical change per commit. Fold review fixes into the commit they belong to (`git commit --fixup` + `git rebase --autosquash`).
 - **Stage explicitly:** `git add <file1> <file2>` — avoid blanket `git add -A` on dirty trees.
 - **Verify first:** run `swift test`, `bash scripts/lint.sh`, and `./build.sh` before committing Swift changes.
+- **PR body:** follow `.github/PULL_REQUEST_TEMPLATE.md` for every PR, including ones opened with `gh pr create --body`: keep its headings (What changed and why, Tests, AI assistance, Checklist) and fill them per `CONTRIBUTING.md` → Tests.
 - **Commit body:** document the *why* for non-trivial changes (architecture decisions, rejected alternatives).
 - **Hygiene:** no AI tool trailers (`Co-Authored-By:` for assistants, session links) in commit messages; no local machine paths in code, tests, or PR text.
 - **Contributor workflow:** before committing, read `CONTRIBUTING.md` if you haven't this session.
