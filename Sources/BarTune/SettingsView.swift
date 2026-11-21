@@ -1083,7 +1083,7 @@ struct ResourceMetricsTracker: Equatable {
     }
 }
 
-private enum AppResourceMetrics {
+enum AppResourceMetrics {
     static func sample() -> (cpuPercent: Double, memoryBytes: UInt64) {
         (cpuPercent: currentCPUPercent(), memoryBytes: currentMemoryBytes())
     }
@@ -1108,14 +1108,20 @@ private enum AppResourceMetrics {
         else { return 0 }
 
         defer {
+            for i in 0..<Int(threadCount) {
+                mach_port_deallocate(mach_task_self_, threadList[i])
+            }
             let size = vm_size_t(Int(threadCount) * MemoryLayout<thread_t>.size)
             vm_deallocate(mach_task_self_, vm_address_t(bitPattern: threadList), size)
         }
 
+        let threadBasicInfoCount = mach_msg_type_number_t(
+            MemoryLayout<thread_basic_info_data_t>.size / MemoryLayout<integer_t>.size
+        )
         var totalCPU = 0.0
         for i in 0..<Int(threadCount) {
             var info = thread_basic_info()
-            var count = mach_msg_type_number_t(THREAD_INFO_MAX)
+            var count = threadBasicInfoCount
             let status = withUnsafeMutablePointer(to: &info) { ptr in
                 ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
                     thread_info(threadList[i], thread_flavor_t(THREAD_BASIC_INFO), intPtr, &count)

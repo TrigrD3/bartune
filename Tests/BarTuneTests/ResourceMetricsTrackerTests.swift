@@ -1,4 +1,5 @@
 @testable import BarTune
+import Darwin.Mach
 import XCTest
 
 final class ResourceMetricsTrackerTests: XCTestCase {
@@ -29,5 +30,28 @@ final class ResourceMetricsTrackerTests: XCTestCase {
         XCTAssertEqual(tracker.latestMemoryBytes, 0)
         XCTAssertEqual(tracker.averageCPUPercent, 0)
         XCTAssertEqual(tracker.averageMemoryBytes, 0)
+    }
+
+    func testCPUSamplerDoesNotLeakMachThreadSendRights() {
+        let selfThread = mach_thread_self()
+        defer { mach_port_deallocate(mach_task_self_, selfThread) }
+
+        var refsBefore: mach_port_urefs_t = 0
+        XCTAssertEqual(
+            mach_port_get_refs(mach_task_self_, selfThread, MACH_PORT_RIGHT_SEND, &refsBefore),
+            KERN_SUCCESS
+        )
+
+        for _ in 0..<10 {
+            _ = AppResourceMetrics.sample()
+        }
+
+        var refsAfter: mach_port_urefs_t = 0
+        XCTAssertEqual(
+            mach_port_get_refs(mach_task_self_, selfThread, MACH_PORT_RIGHT_SEND, &refsAfter),
+            KERN_SUCCESS
+        )
+
+        XCTAssertEqual(refsAfter, refsBefore)
     }
 }
