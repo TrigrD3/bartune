@@ -30,6 +30,12 @@ struct PlaybackSnapshot {
     let isPlaying: Bool
     let track: TrackInfo?
     let position: Double
+    var playbackRate: Double = 1.0
+
+    func position(after elapsed: TimeInterval) -> Double {
+        guard isPlaying else { return position }
+        return position + max(0, elapsed) * playbackRate
+    }
 }
 
 @MainActor
@@ -358,7 +364,8 @@ final class SpotifyMonitor {
             isRunning: snap.isRunning,
             isPlaying: snap.isPlaying,
             track: track,
-            position: snap.position + elapsed
+            position: snap.position(after: elapsed),
+            playbackRate: snap.playbackRate
         )
         onUpdate?(interpolated)
     }

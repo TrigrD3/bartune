@@ -265,7 +265,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        state.updatePlayback(isPlaying: snapshot.isPlaying, position: snapshot.position)
+        state.updatePlayback(
+            isPlaying: snapshot.isPlaying,
+            position: snapshot.position,
+            playbackRate: snapshot.playbackRate
+        )
         audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying)
     }
 

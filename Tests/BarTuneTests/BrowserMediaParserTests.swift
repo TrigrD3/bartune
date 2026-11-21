@@ -331,4 +331,38 @@ final class BrowserMediaParserTests: XCTestCase {
             BrowserTabDescriptor(windowIndex: 2, tabIndex: 3, url: "https://private.invalid/path?a=1"),
         ])
     }
+
+    @MainActor
+    func testBrowserRateScalesInterpolation() throws {
+        let sep = "\u{1F}"
+        let fields = ["BROWSER", "playing", "browser:music.youtube.com:Example|A", "Example", "A", "", "180", "20", "", ""]
+        let fast = try XCTUnwrap(BrowserMediaParser.parsePayload((fields + ["2"]).joined(separator: sep)))
+        XCTAssertEqual(fast.position(after: 0.5), 21.0, accuracy: 0.001)
+
+        let legacy = try XCTUnwrap(BrowserMediaParser.parsePayload(fields.joined(separator: sep)))
+        XCTAssertEqual(legacy.position(after: 0.5), 20.5, accuracy: 0.001)
+
+        XCTAssertEqual(BrowserMediaParser.parsePlaybackRate("1,5"), 1.5, accuracy: 0.001)
+        XCTAssertEqual(BrowserMediaParser.parsePlaybackRate("100"), BrowserMediaParser.maxPlaybackRate)
+        XCTAssertEqual(BrowserMediaParser.parsePlaybackRate("-1"), 0)
+        XCTAssertEqual(BrowserMediaParser.parsePlaybackRate("NaN"), 1.0)
+        XCTAssertEqual(BrowserMediaParser.parsePlaybackRate("abc"), 1.0)
+
+        let paused = PlaybackSnapshot(isRunning: true, isPlaying: false, track: fast.track, position: 20, playbackRate: 2)
+        XCTAssertEqual(paused.position(after: 0.5), 20.0, accuracy: 0.001)
+
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        let line = LyricLine(id: 0, timestamp: 20.0, duration: 4.0, text: "Line")
+        state.setTrack(fast.track, lyrics: [line])
+        state.updatePlayback(isPlaying: true, position: fast.position, playbackRate: fast.playbackRate)
+        let expected = LyricsState.computeLineProgress(
+            line: line,
+            nextTimestamp: state.activeLineNextTimestamp,
+            position: 21.0
+        )
+        XCTAssertEqual(state.liveProgress(at: state.playbackAnchorDate.addingTimeInterval(0.5)), expected, accuracy: 0.001)
+    }
 }

@@ -583,7 +583,7 @@ final class AudioSyncManager {
 
     private func currentPlaybackPosition() -> Double {
         let elapsed = max(0.0, Date().timeIntervalSince(state.playbackAnchorDate))
-        return state.playbackAnchorPosition + (state.isPlaying ? elapsed : 0.0)
+        return state.playbackAnchorPosition + (state.isPlaying ? elapsed * state.playbackRate : 0.0)
     }
 
     private func promptSnippet(around position: Double) -> String {
