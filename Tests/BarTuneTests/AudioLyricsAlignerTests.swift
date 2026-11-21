@@ -533,4 +533,35 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertGreaterThan(result.lines[2].timestamp, 19.0)
         XCTAssertGreaterThan(result.lines[2].timestamp, result.lines[1].timestamp + 1.0)
     }
+
+    func testAlignEnforcesMonotonicOrderAcrossFallbackLinesAndConsumedWordBoundaries() {
+        // Line 0 matches at 11.2s, while unmatched line 1 has raw timestamp 11.0s.
+        let fallbackLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "alpha beta"),
+            LyricLine(id: 1, timestamp: 11.0, text: "unmatched second line"),
+        ]
+        let fallbackRecognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 11.2, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "beta", startTime: 11.5, duration: 0.2, confidence: 0.9),
+        ]
+        let fallbackResult = LyricsAudioAligner.align(lines: fallbackLines, recognizedWords: fallbackRecognized)
+        XCTAssertGreaterThan(fallbackResult.lines[1].timestamp, fallbackResult.lines[0].timestamp)
+
+        // Boundary word at 12.2s must not be consumed by both line 0 and line 1.
+        let boundaryLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "alpha beta"),
+            LyricLine(id: 1, timestamp: 12.0, text: "beta gamma"),
+        ]
+        let boundaryRecognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 10.0, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "beta", startTime: 12.2, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "gamma", startTime: 12.6, duration: 0.2, confidence: 0.9),
+        ]
+        let boundaryResult = LyricsAudioAligner.align(lines: boundaryLines, recognizedWords: boundaryRecognized)
+        XCTAssertGreaterThan(boundaryResult.lines[1].timestamp, boundaryResult.lines[0].timestamp)
+        if let firstLastWord = boundaryResult.lines[0].words.last,
+           let secondFirstWord = boundaryResult.lines[1].words.first {
+            XCTAssertGreaterThanOrEqual(secondFirstWord.timestamp, firstLastWord.timestamp + (firstLastWord.duration ?? 0))
+        }
+    }
 }
