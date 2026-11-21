@@ -57,7 +57,21 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-codesign --force --deep --sign - "$APP_BUNDLE"
+SIGN_IDENTITY="${BARTUNE_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+        | sed -n 's/.*"\(Apple Development:[^"]*\)".*/\1/p' | head -n 1 || true)"
+fi
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    SIGN_IDENTITY="-"
+fi
+
+echo "==> Signing $APP_BUNDLE with identity: $SIGN_IDENTITY"
+codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
 
 if [[ "${1:-}" == "--install" ]]; then
     echo "==> Installing to /Applications/$APP_NAME.app..."
