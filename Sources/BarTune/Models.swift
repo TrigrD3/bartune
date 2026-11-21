@@ -100,7 +100,8 @@ enum LRCParser {
             let rawBody = nsLine.substring(from: lastTagEnd)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
 
-            let (cleanText, wordTimestamps) = parseEnhancedWords(rawBody)
+            guard let lineStart = timestamps.first else { continue }
+            let (cleanText, wordTimestamps) = parseEnhancedWords(rawBody, lineStart: lineStart)
 
             for ts in timestamps {
                 entries.append((ts, cleanText, wordTimestamps))
@@ -131,7 +132,7 @@ enum LRCParser {
         return minutes * 60.0 + seconds + fraction
     }
 
-    private static func parseEnhancedWords(_ body: String) -> (String, [WordTimestamp]) {
+    private static func parseEnhancedWords(_ body: String, lineStart: Double) -> (String, [WordTimestamp]) {
         let nsBody = body as NSString
         let fullRange = NSRange(location: 0, length: nsBody.length)
         let matches = wordTagRegex.matches(in: body, range: fullRange)
@@ -142,12 +143,24 @@ enum LRCParser {
         var words: [WordTimestamp] = []
         var cleanParts: [String] = []
 
+        // Text before the first word tag has no cue of its own; start it with the line.
+        let prefix = nsBody.substring(to: matches[0].range.location)
+        if !prefix.isEmpty {
+            words.append(WordTimestamp(timestamp: lineStart, text: prefix))
+            cleanParts.append(prefix)
+        }
+
         for (i, match) in matches.enumerated() {
             guard let ts = parseTimestamp(nsLine: nsBody, match: match) else { continue }
             let textStart = match.range.location + match.range.length
             let textEnd = (i + 1 < matches.count) ? matches[i + 1].range.location : nsBody.length
             let segment = nsBody.substring(with: NSRange(location: textStart, length: max(0, textEnd - textStart)))
-            if !segment.isEmpty {
+            if segment.isEmpty {
+                // A tag with no text after it marks the end of the preceding word.
+                if let last = words.last, last.duration == nil, ts > last.timestamp {
+                    words[words.count - 1] = WordTimestamp(timestamp: last.timestamp, duration: ts - last.timestamp, text: last.text)
+                }
+            } else {
                 words.append(WordTimestamp(timestamp: ts, text: segment))
                 cleanParts.append(segment)
             }
