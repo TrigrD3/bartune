@@ -8,6 +8,7 @@ cask "bartune" do
   homepage "https://github.com/TrigrD3/bartune"
 
   depends_on macos: ">= :ventura"
+  depends_on arch: :arm64
 
   app "BarTune.app"
 

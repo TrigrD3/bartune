@@ -41,6 +41,8 @@ Most desktop lyrics apps float over your editor, browser tabs, or terminal. **Ba
 
 ### Homebrew (Recommended)
 
+Requires **macOS 13.0 (Ventura)+** on **Apple Silicon** (Intel Macs can build from source below).
+
 ```bash
 brew install --cask TrigrD3/tap/bartune
 ```
