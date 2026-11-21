@@ -489,5 +489,48 @@ final class AudioLyricsAlignerTests: XCTestCase {
             lines: lines
         )
         XCTAssertTrue(reliable.isReliable)
+
+        let duplicateTimestamp = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:dup",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: nil,
+            alignedLineCount: 3,
+            lines: [
+                LyricLine(id: 0, timestamp: 13.49, text: "Yeah, yeah"),
+                LyricLine(id: 1, timestamp: 13.49, text: "Yeah, yeah"),
+            ]
+        )
+        XCTAssertFalse(duplicateTimestamp.isReliable)
+    }
+
+    func testAlignPreventsCrossLineWordBleedAndOverlappingTimestamps() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 9.20, text: "We found each other"),
+            LyricLine(id: 1, timestamp: 14.50, text: "I helped you out of a broken place"),
+            LyricLine(id: 2, timestamp: 19.87, text: "You gave me comfort"),
+        ]
+        // Stray early hallucination at 3.67s + "you" sung during line 2 at 15.39s.
+        let recognized = [
+            RecognizedAudioWord(text: "we", startTime: 3.67, duration: 0.25, confidence: 0.8),
+            RecognizedAudioWord(text: "found", startTime: 4.10, duration: 0.25, confidence: 0.8),
+            RecognizedAudioWord(text: "i", startTime: 14.30, duration: 0.20, confidence: 0.9),
+            RecognizedAudioWord(text: "helped", startTime: 14.70, duration: 0.30, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 15.39, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "out", startTime: 15.80, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "broken", startTime: 17.50, duration: 0.35, confidence: 0.9),
+            RecognizedAudioWord(text: "place", startTime: 18.10, duration: 0.40, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 19.75, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "gave", startTime: 20.15, duration: 0.30, confidence: 0.9),
+            RecognizedAudioWord(text: "me", startTime: 20.55, duration: 0.20, confidence: 0.9),
+            RecognizedAudioWord(text: "comfort", startTime: 21.00, duration: 0.50, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        // Line 0 must NOT be pulled back to 3.67s.
+        XCTAssertGreaterThan(result.lines[0].timestamp, 8.0)
+        // Line 2 must NOT steal "you" from line 1 at 15.39s or overlap line 1.
+        XCTAssertGreaterThan(result.lines[2].timestamp, 19.0)
+        XCTAssertGreaterThan(result.lines[2].timestamp, result.lines[1].timestamp + 1.0)
     }
 }
