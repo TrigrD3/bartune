@@ -699,9 +699,13 @@ struct SettingsView: View {
         }
         .alert("Clear Offline Cache?", isPresented: $showClearCacheConfirmation) {
             Button("Clear All Cache", role: .destructive) {
-                LyricsDiskCache.default.clear()
-                AudioSyncedLyricsCache.default.clear()
-                refreshCacheStats()
+                Task {
+                    await Task.detached(priority: .utility) {
+                        LyricsDiskCache.default.clear()
+                        AudioSyncedLyricsCache.default.clear()
+                    }.value
+                    refreshCacheStats()
+                }
             }
             Button("Cancel", role: .cancel) {}
         } message: {
