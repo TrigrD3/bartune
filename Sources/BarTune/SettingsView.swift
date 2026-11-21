@@ -2,6 +2,7 @@ import AppKit
 import Combine
 import Darwin
 import SwiftUI
+import UniformTypeIdentifiers
 
 private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
@@ -38,6 +39,12 @@ struct SettingsView: View {
     @State private var selectedTab: SettingsTab = .general
     @State private var cachedSongCount: Int = 0
     @State private var cachedBytes: Int64 = 0
+    @State private var syncedSongCount: Int = 0
+    @State private var syncedBytes: Int64 = 0
+    @State private var discoveredModels: [DiscoveredWhisperModel] = []
+    @State private var whisperCLIFound: Bool = false
+    @State private var isDownloadingModel: Bool = false
+    @State private var modelDownloadError: String?
     @State private var cpuPercent: Double = 0
     @State private var memoryBytes: UInt64 = 0
     private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
@@ -287,6 +294,106 @@ struct SettingsView: View {
                 Toggle("Chinese → Pinyin", isOn: $state.romanizeChinese)
             }
 
+            Section("Audio Karaoke Sync") {
+                Picker("Sync Engine", selection: $state.audioSyncEngine) {
+                    ForEach(AudioSyncEngine.allCases) { engine in
+                        Text(engine.title).tag(engine)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Text(state.audioSyncEngine.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                if state.audioSyncEngine != .off {
+                    HStack {
+                        Text("Status")
+                        Spacer()
+                        Text(state.audioSyncStatus.label)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+
+                    HStack {
+                        if case .permissionRequired = state.audioSyncStatus {
+                            Button("Open Privacy Settings") {
+                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                    NSWorkspace.shared.open(url)
+                                }
+                            }
+                        }
+                        Spacer()
+                        Button("Re-sync Current Track") {
+                            state.onResyncCurrentTrack?()
+                        }
+                        .disabled(!state.hasLyrics)
+                    }
+                }
+
+                if state.audioSyncEngine == .whisper {
+                    HStack {
+                        Text("whisper-cli")
+                        Spacer()
+                        Text(whisperCLIFound ? "Installed" : "Not found (brew install whisper-cpp)")
+                            .font(.caption)
+                            .foregroundStyle(whisperCLIFound ? Color.secondary : Color.orange)
+                    }
+
+                    if !discoveredModels.isEmpty {
+                        Picker("Shared Model", selection: $state.whisperModelPath) {
+                            Text("Auto (\(discoveredModels.first?.name ?? "None"))").tag("")
+                            ForEach(discoveredModels) { model in
+                                Text("\(model.name) (\(model.formattedSize) · \(model.sourceLabel))")
+                                    .tag(model.path)
+                            }
+                        }
+                    } else {
+                        HStack {
+                            Text("Shared Model")
+                            Spacer()
+                            Text("None found")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    HStack {
+                        Button("Choose Existing…") {
+                            chooseExistingWhisperModel()
+                        }
+                        Button("Rescan") {
+                            refreshWhisperDiscovery()
+                        }
+                        Spacer()
+                        if isDownloadingModel {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Downloading…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Button("Download Tiny (~75 MB)") {
+                                downloadDefaultWhisperModel()
+                            }
+                        }
+                    }
+
+                    if let err = modelDownloadError {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    }
+
+                    Text(
+                        "Automatically reuses existing GGML models from ~/.cache/whisper, ~/.cache/huggingface, and Homebrew. "
+                            + "Downloads are saved to ~/.cache/whisper so other apps can share them."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
+            }
+
             Section("Performance & Sync") {
                 Picker("Karaoke Precision", selection: $state.lowCPUMode) {
                     Text("Low CPU (Standard)").tag(true)
@@ -321,6 +428,9 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            refreshWhisperDiscovery()
+        }
     }
 
     private var cacheTab: some View {
@@ -338,6 +448,14 @@ struct SettingsView: View {
                     Text("Storage Used")
                     Spacer()
                     Text(formattedCacheSize)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                HStack {
+                    Text("Audio-Synced Tracks")
+                    Spacer()
+                    Text("\(syncedSongCount) (\(formattedSyncedSize))")
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
@@ -363,9 +481,10 @@ struct SettingsView: View {
                     }
                     Button("Clear Cache", role: .destructive) {
                         LyricsDiskCache.default.clear()
+                        AudioSyncedLyricsCache.default.clear()
                         refreshCacheStats()
                     }
-                    .disabled(cachedSongCount == 0)
+                    .disabled(cachedSongCount == 0 && syncedSongCount == 0)
                 }
 
                 Text(cacheFooterText)
@@ -399,10 +518,55 @@ struct SettingsView: View {
         return ByteCountFormatter.string(fromByteCount: cachedBytes, countStyle: .file)
     }
 
+    private var formattedSyncedSize: String {
+        guard syncedBytes > 0 else { return "0 KB" }
+        return ByteCountFormatter.string(fromByteCount: syncedBytes, countStyle: .file)
+    }
+
     private func refreshCacheStats() {
         let stats = LyricsDiskCache.default.stats()
         cachedSongCount = stats.count
         cachedBytes = stats.bytes
+        let syncStats = AudioSyncedLyricsCache.default.stats()
+        syncedSongCount = syncStats.count
+        syncedBytes = syncStats.bytes
+    }
+
+    private func refreshWhisperDiscovery() {
+        whisperCLIFound = WhisperModelLocator.locateWhisperCLI() != nil
+        discoveredModels = WhisperModelLocator.discoverModels(customPath: state.whisperModelPath)
+    }
+
+    private func chooseExistingWhisperModel() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Existing Whisper GGML Model"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data]
+        if panel.runModal() == .OK, let url = panel.url {
+            state.whisperModelPath = url.path
+            refreshWhisperDiscovery()
+        }
+    }
+
+    private func downloadDefaultWhisperModel() {
+        isDownloadingModel = true
+        modelDownloadError = nil
+        Task {
+            do {
+                let url = try await AudioSyncManager.downloadSharedDefaultModel()
+                await MainActor.run {
+                    isDownloadingModel = false
+                    state.whisperModelPath = url.path
+                    refreshWhisperDiscovery()
+                }
+            } catch {
+                await MainActor.run {
+                    isDownloadingModel = false
+                    modelDownloadError = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func refreshResourceMetrics() {

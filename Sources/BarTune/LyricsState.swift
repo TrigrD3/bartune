@@ -222,6 +222,8 @@ final class LyricsState: ObservableObject {
         static let lowCPUMode = "bartune.lowCPUMode"
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
         static let trackOffsets = "bartune.trackOffsets"
+        static let audioSyncEngine = "bartune.audioSyncEngine"
+        static let whisperModelPath = "bartune.whisperModelPath"
     }
 
     private static let maxStoredOffsets = 500
@@ -253,6 +255,8 @@ final class LyricsState: ObservableObject {
         }
     }
     @Published var albumColors: ExtractedAlbumColors? = nil
+    @Published var audioSyncStatus: AudioSyncStatus = .idle
+    var onResyncCurrentTrack: (() -> Void)?
 
     // Persisted user settings
     @Published var hoverMode: HoverMode {
@@ -354,6 +358,14 @@ final class LyricsState: ObservableObject {
 
     @Published var browserMusicEnabled: Bool {
         didSet { userDefaults.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
+    }
+
+    @Published var audioSyncEngine: AudioSyncEngine {
+        didSet { userDefaults.set(audioSyncEngine.rawValue, forKey: Keys.audioSyncEngine) }
+    }
+
+    @Published var whisperModelPath: String {
+        didSet { userDefaults.set(whisperModelPath, forKey: Keys.whisperModelPath) }
     }
 
     @Published var lyricsCacheLimit: LyricsCacheLimit {
@@ -486,6 +498,13 @@ final class LyricsState: ObservableObject {
         }
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
+        if let rawEngine = ud.string(forKey: Keys.audioSyncEngine),
+           let parsedEngine = AudioSyncEngine(rawValue: rawEngine) {
+            self.audioSyncEngine = parsedEngine
+        } else {
+            self.audioSyncEngine = .off
+        }
+        self.whisperModelPath = ud.string(forKey: Keys.whisperModelPath) ?? ""
         let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
         self.lyricsCacheLimit = LyricsCacheLimit(rawValue: storedLimit) ?? .songs1000
         self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
@@ -567,6 +586,21 @@ final class LyricsState: ObservableObject {
 
     func setTranslatedLines(_ lines: [LyricLine]) {
         translatedLines = lines
+        refreshCurrentLineText()
+    }
+
+    func applyAudioSyncedLines(_ lines: [LyricLine]) {
+        guard !lines.isEmpty else { return }
+        rawLines = lines
+        if isJapaneseSong {
+            romanizedLines = Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine)
+        }
+        if isKoreanSong {
+            koreanRomanizedLines = Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
+        }
+        if isChineseSong {
+            chineseRomanizedLines = Self.romanizeLines(lines, using: ChineseRomanizer.romanizeLine)
+        }
         refreshCurrentLineText()
     }
 
