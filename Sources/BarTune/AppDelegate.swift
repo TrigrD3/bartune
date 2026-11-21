@@ -303,7 +303,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                   self.lastFetchedTrackId == trackId,
                   self.state.translationLanguage == targetLang
             else { return }
-            self.state.setTranslatedLines(translated)
+            guard self.state.setTranslatedLines(translated, sourceLines: lines) else {
+                self.translateCurrentTrack()
+                return
+            }
         }
     }
 

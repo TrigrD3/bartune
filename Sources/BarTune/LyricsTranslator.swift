@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum TranslationLanguage: String, CaseIterable, Identifiable, Sendable {
@@ -89,13 +90,20 @@ actor LyricsTranslator {
         memoryCache.removeAll { $0 == trackId || $0.hasPrefix("\(trackId):tr:") }
     }
 
+    /// Keys on line IDs and source text, not timing, so realigned lines reuse the translation but edited text does not.
+    static func cacheKey(trackId: String, targetLanguage: TranslationLanguage, lines: [LyricLine]) -> String {
+        let source = lines.map { "\($0.id)\u{1F}\($0.text)" }.joined(separator: "\u{1E}")
+        let digest = SHA256.hash(data: Data(source.utf8)).prefix(8).map { String(format: "%02x", $0) }.joined()
+        return "\(trackId):tr:\(targetLanguage.rawValue):\(digest)"
+    }
+
     func translate(
         lines: [LyricLine],
         trackId: String,
         targetLanguage: TranslationLanguage
     ) async -> [LyricLine] {
         guard !lines.isEmpty else { return [] }
-        let cacheKey = "\(trackId):tr:\(targetLanguage.rawValue)"
+        let cacheKey = Self.cacheKey(trackId: trackId, targetLanguage: targetLanguage, lines: lines)
 
         if let mem = memoryCache[cacheKey] {
             return mem
