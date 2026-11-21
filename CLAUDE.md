@@ -98,6 +98,8 @@ swiftformat Sources Tests
 
 - **Branch protection:** `main` is protected — never push directly to `main`. Always open a pull request and merge after required checks (`lint`, `test`, `Conventional PR Title`) pass.
 - **Issue tracking:** before starting work on a new feature, create a GitHub issue for it and link the pull request to that issue (e.g., `Closes #<number>`).
+- **Issue format:** follow the forms in `.github/ISSUE_TEMPLATE/` (blank issues are disabled; questions go to Discussions). Titles are `[Bug] <plain description>` or `[Feature] <plain description>`; Conventional Commits apply to PR titles and commits, not issues. When filing with `gh issue create`, reproduce the form's `### <Label>` headings so `issue-severity-labeler.yml` can read `### Severity`.
+- **Issue labels:** one type (`bug`, `enhancement`, `documentation`), one `severity: *` for bugs, one or more `area: *` (audio-sync, aligner, playback-monitor, lyrics-fetch, parser, translation, overlay, settings, build, ci), plus `privacy`, `performance`, `needs-verification` (found by code reading, unconfirmed) or `needs-triage` (set by the forms; remove once reviewed) where they apply.
 - **Conventional Commits:** `<type>(<scope>): <description>` — types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `chore`, `build`, `ci`, `revert`. Enforced in CI (`pr-title.yml`) and locally (`scripts/hooks/commit-msg`).
 - **Scopes:** `app`, `test`, `build`, `ci`, `docs`, `deps`.
 - **Atomic commits:** one logical change per commit. Fold review fixes into the commit they belong to (`git commit --fixup` + `git rebase --autosquash`).
