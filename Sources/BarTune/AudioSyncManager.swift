@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import CoreGraphics
 import CoreMedia
@@ -8,7 +9,27 @@ import Speech
 private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sendable {
     var onAudioSamples: (([Float], Double) -> Void)?
     private var stream: SCStream?
+    private var activeTargetBundleIds: Set<String> = []
+    private var launchObserver: NSObjectProtocol?
     private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
+
+    deinit {
+        if let observer = launchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+        }
+    }
+
+    private func makeContentFilter(
+        content: SCShareableContent,
+        display: SCDisplay,
+        targetBundleIds: Set<String>
+    ) -> SCContentFilter {
+        if !targetBundleIds.isEmpty {
+            let excludedApps = content.applications.filter { !targetBundleIds.contains($0.bundleIdentifier) }
+            return SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
+        }
+        return SCContentFilter(display: display, excludingWindows: [])
+    }
 
     func start(targetBundleIds: Set<String> = []) async throws {
         stop()
@@ -19,13 +40,8 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
             ])
         }
 
-        let filter: SCContentFilter
-        if !targetBundleIds.isEmpty {
-            let excludedApps = content.applications.filter { !targetBundleIds.contains($0.bundleIdentifier) }
-            filter = SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-        } else {
-            filter = SCContentFilter(display: display, excludingWindows: [])
-        }
+        activeTargetBundleIds = targetBundleIds
+        let filter = makeContentFilter(content: content, display: display, targetBundleIds: targetBundleIds)
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
@@ -40,9 +56,42 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
         try await stream.startCapture()
         self.stream = stream
+
+        if !targetBundleIds.isEmpty {
+            launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
+                forName: NSWorkspace.didLaunchApplicationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                guard let self, let activeStream = self.stream else { return }
+                let launchedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                if let bundleId = launchedApp?.bundleIdentifier, self.activeTargetBundleIds.contains(bundleId) {
+                    return
+                }
+                let targets = self.activeTargetBundleIds
+                Task { [weak self] in
+                    guard let self, self.stream === activeStream else { return }
+                    guard let updated = try? await SCShareableContent.excludingDesktopWindows(
+                        false,
+                        onScreenWindowsOnly: false
+                    ), let updatedDisplay = updated.displays.first else { return }
+                    let updatedFilter = self.makeContentFilter(
+                        content: updated,
+                        display: updatedDisplay,
+                        targetBundleIds: targets
+                    )
+                    try? await activeStream.updateContentFilter(updatedFilter)
+                }
+            }
+        }
     }
 
     func stop() {
+        if let observer = launchObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
+            launchObserver = nil
+        }
+        activeTargetBundleIds = []
         guard let activeStream = stream else { return }
         stream = nil
         Task {
@@ -549,12 +598,14 @@ final class AudioSyncManager {
 
     private func persistAlignment(_ result: AudioAlignmentResult, engine: AudioSyncEngine) {
         guard let trackId = activeTrackId else { return }
+        let sourceCount = baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         let record = AudioSyncedLyricsRecord(
             trackId: trackId,
             engine: engine,
             syncedAt: Date(),
             medianOffset: result.medianOffset,
             alignedLineCount: result.matchedLineCount,
+            sourceLineCount: sourceCount,
             lines: result.lines
         )
         cache.save(record)

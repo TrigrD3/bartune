@@ -98,17 +98,38 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let syncedAt: Date
     let medianOffset: Double?
     let alignedLineCount: Int
+    let sourceLineCount: Int?
     let lines: [LyricLine]
 
+    init(
+        trackId: String,
+        engine: AudioSyncEngine,
+        syncedAt: Date,
+        medianOffset: Double?,
+        alignedLineCount: Int,
+        sourceLineCount: Int? = nil,
+        lines: [LyricLine]
+    ) {
+        self.trackId = trackId
+        self.engine = engine
+        self.syncedAt = syncedAt
+        self.medianOffset = medianOffset
+        self.alignedLineCount = alignedLineCount
+        self.sourceLineCount = sourceLineCount
+        self.lines = lines
+    }
+
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
-    /// Rejects single-line partial matches on multi-line tracks and extreme outlier offsets (> 5s).
+    /// Rejects single-line partial matches on multi-line tracks (including transcript-only
+    /// caches that omit untranscribed lines) and extreme outlier offsets (> 5s).
     var isReliable: Bool {
         let nonEmptyCount = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         guard nonEmptyCount > 0 else { return false }
         if let offset = medianOffset, abs(offset) > 5.0 {
             return false
         }
-        let minRequired = min(2, nonEmptyCount)
+        let referenceCount = max(nonEmptyCount, sourceLineCount ?? 0)
+        let minRequired = min(2, referenceCount)
         return alignedLineCount >= minRequired
     }
 }

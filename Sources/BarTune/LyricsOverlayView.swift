@@ -397,7 +397,7 @@ private struct SyncStatusBadgeView: View {
         if compact && badge.isSynced {
             Image(systemName: badge.symbolName)
                 .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(foreground)
+                .foregroundStyle(Color.green)
                 .transition(.opacity.combined(with: .scale(scale: 0.85)))
         } else {
             TimelineView(.animation(minimumInterval: lowCPUMode ? 0.30 : 0.12, paused: badge.isSynced)) { timeline in
