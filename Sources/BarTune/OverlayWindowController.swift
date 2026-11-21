@@ -12,6 +12,7 @@ final class OverlayWindowController {
     private var mouseMoveMonitor: Any?
     private var mouseDownMonitor: Any?
     private var keyDownMonitor: Any?
+    private var screenObserver: NSObjectProtocol?
     private var hoverCheckTimer: Timer?
 
     private var isHovered = false
@@ -33,6 +34,7 @@ final class OverlayWindowController {
         if let m = mouseMoveMonitor { NSEvent.removeMonitor(m) }
         if let m = mouseDownMonitor { NSEvent.removeMonitor(m) }
         if let m = keyDownMonitor { NSEvent.removeMonitor(m) }
+        if let observer = screenObserver { NotificationCenter.default.removeObserver(observer) }
     }
 
     private func setupPanel() {
@@ -80,7 +82,7 @@ final class OverlayWindowController {
     }
 
     private func observeScreens() {
-        NotificationCenter.default.addObserver(
+        screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main

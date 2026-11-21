@@ -252,14 +252,15 @@ enum WhisperModelPreset: String, CaseIterable, Identifiable, Sendable {
     }
 
     var downloadURL: URL {
-        URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(rawValue)")!
+        guard let url = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(rawValue)") else {
+            preconditionFailure("Invalid Whisper model download URL for \(rawValue)")
+        }
+        return url
     }
 }
 
 enum WhisperModelLocator {
-    static let defaultModelDownloadURL = URL(
-        string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin"
-    )!
+    static let defaultModelDownloadURL = WhisperModelPreset.tiny.downloadURL
     static let defaultModelFilename = "ggml-tiny.bin"
 
     /// Shared directory used when BarTune downloads a model so other tools on the Mac can reuse it.
@@ -582,7 +583,7 @@ enum LyricsAudioAligner {
         var tokens: [DisplayToken] = []
         var cursor = 0
 
-        while CFStringTokenizerAdvanceToNextToken(tokenizer) != [] {
+        while !CFStringTokenizerAdvanceToNextToken(tokenizer).isEmpty {
             let tokenRange = CFStringTokenizerGetCurrentTokenRange(tokenizer)
             guard tokenRange.location != kCFNotFound, tokenRange.length > 0 else { continue }
             if tokenRange.location > cursor {
