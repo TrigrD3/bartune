@@ -632,7 +632,7 @@ enum LyricsAudioAligner {
                 let windowWords = sortedRecognized.filter {
                     $0.startTime >= shiftedStart - 0.6 && $0.startTime < shiftedEnd + 0.4
                 }
-                if !windowWords.isEmpty {
+                if !windowWords.isEmpty, Self.transcriptionMatchesLine(lineTokens: lineTokens, recognized: windowWords) {
                     matchedLineCount += 1
                     matchedWordCount += windowWords.count
                     let transcribedWords: [WordTimestamp] = windowWords.enumerated().map { idx, word in
@@ -758,6 +758,39 @@ enum LyricsAudioAligner {
             }
         }
         return false
+    }
+
+    /// Guards transcription-text overwrite so unrelated desktop speech cannot replace a song's lyrics.
+    static func transcriptionMatchesLine(lineTokens: [DisplayToken], recognized: [RecognizedAudioWord]) -> Bool {
+        let lineNorms = lineTokens.map(\.normalized).filter { !$0.isEmpty }
+        let recNorms = recognized.map { normalizeToken($0.text) }.filter { !$0.isEmpty }
+        guard !lineNorms.isEmpty, !recNorms.isEmpty else { return false }
+
+        // Direct token match (handles both Latin and segmented CJK words).
+        for lt in lineNorms where recNorms.contains(where: { tokensMatch(lt, $0) }) {
+            return true
+        }
+
+        // Character bigram overlap fallback (handles minor pronunciation/kanji differences).
+        let lineJoined = lineNorms.joined()
+        let recJoined = recNorms.joined()
+        let lineBigrams = characterBigrams(lineJoined)
+        let recBigrams = characterBigrams(recJoined)
+        guard !lineBigrams.isEmpty, !recBigrams.isEmpty else { return false }
+        let shared = lineBigrams.intersection(recBigrams).count
+        let denom = min(lineBigrams.count, recBigrams.count)
+        return Double(shared) / Double(max(1, denom)) >= 0.30
+    }
+
+    private static func characterBigrams(_ text: String) -> Set<String> {
+        let chars = Array(text)
+        guard chars.count >= 2 else { return chars.isEmpty ? [] : [text] }
+        var out = Set<String>()
+        out.reserveCapacity(chars.count - 1)
+        for i in 0..<(chars.count - 1) {
+            out.insert(String(chars[i...i + 1]))
+        }
+        return out
     }
 
     private static func interpolateWordTimestamps(

@@ -10,7 +10,7 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
     private var stream: SCStream?
     private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
 
-    func start() async throws {
+    func start(targetBundleIds: Set<String> = []) async throws {
         stop()
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
         guard let display = content.displays.first else {
@@ -19,7 +19,12 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, @unchecked Sen
             ])
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        let matchedApps = content.applications.filter { targetBundleIds.contains($0.bundleIdentifier) }
+        let filter: SCContentFilter = if !matchedApps.isEmpty {
+            SCContentFilter(display: display, including: matchedApps, exceptingWindows: [])
+        } else {
+            SCContentFilter(display: display, excludingWindows: [])
+        }
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
@@ -233,6 +238,26 @@ final class AudioSyncManager {
         return wordSyncedCount * 2 >= nonEmpty.count
     }
 
+    /// Maps a BarTune track ID prefix to the exact media player bundle ID(s) for isolated ScreenCaptureKit audio capture.
+    nonisolated static func targetBundleIdentifiers(for trackId: String) -> Set<String> {
+        if trackId.hasPrefix("spotify:") {
+            return ["com.spotify.client"]
+        }
+        if trackId.hasPrefix("music:") {
+            return ["com.apple.Music"]
+        }
+        if trackId.hasPrefix("browser:") {
+            return [
+                "com.google.Chrome",
+                "company.thebrowser.Browser",
+                "com.brave.Browser",
+                "com.microsoft.edgemac",
+                "com.apple.Safari",
+            ]
+        }
+        return []
+    }
+
     func handlePlaybackStateChanged(isPlaying: Bool) {
         guard !isPlaying, isLiveSyncActive else { return }
         // Persist whatever alignment we gathered before pausing/stopping.
@@ -367,9 +392,10 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
+        let targetBundles = Self.targetBundleIdentifiers(for: track.id)
         Task { [weak self] in
             do {
-                try await self?.capture.start()
+                try await self?.capture.start(targetBundleIds: targetBundles)
             } catch {
                 await MainActor.run {
                     self?.isLiveSyncActive = false
@@ -438,9 +464,10 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
+        let targetBundles = Self.targetBundleIdentifiers(for: track.id)
         Task { [weak self] in
             do {
-                try await self?.capture.start()
+                try await self?.capture.start(targetBundleIds: targetBundles)
             } catch {
                 await MainActor.run {
                     self?.isLiveSyncActive = false
