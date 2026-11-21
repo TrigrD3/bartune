@@ -47,6 +47,7 @@ struct SettingsView: View {
     @State private var cachedSongs: [CachedSongSummary] = []
     @State private var cacheSearchQuery: String = ""
     @State private var inspectingSong: CachedSongSummary?
+    @State private var showClearCacheConfirmation: Bool = false
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
     @State private var whisperCLIFound: Bool = false
     @State private var isDownloadingModel: Bool = false
@@ -596,9 +597,7 @@ struct SettingsView: View {
                         refreshCacheStats()
                     }
                     Button("Clear Cache", role: .destructive) {
-                        LyricsDiskCache.default.clear()
-                        AudioSyncedLyricsCache.default.clear()
-                        refreshCacheStats()
+                        showClearCacheConfirmation = true
                     }
                     .disabled(cachedSongCount == 0 && syncedSongCount == 0)
                 }
@@ -693,6 +692,20 @@ struct SettingsView: View {
         }
         .sheet(item: $inspectingSong) { song in
             CachedSongFileSheet(song: song)
+        }
+        .alert("Clear Offline Cache?", isPresented: $showClearCacheConfirmation) {
+            Button("Clear All Cache", role: .destructive) {
+                LyricsDiskCache.default.clear()
+                AudioSyncedLyricsCache.default.clear()
+                refreshCacheStats()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This will permanently delete \(cachedSongCount) cached "
+                    + "\(cachedSongCount == 1 ? "song" : "songs") and \(syncedSongCount) audio-synced "
+                    + "\(syncedSongCount == 1 ? "track" : "tracks") from disk."
+            )
         }
     }
 
