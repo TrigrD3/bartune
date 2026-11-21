@@ -415,4 +415,66 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "browser:yt:xyz").contains("com.google.Chrome"))
         XCTAssertTrue(AudioSyncManager.targetBundleIdentifiers(for: "unknown:1").isEmpty)
     }
+
+    func testSingleMatchedLineDoesNotShiftGlobalOffset() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "First line here"),
+            LyricLine(id: 1, timestamp: 30.0, text: "Future unsung line"),
+        ]
+        // Only a single line matches +6.0s away — must NOT shift the entire song.
+        let recognized = [
+            RecognizedAudioWord(text: "first", startTime: 16.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "line", startTime: 16.4, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "here", startTime: 16.8, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+        XCTAssertNil(result.medianOffset)
+        XCTAssertEqual(result.lines[1].timestamp, 30.0, accuracy: 0.01)
+    }
+
+    func testWhisperModelPresetsProvideValidDownloadURLs() {
+        XCTAssertEqual(WhisperModelPreset.allCases.count, 4)
+        for preset in WhisperModelPreset.allCases {
+            XCTAssertTrue(preset.downloadURL.absoluteString.hasSuffix(preset.rawValue))
+        }
+    }
+
+    func testCachedRecordReliabilityRejectsSingleLinePartialMatchAndOutlierOffsets() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 1.0, text: "Line one"),
+            LyricLine(id: 1, timestamp: 5.0, text: "Line two"),
+            LyricLine(id: 2, timestamp: 9.0, text: "Line three"),
+        ]
+
+        let singleLinePartial = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:partial",
+            engine: .appleSpeech,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 1,
+            lines: lines
+        )
+        XCTAssertFalse(singleLinePartial.isReliable)
+
+        let outlierOffset = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:outlier",
+            engine: .appleSpeech,
+            syncedAt: Date(),
+            medianOffset: 9.85,
+            alignedLineCount: 3,
+            lines: lines
+        )
+        XCTAssertFalse(outlierOffset.isReliable)
+
+        let reliable = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:good",
+            engine: .whisper,
+            syncedAt: Date(),
+            medianOffset: -0.45,
+            alignedLineCount: 2,
+            lines: lines
+        )
+        XCTAssertTrue(reliable.isReliable)
+    }
 }

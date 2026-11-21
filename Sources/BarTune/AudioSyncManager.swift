@@ -220,9 +220,12 @@ final class AudioSyncManager {
         if forceResync {
             cache.remove(trackId: track.id)
         } else if let cached = cache.load(trackId: track.id) {
-            state.applyAudioSyncedLines(cached.lines)
-            state.audioSyncStatus = .cached(cached.engine)
-            return
+            if cached.isReliable {
+                state.applyAudioSyncedLines(cached.lines)
+                state.audioSyncStatus = .cached(cached.engine)
+                return
+            }
+            cache.remove(trackId: track.id)
         } else if !state.replaceLyricsWithTranscription, Self.hasPreexistingWordSync(rawLines) {
             state.audioSyncStatus = .cached(engine)
             return
@@ -612,16 +615,16 @@ final class AudioSyncManager {
         return WhisperJSONParser.parse(data: data, chunkStartTime: request.chunkStartTime)
     }
 
-    /// Downloads the default tiny GGML model into `~/.cache/whisper/` so other tools on the Mac can reuse it.
-    static func downloadSharedDefaultModel() async throws -> URL {
+    /// Downloads a GGML Whisper model preset into `~/.cache/whisper/` so other tools on the Mac can reuse it.
+    static func downloadSharedModel(_ preset: WhisperModelPreset = .tiny) async throws -> URL {
         let dir = WhisperModelLocator.sharedCacheDirectory()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let destURL = dir.appendingPathComponent(WhisperModelLocator.defaultModelFilename)
+        let destURL = dir.appendingPathComponent(preset.rawValue)
         if FileManager.default.fileExists(atPath: destURL.path) {
             return destURL
         }
 
-        let (tempURL, response) = try await URLSession.shared.download(from: WhisperModelLocator.defaultModelDownloadURL)
+        let (tempURL, response) = try await URLSession.shared.download(from: preset.downloadURL)
         if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
             throw NSError(domain: "BarTune.WhisperDownload", code: http.statusCode, userInfo: [
                 NSLocalizedDescriptionKey: "Download failed with HTTP \(http.statusCode)",
