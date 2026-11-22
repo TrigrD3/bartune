@@ -79,6 +79,33 @@ enum FontOption: String, CaseIterable, Identifiable {
         }
     }
 
+    /// AppKit counterpart of `font(size:weight:)`, used to measure glyph positions with CoreText.
+    func nsFont(size: Double, weight: FontWeightOption) -> NSFont {
+        let system = NSFont.systemFont(ofSize: size, weight: weight.nsWeight)
+        let design: NSFontDescriptor.SystemDesign? = switch self {
+        case .sfRounded: .rounded
+        case .sfSerif: .serif
+        case .sfMono: .monospaced
+        default: nil
+        }
+        if let design, let descriptor = system.fontDescriptor.withDesign(design) {
+            return NSFont(descriptor: descriptor, size: size) ?? system
+        }
+        let customName: String? = switch self {
+        case .avenirNext: "Avenir Next"
+        case .helveticaNeue: "Helvetica Neue"
+        case .futura: "Futura"
+        case .georgia: "Georgia"
+        default: nil
+        }
+        guard let customName else { return system }
+        let descriptor = NSFontDescriptor(fontAttributes: [
+            .family: customName,
+            .traits: [NSFontDescriptor.TraitKey.weight: weight.nsWeight.rawValue],
+        ])
+        return NSFont(descriptor: descriptor, size: size) ?? system
+    }
+
     func font(size: Double, weight: FontWeightOption) -> Font {
         switch self {
         case .sfPro:
@@ -111,6 +138,15 @@ enum FontWeightOption: String, CaseIterable, Identifiable {
 
     var title: String {
         rawValue.capitalized
+    }
+
+    var nsWeight: NSFont.Weight {
+        switch self {
+        case .regular: return .regular
+        case .medium: return .medium
+        case .semibold: return .semibold
+        case .bold: return .bold
+        }
     }
 
     var swiftUIWeight: Font.Weight {
@@ -932,20 +968,74 @@ final class LyricsState: ObservableObject {
         }
     }
 
-    func liveProgress(at date: Date) -> Double {
+    private struct BoundaryKey: Equatable {
+        let line: LyricLine
+        let fontName: String
+        let fontSize: CGFloat
+    }
+
+    private var boundaryCache: (key: BoundaryKey, fractions: [Double]?)?
+
+    /// `font` is the overlay's font; with it, the edge moves through measured glyph positions.
+    func liveProgress(at date: Date, font: NSFont? = nil) -> Double {
         guard isPlaying, let line = activeLine else { return 0.0 }
         let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
         let effectivePos = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
-        return Self.computeLineProgress(line: line, nextTimestamp: activeLineNextTimestamp, position: effectivePos)
+        let boundaries = font.flatMap { wordBoundaries(for: line, font: $0) }
+        return Self.computeLineProgress(
+            line: line,
+            nextTimestamp: activeLineNextTimestamp,
+            position: effectivePos,
+            boundaries: boundaries
+        )
     }
 
-    static func computeLineProgress(line: LyricLine, nextTimestamp: Double, position: Double) -> Double {
+    private func wordBoundaries(for line: LyricLine, font: NSFont) -> [Double]? {
+        guard !line.words.isEmpty else { return nil }
+        let key = BoundaryKey(line: line, fontName: font.fontName, fontSize: font.pointSize)
+        if let cached = boundaryCache, cached.key == key {
+            return cached.fractions
+        }
+        let fractions = Self.wordBoundaryFractions(words: line.words, lineText: line.text, font: font)
+        boundaryCache = (key, fractions)
+        return fractions
+    }
+
+    /// Share of the rendered line width at each word boundary (`words.count + 1` values), measured with
+    /// CoreText; nil when the words don't spell out the line text.
+    static func wordBoundaryFractions(words: [WordTimestamp], lineText: String, font: NSFont) -> [Double]? {
+        guard !words.isEmpty, !lineText.isEmpty else { return nil }
+        let joined = words.map(\.text).joined()
+        guard joined == lineText || joined.trimmingCharacters(in: .whitespacesAndNewlines) == lineText else {
+            return nil
+        }
+        let ctLine = CTLineCreateWithAttributedString(NSAttributedString(string: lineText, attributes: [.font: font]))
+        let width = CTLineGetTypographicBounds(ctLine, nil, nil, nil)
+        guard width > 0 else { return nil }
+        let length = (lineText as NSString).length
+        var fractions: [Double] = [0]
+        var index = 0
+        for word in words {
+            index = min(length, index + (word.text as NSString).length)
+            let offset = Double(CTLineGetOffsetForStringIndex(ctLine, index, nil)) / width
+            fractions.append(min(1, max(fractions[fractions.count - 1], offset)))
+        }
+        return fractions
+    }
+
+    static func computeLineProgress(
+        line: LyricLine,
+        nextTimestamp: Double,
+        position: Double,
+        boundaries: [Double]? = nil
+    ) -> Double {
         let rawDuration = max(0.4, nextTimestamp - line.timestamp)
         if !line.words.isEmpty {
             return computeWordProgress(
                 words: line.words,
                 position: position,
-                lineEnd: line.duration.map { line.timestamp + $0 } ?? nextTimestamp
+                lineEnd: line.duration.map { line.timestamp + $0 } ?? nextTimestamp,
+                boundaries: boundaries
             )
         }
         let effectiveDuration: Double
@@ -964,25 +1054,33 @@ final class LyricsState: ObservableObject {
     private static func computeWordProgress(
         words: [WordTimestamp],
         position: Double,
-        lineEnd: Double
+        lineEnd: Double,
+        boundaries: [Double]?
     ) -> Double {
         let totalChars = max(1, words.reduce(0) { $0 + $1.text.count })
+        let measured = boundaries.flatMap { $0.count == words.count + 1 ? $0 : nil }
         var charsBefore = 0
+
+        func edge(word index: Int, fraction: Double) -> Double {
+            if let measured {
+                return measured[index] + (measured[index + 1] - measured[index]) * fraction
+            }
+            return (Double(charsBefore) + Double(words[index].text.count) * fraction) / Double(totalChars)
+        }
 
         for (i, word) in words.enumerated() {
             let wordStart = word.timestamp
             let fallbackEnd = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
             let wordEnd = word.duration.map { wordStart + $0 } ?? fallbackEnd
-            let wordChars = word.text.count
 
             if position < wordStart {
-                return Double(charsBefore) / Double(totalChars)
+                return edge(word: i, fraction: 0)
             } else if position < wordEnd {
                 let wordDur = max(0.04, wordEnd - wordStart)
                 let frac = min(1.0, max(0.0, (position - wordStart) / wordDur))
-                return (Double(charsBefore) + Double(wordChars) * frac) / Double(totalChars)
+                return edge(word: i, fraction: frac)
             }
-            charsBefore += wordChars
+            charsBefore += word.text.count
         }
         return 1.0
     }
