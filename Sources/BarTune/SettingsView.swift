@@ -110,6 +110,9 @@ struct SettingsView: View {
     @State private var showClearCacheConfirmation: Bool = false
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
     @State private var whisperServerFound: Bool = false
+    @State private var lyricsAlignerInstalled: Bool = false
+    @State private var isDownloadingAligner: Bool = false
+    @State private var alignerDownloadError: String?
     @State private var isDownloadingModel: Bool = false
     @State private var modelDownloadError: String?
     @State private var selectedDownloadPreset: WhisperModelPreset = .base
@@ -523,6 +526,39 @@ struct SettingsView: View {
                             state.onResyncCurrentTrack?()
                         }
                         .disabled(!state.hasLyrics)
+                    }
+                }
+
+                if state.audioSyncEngine == .lyricsAlignment {
+                    HStack {
+                        Text("Alignment Model")
+                        Spacer()
+                        Text(lyricsAlignerInstalled ? "Installed" : "Not installed")
+                            .font(.caption)
+                            .foregroundStyle(lyricsAlignerInstalled ? Color.secondary : Color.orange)
+                    }
+                    if !lyricsAlignerInstalled {
+                        HStack {
+                            if isDownloadingAligner {
+                                ProgressView()
+                                    .controlSize(.small)
+                                Text("Downloading…")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Button("Download Model (\(LyricsAlignerModel.downloadSizeDescription))") {
+                                    downloadLyricsAligner()
+                                }
+                            }
+                        }
+                        Text("MMS forced-aligner by Meta, CC BY-NC 4.0 (non-commercial use).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if let alignerDownloadError {
+                            Text(alignerDownloadError)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                        }
                     }
                 }
 
@@ -1127,6 +1163,7 @@ struct SettingsView: View {
 
     private func refreshWhisperDiscovery() {
         whisperServerFound = WhisperModelLocator.locateWhisperServer() != nil
+        lyricsAlignerInstalled = LyricsAlignerModel.isInstalled()
         discoveredModels = WhisperModelLocator.discoverModels(customPath: state.whisperModelPath)
     }
 
@@ -1139,6 +1176,26 @@ struct SettingsView: View {
         if panel.runModal() == .OK, let url = panel.url {
             state.whisperModelPath = url.path
             refreshWhisperDiscovery()
+        }
+    }
+
+    private func downloadLyricsAligner() {
+        isDownloadingAligner = true
+        alignerDownloadError = nil
+        Task {
+            do {
+                try await LyricsAlignerModel.download()
+                await MainActor.run {
+                    isDownloadingAligner = false
+                    refreshWhisperDiscovery()
+                    state.onResyncCurrentTrack?()
+                }
+            } catch {
+                await MainActor.run {
+                    isDownloadingAligner = false
+                    alignerDownloadError = error.localizedDescription
+                }
+            }
         }
     }
 

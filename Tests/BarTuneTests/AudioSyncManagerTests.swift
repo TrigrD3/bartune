@@ -470,6 +470,63 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testLyricsAlignmentAppliesAlignedWordsWithoutWhisper() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let launchedWith = LockedBox<[String]>([])
+        let aligned = ["Hello", "world", "from", "test"].enumerated().map { index, word in
+            RecognizedAudioWord(text: word, startTime: 11.0 + Double(index) * 0.5, duration: 0.4, confidence: 0.5)
+        }
+        let deps = AudioSyncManager.Dependencies(
+            capture: fakeCapture,
+            hasScreenCaptureAccess: { true },
+            requestScreenCaptureAccess: {},
+            locateWhisperServer: { nil },
+            resolveWhisperModelPath: { _ in nil },
+            launchWhisper: { _, _ in nil },
+            whisperChunkDurationSeconds: 1.0,
+            launchLyricsAligner: { lines in
+                launchedWith.withLock { $0 = lines.map(\.text) }
+                return FakeWhisperEngine { _ in aligned }
+            }
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started, "capture starts without a whisper-server")
+        XCTAssertEqual(launchedWith.withLock { $0 }, sampleLines().map(\.text))
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let synced = await waitUntil { state.audioSyncStatus != .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 2) }
+
+        XCTAssertTrue(synced)
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 1, totalLines: 2))
+        XCTAssertEqual(state.rawLyricLines.first?.timestamp ?? 0, 11.0, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testLyricsAlignmentReportsAMissingModel() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.launchLyricsAligner = { _ in nil }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+
+        let reported = await waitUntil {
+            if case .unavailable = state.audioSyncStatus { return true }
+            return false
+        }
+        XCTAssertTrue(reported)
+        XCTAssertEqual(fakeCapture.startCount, 0)
+    }
+
+    @MainActor
     func testWhisperChunksCarryTheLyricLanguage() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .whisper
