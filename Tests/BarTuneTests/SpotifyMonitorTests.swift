@@ -1,4 +1,3 @@
-import Speech
 @testable import BarTune
 import XCTest
 
@@ -422,21 +421,16 @@ final class SpotifyMonitorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
 
         let fakeCapture = MonitorFakeAudioCapture()
-        let fakeRecognizer = MonitorFakeSpeechRecognizer()
         let syncDeps = AudioSyncManager.Dependencies(
             capture: fakeCapture,
             hasScreenCaptureAccess: { true },
             requestScreenCaptureAccess: {},
-            speechAuthorizationStatus: { .authorized },
-            requestSpeechAuthorization: { _ in },
-            makeSpeechRecognizer: { _ in fakeRecognizer },
-            makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
-            locateWhisperServer: { nil },
-            resolveWhisperModelPath: { _ in nil },
-            launchWhisper: { _, _ in nil },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            launchWhisper: { _, _ in MonitorFakeWhisperEngine() },
             whisperChunkDurationSeconds: 12.0
         )
         let syncManager = AudioSyncManager(
@@ -512,21 +506,16 @@ final class SpotifyMonitorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
 
         let fakeCapture = MonitorFakeAudioCapture()
-        let fakeRecognizer = MonitorFakeSpeechRecognizer()
         let syncDeps = AudioSyncManager.Dependencies(
             capture: fakeCapture,
             hasScreenCaptureAccess: { true },
             requestScreenCaptureAccess: {},
-            speechAuthorizationStatus: { .authorized },
-            requestSpeechAuthorization: { _ in },
-            makeSpeechRecognizer: { _ in fakeRecognizer },
-            makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
-            locateWhisperServer: { nil },
-            resolveWhisperModelPath: { _ in nil },
-            launchWhisper: { _, _ in nil },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            launchWhisper: { _, _ in MonitorFakeWhisperEngine() },
             whisperChunkDurationSeconds: 12.0
         )
         let syncManager = AudioSyncManager(
@@ -725,20 +714,10 @@ private final class MonitorFakeAudioCapture: AudioCaptureProviding {
     }
 }
 
-private final class MonitorFakeSpeechTask: SpeechRecognitionTaskHandling {
-    func cancel() {}
-}
-
-private final class MonitorFakeSpeechRecognizer: SpeechRecognizing {
-    var isAvailable: Bool { true }
-    var supportsOnDeviceRecognition: Bool { true }
-    private(set) var resultHandlers: [@Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void] = []
-
-    func startRecognitionTask(
-        with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
-    ) -> SpeechRecognitionTaskHandling {
-        resultHandlers.append(resultHandler)
-        return MonitorFakeSpeechTask()
+private final class MonitorFakeWhisperEngine: WhisperTranscribing {
+    // swiftlint:disable:next async_without_await
+    func transcribe(_ request: AudioSyncManager.WhisperChunkRequest) async -> [RecognizedAudioWord] {
+        []
     }
+    func shutdown() {}
 }
