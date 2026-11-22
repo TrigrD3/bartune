@@ -102,6 +102,7 @@ struct SettingsView: View {
     let cacheRemover: OfflineCacheRemover
     @ObservedObject var updater: AppUpdaterModel
     let diagnostics: AudioSyncDiagnosticsModel
+    var onOpenLyricTimingEditor: () -> Void = {}
     @State private var selectedTab: SettingsTab = .general
     @StateObject private var cacheStats = OfflineCacheStatsModel()
     @State private var cacheSearchQuery: String = ""
@@ -503,6 +504,21 @@ struct SettingsView: View {
                 Toggle("Japanese → Romaji", isOn: $state.romanizeJapanese)
                 Toggle("Korean → Romanized", isOn: $state.romanizeKorean)
                 Toggle("Chinese → Pinyin", isOn: $state.romanizeChinese)
+            }
+
+            Section("Manual Lyric Timing") {
+                HStack {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Lyric Timing Editor")
+                        Text("Tap-to-time lines and words by hand and save a Custom version per song.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Edit Lyric Timing…") {
+                        onOpenLyricTimingEditor()
+                    }
+                }
             }
 
             Section("Audio Karaoke Sync") {
@@ -1686,18 +1702,21 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let cacheRemover: OfflineCacheRemover
     private let appUpdater: AppUpdaterModel
     private let diagnostics: AudioSyncDiagnosticsModel
+    private let onOpenLyricTimingEditor: () -> Void
     private var window: NSWindow?
 
     init(
         state: LyricsState,
         cacheRemover: OfflineCacheRemover,
         appUpdater: AppUpdaterModel,
-        diagnostics: AudioSyncDiagnosticsModel
+        diagnostics: AudioSyncDiagnosticsModel,
+        onOpenLyricTimingEditor: @escaping () -> Void = {}
     ) {
         self.state = state
         self.cacheRemover = cacheRemover
         self.appUpdater = appUpdater
         self.diagnostics = diagnostics
+        self.onOpenLyricTimingEditor = onOpenLyricTimingEditor
         super.init()
     }
 
@@ -1709,7 +1728,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
 
         let hosting = NSHostingController(
-            rootView: SettingsView(state: state, cacheRemover: cacheRemover, updater: appUpdater, diagnostics: diagnostics)
+            rootView: SettingsView(
+                state: state,
+                cacheRemover: cacheRemover,
+                updater: appUpdater,
+                diagnostics: diagnostics,
+                onOpenLyricTimingEditor: onOpenLyricTimingEditor
+            )
         )
         let win = NSWindow(contentViewController: hosting)
         win.title = "BarTune Settings"

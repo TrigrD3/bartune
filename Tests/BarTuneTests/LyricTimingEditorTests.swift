@@ -150,6 +150,52 @@ final class LyricTimingSessionTests: XCTestCase {
         let latinWords = [EditableWord(text: "Hello "), EditableWord(text: "world")]
         XCTAssertEqual(LyricTimingSession.romanizedWordPreviews(for: latinWords), ["", ""])
     }
+
+    func testImportedWordDurationsArePreservedUntilRetimed() {
+        var session = LyricTimingSession(lines: [
+            LyricLine(id: 0, timestamp: 10.0, duration: 5.0, text: "Alpha beta", words: [
+                WordTimestamp(timestamp: 10.0, duration: 0.3, text: "Alpha "),
+                WordTimestamp(timestamp: 12.0, duration: 0.4, text: "beta"),
+            ]),
+        ])
+
+        // Unrelated edit (or no word edit) preserves exact imported durations.
+        let preserved = session.buildLyricLines()
+        XCTAssertEqual(preserved[0].words[0].duration ?? 0, 0.3, accuracy: 0.001)
+        XCTAssertEqual(preserved[0].words[1].duration ?? 0, 0.4, accuracy: 0.001)
+
+        // Retiming word 0 clears its preserved duration so it derives to word 1's start.
+        session.nudgeWord(lineIndex: 0, wordIndex: 0, by: 0.1)
+        let retimed = session.buildLyricLines()
+        XCTAssertEqual(retimed[0].words[0].timestamp, 10.1, accuracy: 0.001)
+        XCTAssertEqual(retimed[0].words[0].duration ?? 0, 1.9, accuracy: 0.001)
+        XCTAssertEqual(retimed[0].words[1].duration ?? 0, 0.4, accuracy: 0.001)
+    }
+
+    func testUndoStampPreservesLaterTextEditsAndAddedLines() {
+        var session = LyricTimingSession()
+        session.replaceWithPlainText("First\nSecond")
+        session.beginLinePass()
+        XCTAssertTrue(session.stamp(at: 10.0))
+
+        // Edit line 1's text and add line 2 after stamping line 0.
+        session.updateLineText(at: 1, to: "Second edited")
+        session.addLine(after: 1, text: "Third added")
+
+        XCTAssertTrue(session.undoLastStamp())
+        XCTAssertNil(session.lines[0].timestamp, "stamped timestamp must be undone")
+        XCTAssertEqual(session.lines.count, 3, "added line must survive undo")
+        XCTAssertEqual(session.lines[1].text, "Second edited", "later text edit must survive undo")
+        XCTAssertEqual(session.lines[2].text, "Third added")
+    }
+
+    func testUnstampedLineNumbersIdentifyRemainingLines() {
+        var session = LyricTimingSession()
+        session.replaceWithPlainText("Line one\nLine two\nLine three")
+        session.beginLinePass()
+        XCTAssertTrue(session.stamp(at: 5.0))
+        XCTAssertEqual(session.unstampedLineNumbers, [2, 3])
+    }
 }
 
 final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
@@ -210,7 +256,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         )
     }
 
-    func testCustomStoreRoundTripAndIsolationFromCacheClearPruneAndRemover() async {
+    func testCustomStoreRoundTripAndIsolationFromCacheClearPruneAndRemover() async throws {
         let customDir = tempDir.appendingPathComponent("custom-lyrics", isDirectory: true)
         let lyricsCacheDir = tempDir.appendingPathComponent("lyrics-cache", isDirectory: true)
         let syncCacheDir = tempDir.appendingPathComponent("audio-sync", isDirectory: true)
@@ -242,7 +288,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
             lines: customLines
         )
 
-        customStore.save(customRecord)
+        try customStore.save(customRecord)
         lyricsCache.save(trackId: track.id, lines: fetchedLines)
         syncCache.save(AudioSyncedLyricsRecord(
             trackId: track.id, engine: .whisper, syncedAt: savedDate, medianOffset: 0.1,
@@ -314,6 +360,24 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         let safariPlayPause = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(for: .playPause, browser: safari, tab: tab))
         XCTAssertTrue(safariPlayPause.contains("m.paused ? m.play() : m.pause()"))
         XCTAssertTrue(safariPlayPause.contains("do JavaScript"))
+
+        // Targeted editor seeks verify the player's current track and never fall back to another player.
+        let guardedSpotify = try XCTUnwrap(SpotifyMonitor.transportScriptSource(
+            for: .seek(12.5),
+            activeTrackId: "spotify:track:abc",
+            runningBundleIds: ["com.spotify.client"],
+            expectedTrackId: "spotify:track:abc"
+        ))
+        XCTAssertTrue(guardedSpotify.contains("id of current track as string"))
+        XCTAssertTrue(guardedSpotify.contains("spotify:track:abc"))
+
+        let musicExitedNoFallback = SpotifyMonitor.transportScriptSource(
+            for: .seek(12.5),
+            activeTrackId: "",
+            runningBundleIds: ["com.spotify.client"],
+            expectedTrackId: "music:12345"
+        )
+        XCTAssertNil(musicExitedNoFallback, "editor seek for Music must not fall back to Spotify")
     }
 
     @MainActor
@@ -327,14 +391,15 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         let lines = [LyricLine(id: 0, timestamp: 5.0, text: "Stay visible")]
         state.setTrack(track, lyrics: lines)
 
+        var deletedTrackIds: [String] = []
         let model = LyricTimingEditorModel(
             state: state,
             customLyricsStore: customStore,
-            onSeek: { _ in },
-            onTogglePlayPause: {},
+            onSeek: { _, _ in },
+            onTogglePlayPause: { _ in },
             onSelectSource: { _, _ in },
-            onSaveCustom: { _, _ in },
-            onDeleteCustom: { _ in }
+            onSaveCustom: { _, _ in throw CustomLyricsStoreError.emptyLyrics },
+            onDeleteCustom: { deletedTrackIds.append($0.id) }
         )
         XCTAssertEqual(model.activeTrack?.id, track.id)
         XCTAssertEqual(model.session.lines.count, 1)
@@ -344,6 +409,41 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         model.loadCurrentTrack()
         XCTAssertEqual(model.activeTrack?.id, track.id)
         XCTAssertEqual(model.session.lines.count, 1)
+
+        // Save error must keep draft and not switch source to .custom.
+        let pending = try XCTUnwrap(model.prepareCustomSave())
+        XCTAssertFalse(model.commitCustomSave(pending))
+        XCTAssertFalse(model.hasCustomLyrics)
+        XCTAssertNotEqual(model.selectedSource, .custom)
+
+        // Unstamped lines block prepareCustomSave and report line numbers.
+        model.session.addLine(after: 0, text: "Unstamped second line")
+        XCTAssertNil(model.prepareCustomSave())
+        XCTAssertTrue(try XCTUnwrap(model.statusMessage).contains("2"))
+
+        // Deleting with a stale captured track must not delete the active track.
+        let otherTrack = TrackInfo(id: "spotify:track:other", title: "Other", artist: "Other", album: "", duration: 120, artworkURL: nil)
+        model.deleteCustomLyrics(for: otherTrack)
+        XCTAssertTrue(deletedTrackIds.isEmpty)
+    }
+
+    @MainActor
+    func testOutOfOrderCustomLinesStillSelectCorrectActiveLineDuringPlayback() throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        let track = TrackInfo(id: "spotify:track:unsorted", title: "Unsorted", artist: "Art", album: "", duration: 120, artworkURL: nil)
+        let unsorted = [
+            LyricLine(id: 0, timestamp: 20.0, text: "Later timestamp first"),
+            LyricLine(id: 1, timestamp: 10.0, text: "Earlier timestamp second"),
+        ]
+        state.setTrack(track, lyrics: unsorted)
+        state.updatePlayback(isPlaying: true, position: 15.0)
+
+        XCTAssertEqual(state.currentLineId, 1)
+        XCTAssertEqual(state.currentText, "Earlier timestamp second")
+        XCTAssertEqual(state.activeLineNextTimestamp, 20.0, accuracy: 0.001)
     }
 
     @MainActor
@@ -405,7 +505,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
 
         // Saving Custom switches per-song choice to .custom, applies Custom lines, and stops audio sync.
         let customLines = [LyricLine(id: 0, timestamp: 10.4, duration: 4.0, text: "Hand-timed line")]
-        appDelegate.saveCustomLyrics(customLines, for: track)
+        try appDelegate.saveCustomLyrics(customLines, for: track)
         XCTAssertEqual(state.lyricSourceChoice(for: track.id), .custom)
         XCTAssertEqual(state.rawLyricLines, customLines)
         XCTAssertEqual(state.audioSyncStatus, .idle)

@@ -13,20 +13,20 @@ final class LyricTimingEditorModel: ObservableObject {
 
     private let state: LyricsState
     private let customLyricsStore: CustomLyricsStore
-    private let onSeek: (Double) -> Void
-    private let onTogglePlayPause: () -> Void
+    private let onSeek: (String, Double) -> Void
+    private let onTogglePlayPause: (String) -> Void
     private let onSelectSource: (TrackInfo, TrackLyricSource) -> Void
-    private let onSaveCustom: (TrackInfo, [LyricLine]) -> Void
+    private let onSaveCustom: (TrackInfo, [LyricLine]) throws -> Void
     private let onDeleteCustom: (TrackInfo) -> Void
     private var cancellables = Set<AnyCancellable>()
 
     init(
         state: LyricsState,
         customLyricsStore: CustomLyricsStore,
-        onSeek: @escaping (Double) -> Void,
-        onTogglePlayPause: @escaping () -> Void,
+        onSeek: @escaping (String, Double) -> Void,
+        onTogglePlayPause: @escaping (String) -> Void,
         onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> Void,
-        onSaveCustom: @escaping (TrackInfo, [LyricLine]) -> Void,
+        onSaveCustom: @escaping (TrackInfo, [LyricLine]) throws -> Void,
         onDeleteCustom: @escaping (TrackInfo) -> Void
     ) {
         self.state = state
@@ -92,11 +92,13 @@ final class LyricTimingEditorModel: ObservableObject {
     }
 
     func togglePlayPause() {
-        onTogglePlayPause()
+        guard let track = activeTrack else { return }
+        onTogglePlayPause(track.id)
     }
 
     func seek(to seconds: Double) {
-        onSeek(max(0.0, seconds))
+        guard let track = activeTrack else { return }
+        onSeek(track.id, max(0.0, seconds))
     }
 
     func nudgePlayback(by delta: Double) {
@@ -123,27 +125,53 @@ final class LyricTimingEditorModel: ObservableObject {
         _ = session.undoLastStamp()
     }
 
-    func saveCustomLyrics() {
-        guard let track = activeTrack else { return }
+    struct PendingCustomSave: Equatable {
+        let track: TrackInfo
+        let lines: [LyricLine]
+    }
+
+    /// Validates the draft for saving; returns the payload if valid, otherwise sets `statusMessage`.
+    func prepareCustomSave() -> PendingCustomSave? {
+        guard let track = activeTrack else { return nil }
+        let unstamped = session.unstampedLineNumbers
+        if !unstamped.isEmpty {
+            let preview = unstamped.prefix(5).map(String.init).joined(separator: ", ")
+            let suffix = unstamped.count > 5 ? ", …" : ""
+            let label = unstamped.count == 1 ? "line" : "lines"
+            statusMessage = "Stamp or delete remaining lines before saving (\(label) \(preview)\(suffix))."
+            return nil
+        }
         let built = session.buildLyricLines()
         guard !built.isEmpty else {
             statusMessage = "Stamp at least one line before saving."
-            return
+            return nil
         }
-        session.stopStamping()
-        onSaveCustom(track, built)
-        hasCustomLyrics = true
-        selectedSource = .custom
-        statusMessage = "Saved Custom timing (\(built.count) lines)."
+        return PendingCustomSave(track: track, lines: built)
     }
 
-    func deleteCustomLyrics() {
-        guard let track = activeTrack else { return }
+    @discardableResult
+    func commitCustomSave(_ pending: PendingCustomSave) -> Bool {
+        guard activeTrack?.id == pending.track.id else { return false }
         session.stopStamping()
-        onDeleteCustom(track)
+        do {
+            try onSaveCustom(pending.track, pending.lines)
+            hasCustomLyrics = true
+            selectedSource = .custom
+            statusMessage = "Saved Custom timing (\(pending.lines.count) lines)."
+            return true
+        } catch {
+            statusMessage = "Could not save Custom timing: \(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func deleteCustomLyrics(for capturedTrack: TrackInfo) {
+        guard activeTrack?.id == capturedTrack.id else { return }
+        session.stopStamping()
+        onDeleteCustom(capturedTrack)
         hasCustomLyrics = false
         selectedSource = LyricSourceResolver.effectiveSource(
-            choice: state.lyricSourceChoice(for: track.id),
+            choice: state.lyricSourceChoice(for: capturedTrack.id),
             hasCustomLyrics: false,
             audioSyncEngine: state.audioSyncEngine
         )
@@ -164,7 +192,8 @@ struct LyricTimingEditorView: View {
     @ObservedObject var model: LyricTimingEditorModel
     @State private var showPasteSheet = false
     @State private var pasteBuffer = ""
-    @State private var showDeleteConfirmation = false
+    @State private var trackPendingDeletion: TrackInfo?
+    @State private var pendingOverwriteSave: LyricTimingEditorModel.PendingCustomSave?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -197,15 +226,45 @@ struct LyricTimingEditorView: View {
         .sheet(isPresented: $showPasteSheet) {
             pasteLyricsSheet
         }
-        .alert("Delete Custom Lyrics?", isPresented: $showDeleteConfirmation) {
+        .alert(
+            "Delete Custom Lyrics?",
+            isPresented: Binding(
+                get: { trackPendingDeletion != nil },
+                set: { if !$0 { trackPendingDeletion = nil } }
+            ),
+            presenting: trackPendingDeletion
+        ) { capturedTrack in
             Button("Delete", role: .destructive) {
-                model.deleteCustomLyrics()
+                model.deleteCustomLyrics(for: capturedTrack)
+                trackPendingDeletion = nil
             }
-            Button("Cancel", role: .cancel) {}
-        } message: {
+            Button("Cancel", role: .cancel) {
+                trackPendingDeletion = nil
+            }
+        } message: { capturedTrack in
             Text(
-                "This removes your saved Custom timing for \(model.activeTrack?.title ?? "this song"). "
+                "This removes your saved Custom timing for \(capturedTrack.title). "
                     + "Fetched lyrics and automatic audio sync records will not be affected."
+            )
+        }
+        .alert(
+            "Replace Custom Lyrics?",
+            isPresented: Binding(
+                get: { pendingOverwriteSave != nil },
+                set: { if !$0 { pendingOverwriteSave = nil } }
+            ),
+            presenting: pendingOverwriteSave
+        ) { pending in
+            Button("Replace", role: .destructive) {
+                model.commitCustomSave(pending)
+                pendingOverwriteSave = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingOverwriteSave = nil
+            }
+        } message: { pending in
+            Text(
+                "This permanently replaces your previously saved Custom timing for \(pending.track.title)."
             )
         }
     }
@@ -634,9 +693,9 @@ struct LyricTimingEditorView: View {
 
     private var footerBar: some View {
         HStack(spacing: 10) {
-            if model.hasCustomLyrics {
+            if model.hasCustomLyrics, let track = model.activeTrack {
                 Button("Delete Custom…", role: .destructive) {
-                    showDeleteConfirmation = true
+                    trackPendingDeletion = track
                 }
             }
 
@@ -650,10 +709,15 @@ struct LyricTimingEditorView: View {
             Spacer()
 
             Button("Save Custom") {
-                model.saveCustomLyrics()
+                guard let pending = model.prepareCustomSave() else { return }
+                if model.hasCustomLyrics {
+                    pendingOverwriteSave = pending
+                } else {
+                    model.commitCustomSave(pending)
+                }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(model.session.buildLyricLines().isEmpty)
+            .disabled(model.session.lines.isEmpty)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
@@ -931,10 +995,10 @@ private struct TimestampField: View {
 final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
     private let state: LyricsState
     private let customLyricsStore: CustomLyricsStore
-    private let onSeek: (Double) -> Void
-    private let onTogglePlayPause: () -> Void
+    private let onSeek: (String, Double) -> Void
+    private let onTogglePlayPause: (String) -> Void
     private let onSelectSource: (TrackInfo, TrackLyricSource) -> Void
-    private let onSaveCustom: (TrackInfo, [LyricLine]) -> Void
+    private let onSaveCustom: (TrackInfo, [LyricLine]) throws -> Void
     private let onDeleteCustom: (TrackInfo) -> Void
 
     private var window: NSWindow?
@@ -944,10 +1008,10 @@ final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
     init(
         state: LyricsState,
         customLyricsStore: CustomLyricsStore,
-        onSeek: @escaping (Double) -> Void,
-        onTogglePlayPause: @escaping () -> Void,
+        onSeek: @escaping (String, Double) -> Void,
+        onTogglePlayPause: @escaping (String) -> Void,
         onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> Void,
-        onSaveCustom: @escaping (TrackInfo, [LyricLine]) -> Void,
+        onSaveCustom: @escaping (TrackInfo, [LyricLine]) throws -> Void,
         onDeleteCustom: @escaping (TrackInfo) -> Void
     ) {
         self.state = state
@@ -962,7 +1026,6 @@ final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         if let existing = window {
-            model?.loadCurrentTrack()
             existing.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return

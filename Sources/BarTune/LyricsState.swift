@@ -633,6 +633,7 @@ final class LyricsState: ObservableObject {
 
     private let userDefaults: UserDefaults
     private var rawLines: [LyricLine] = []
+    private var rawLinesAreSortedByTimestamp: Bool = true
     private var romanizedLines: [LyricLine] = []
     private var koreanRomanizedLines: [LyricLine] = []
     private var chineseRomanizedLines: [LyricLine] = []
@@ -816,6 +817,7 @@ final class LyricsState: ObservableObject {
         }
 
         rawLines = lyrics
+        rawLinesAreSortedByTimestamp = Self.areTimestampsNonDecreasing(lyrics)
         translatedLines = []
         translationsById = [:]
         clearActiveLineState()
@@ -941,6 +943,7 @@ final class LyricsState: ObservableObject {
     func applyAudioSyncedLines(_ lines: [LyricLine]) {
         guard !lines.isEmpty else { return }
         rawLines = lines
+        rawLinesAreSortedByTimestamp = Self.areTimestampsNonDecreasing(lines)
         hasLyrics = true
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lines)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lines)
@@ -1038,6 +1041,14 @@ final class LyricsState: ObservableObject {
         syncActiveLine(for: position + offsetSeconds, in: lines)
     }
 
+    private static func areTimestampsNonDecreasing(_ lines: [LyricLine]) -> Bool {
+        guard lines.count > 1 else { return true }
+        for idx in 1..<lines.count where lines[idx].timestamp < lines[idx - 1].timestamp {
+            return false
+        }
+        return true
+    }
+
     private func syncActiveLine(for effectivePos: Double, in lines: [LyricLine]) {
         guard !lines.isEmpty else {
             clearActiveLineState()
@@ -1047,24 +1058,41 @@ final class LyricsState: ObservableObject {
         var matchedIndex: Int?
         let selectionPos = effectivePos + lineTransitionLead
 
-        var lo = 0
-        var hi = lines.count - 1
-        while lo <= hi {
-            let mid = (lo + hi) / 2
-            if lines[mid].timestamp <= selectionPos {
-                matchedIndex = mid
-                lo = mid + 1
-            } else {
-                hi = mid - 1
+        if rawLinesAreSortedByTimestamp {
+            var lo = 0
+            var hi = lines.count - 1
+            while lo <= hi {
+                let mid = (lo + hi) / 2
+                if lines[mid].timestamp <= selectionPos {
+                    matchedIndex = mid
+                    lo = mid + 1
+                } else {
+                    hi = mid - 1
+                }
+            }
+        } else {
+            var bestTimestamp = -Double.infinity
+            for (index, candidate) in lines.enumerated() where candidate.timestamp <= selectionPos {
+                if candidate.timestamp >= bestTimestamp {
+                    bestTimestamp = candidate.timestamp
+                    matchedIndex = index
+                }
             }
         }
 
         if let idx = matchedIndex {
             let line = lines[idx]
             let displayText = line.text.isEmpty ? "♪" : line.text
-            let nextTimestamp: Double = (idx + 1 < lines.count)
-                ? lines[idx + 1].timestamp
-                : (line.timestamp + 4.5)
+            let nextTimestamp: Double = if rawLinesAreSortedByTimestamp {
+                (idx + 1 < lines.count)
+                    ? lines[idx + 1].timestamp
+                    : (line.timestamp + 4.5)
+            } else {
+                lines
+                    .map(\.timestamp)
+                    .filter { $0 > line.timestamp }
+                    .min() ?? (line.timestamp + 4.5)
+            }
 
             if line.id != currentLineId
                 || currentText != displayText
