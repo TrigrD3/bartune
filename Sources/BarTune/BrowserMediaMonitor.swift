@@ -388,6 +388,7 @@ final class BrowserMediaMonitor: @unchecked Sendable {
     // Compiled AppleScripts cached per browser bundle ID (accessed serially on SpotifyMonitor's scriptQueue).
     private var compiledListScripts: [String: NSAppleScript] = [:]
     private var compiledProbeScripts: [String: (windowIndex: Int, tabIndex: Int, includeYouTubeVideos: Bool, script: NSAppleScript)] = [:]
+    private(set) var lastActiveTab: (browser: BrowserTarget, tab: BrowserTabDescriptor)?
 
     private let listTabsHandler: ((BrowserTarget) -> [BrowserTabDescriptor])?
     private let probeTabHandler: ((BrowserTarget, BrowserTabDescriptor) -> String?)?
@@ -418,6 +419,7 @@ final class BrowserMediaMonitor: @unchecked Sendable {
                    sourceBundleId: browser.bundleId,
                    includeYouTubeVideos: includeYouTubeVideos
                ) {
+                lastActiveTab = (browser, tab)
                 return snapshot
             }
         }
@@ -476,6 +478,51 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         end tell
         return "IDLE"
         """
+    }
+
+    static func commandScriptSource(
+        for command: PlaybackCommand,
+        browser: BrowserTarget,
+        tab: BrowserTabDescriptor
+    ) -> String? {
+        let js: String
+        switch command {
+        case .playPause:
+            js = "(() => { const m = document.querySelector('video, audio'); if (m) { m.paused ? m.play() : m.pause(); } })()"
+        case let .seek(seconds):
+            let clamped = (seconds.isFinite && seconds > 0) ? seconds : 0.0
+            let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), clamped)
+            js = "(() => { const m = document.querySelector('video, audio'); if (m) { m.currentTime = \(formatted); } })()"
+        case .nextTrack, .previousTrack:
+            return nil
+        }
+        let escapedJS = escapeForAppleScript(js)
+        if browser.isSafari {
+            return """
+            tell application "Safari"
+                try
+                    do JavaScript "\(escapedJS)" in tab \(tab.tabIndex) of window \(tab.windowIndex)
+                end try
+            end tell
+            """
+        }
+        return """
+        tell application "\(browser.appName)"
+            try
+                execute tab \(tab.tabIndex) of window \(tab.windowIndex) javascript "\(escapedJS)"
+            end try
+        end tell
+        """
+    }
+
+    func sendCommand(_ command: PlaybackCommand, runningBundleIds: Set<String>) {
+        guard let active = lastActiveTab,
+              runningBundleIds.contains(active.browser.bundleId),
+              let source = Self.commandScriptSource(for: command, browser: active.browser, tab: active.tab),
+              let script = NSAppleScript(source: source)
+        else { return }
+        var error: NSDictionary?
+        script.executeAndReturnError(&error)
     }
 
     private func listTabsScript(for browser: BrowserTarget) -> NSAppleScript? {
