@@ -1,0 +1,217 @@
+@testable import BarTune
+import XCTest
+
+final class LyricsForcedAlignerTests: XCTestCase {
+    private let vocabSize = 31
+    private let ka = [14, 4] // "k", "a"
+
+    /// Log-probs where each listed frame strongly favours one token and every other frame favours blank.
+    private func emissions(frames: Int, peaks: [Int: Int]) -> [Float] {
+        var values = [Float](repeating: -10, count: frames * vocabSize)
+        for frame in 0..<frames {
+            let token = peaks[frame] ?? CTCForcedAlignment.blank
+            values[frame * vocabSize + token] = -0.01
+        }
+        return values
+    }
+
+    func testViterbiPlacesEachTokenOnItsPeakFrames() {
+        let logProbs = emissions(frames: 20, peaks: [5: 14, 6: 14, 7: 4, 12: 14, 13: 4])
+        let spans = CTCForcedAlignment.align(logProbs: logProbs, vocabSize: vocabSize, tokens: ka + ka)
+
+        XCTAssertEqual(spans?.map(\.firstFrame), [5, 7, 12, 13])
+        XCTAssertEqual(spans?.map(\.lastFrame), [6, 7, 12, 13])
+    }
+
+    func testViterbiSeparatesRepeatedTokensWithABlank() {
+        // "aa" needs a blank between the two a's, so they land on frames 3 and 5.
+        let logProbs = emissions(frames: 8, peaks: [3: 4, 5: 4])
+        let spans = CTCForcedAlignment.align(logProbs: logProbs, vocabSize: vocabSize, tokens: [4, 4])
+        XCTAssertEqual(spans?.map(\.firstFrame), [3, 5])
+    }
+
+    func testViterbiKeepsTokensInsideTheirAllowedFrames() {
+        // The "ka" peak at frames 2-3 is outside the allowed range, so the later, weaker one wins.
+        var logProbs = emissions(frames: 20, peaks: [2: 14, 3: 4])
+        logProbs[14 * vocabSize + 14] = -2
+        logProbs[15 * vocabSize + 4] = -2
+        let spans = CTCForcedAlignment.align(
+            logProbs: logProbs, vocabSize: vocabSize, tokens: ka, allowedFrames: [10...19, 10...19]
+        )
+        XCTAssertEqual(spans?.map(\.firstFrame), [14, 15])
+    }
+
+    func testViterbiReturnsNilWhenTokensCannotFit() {
+        let logProbs = emissions(frames: 2, peaks: [:])
+        XCTAssertNil(CTCForcedAlignment.align(logProbs: logProbs, vocabSize: vocabSize, tokens: [4, 4]))
+        XCTAssertNil(CTCForcedAlignment.align(
+            logProbs: emissions(frames: 10, peaks: [:]), vocabSize: vocabSize, tokens: ka, allowedFrames: [8...9, 0...1]
+        ))
+    }
+
+    func testRomanizedWordsKeepLyricTokensAndDropUnreadableOnes() {
+        let words = ForcedAlignmentText.words(for: "駄目駄目", script: .japanese)
+        XCTAssertEqual(words.map(\.display).joined(), "駄目駄目")
+        XCTAssertEqual(words.map(\.reading).joined(), "damedame")
+
+        XCTAssertEqual(ForcedAlignmentText.words(for: "Darling, BABY!", script: .latin).map(\.reading), ["darling", "baby"])
+        XCTAssertEqual(ForcedAlignmentText.words(for: "Darling, BABY!", script: .latin).map(\.display), ["Darling,", "BABY!"])
+        XCTAssertTrue(ForcedAlignmentText.words(for: "♪ …", script: .latin).isEmpty)
+    }
+
+    func testEngineReturnsLyricWordsAtTheirAlignedTrackTimes() async throws {
+        // 100 frames per 24 s window -> one frame every 0.24 s of audio.
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 16.0, text: "ka"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        // Chunks start at track 10 s; the window's newest 12 s map to frames 50-99 (track 10-22 s).
+        // "ka" of line 0 peaks at track 13.12 s (frame 63), line 1 at 17.2 s (frame 80).
+        model.peaksForCall = [[63: 14, 64: 4, 80: 14, 81: 4], [:]]
+
+        // The first chunk commits track 10-20 s (the newest 2 s wait for right-hand context).
+        let first = try await aligner.transcribe(chunk(start: 10.0))
+        XCTAssertTrue(first.isEmpty, "line 0's window (9-19 s) is covered, but line 1's (13-24 s) is not")
+
+        let second = try await aligner.transcribe(chunk(start: 22.0))
+        XCTAssertEqual(second.map(\.text), ["ka", "ka"])
+        XCTAssertEqual(second.first?.startTime ?? 0, 13.12, accuracy: 0.01)
+        XCTAssertEqual(second.last?.startTime ?? 0, 17.2, accuracy: 0.01)
+
+        let third = try await aligner.transcribe(chunk(start: 34.0))
+        XCTAssertTrue(third.isEmpty, "a line is aligned only once")
+    }
+
+    func testEngineWaitsForTheNextLineSoALineCannotStretchIntoIt() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 11.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 13.0, text: "ka"),
+            LyricLine(id: 2, timestamp: 40.0, text: "ka"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        // Line 0 sings "k" at 12.16 s and holds "a" until line 1's "ka" at 14.08 s.
+        var peaks: [Int: Int] = [59: 14, 67: 14, 68: 4]
+        for frame in 60...66 {
+            peaks[frame] = 4
+        }
+        model.peaksForCall = [peaks, [:], [:]]
+
+        // Committed audio ends at 20 s: line 0's window (8-16 s) is covered, line 1's (10-43 s) isn't.
+        let first = try await aligner.transcribe(chunk(start: 10.0))
+        XCTAssertTrue(first.isEmpty, "line 0 waits until line 1 can be aligned with it")
+
+        _ = try await aligner.transcribe(chunk(start: 22.0))
+        let third = try await aligner.transcribe(chunk(start: 34.0))
+        XCTAssertEqual(third.map(\.text), ["ka"])
+        XCTAssertEqual(third.first?.startTime ?? 0, 12.16, accuracy: 0.01)
+        XCTAssertLessThanOrEqual(third.first.map { $0.startTime + $0.duration } ?? 99, 14.08 + 0.01)
+    }
+
+    func testEngineDropsALineFarFromTheSongsOffsetSoItFallsBackToTheLRC() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [10.5, 12.0, 13.5, 15.0, 16.5, 19.5].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        // Lines 0-3 and 5 are heard 0.1-0.6 s after their LRC time; line 4 (16.5 s) lands 1.9 s late.
+        // First window: frame f is track -2 + 0.24 f. Second window: frame f is track 10 + 0.24 f.
+        var first: [Int: Int] = [:]
+        for frame in [54, 61, 67, 73, 85] {
+            first[frame] = 14
+            first[frame + 1] = 4
+        }
+        model.peaksForCall = [first, [42: 14, 43: 4]]
+
+        var words = try await aligner.transcribe(chunk(start: 10.0))
+        words += try await aligner.transcribe(chunk(start: 22.0))
+
+        XCTAssertEqual(words.count, 5)
+        XCTAssertFalse(words.contains { abs($0.startTime - 18.4) < 0.5 }, "line 4 is 1.4 s off the 0.52 s median offset")
+        XCTAssertEqual(words.last?.startTime ?? 0, 20.08, accuracy: 0.01)
+    }
+
+    func testEngineStartsOverAfterASeek() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let aligner = LyricsForcedAligner(
+            lines: [LyricLine(id: 0, timestamp: 12.0, text: "ka"), LyricLine(id: 1, timestamp: 70.0, text: "ka")],
+            model: model, lineWindow: 3.0, holdBack: 2.0
+        )
+        model.peaksForCall = [[:], [:]]
+        _ = try await aligner.transcribe(chunk(start: 10.0))
+        // A jump to 60 s: the earlier audio must not be stitched onto the new position.
+        _ = try await aligner.transcribe(chunk(start: 60.0))
+
+        let half = 12 * 16000
+        XCTAssertEqual(model.windows.count, 2)
+        XCTAssertEqual(Set(model.windows[1].prefix(half)).count, 1, "the new run's window is padded, not filled with pre-seek audio")
+    }
+
+    func testEngineIgnoresAudioAtAnotherSampleRate() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let aligner = LyricsForcedAligner(lines: [LyricLine(id: 0, timestamp: 1, text: "ka")], model: model)
+        let words = try await aligner.transcribe(AudioSyncManager.WhisperChunkRequest(
+            samples: [Float](repeating: 0.1, count: 48000), sampleRate: 48000, chunkStartTime: 0, playbackRate: 1
+        ))
+        XCTAssertTrue(words.isEmpty)
+        XCTAssertTrue(model.windows.isEmpty)
+    }
+
+    func testModelInstallVerifiesTheArchiveAndReplacesAStaleCompiledModel() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("src/\(LyricsAlignerModel.packageName)")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: source.appendingPathComponent("Manifest.json"))
+        let archive = root.appendingPathComponent("model.zip")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", source.path, archive.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        let digest = try AppUpdateService.sha256Hex(ofFileAt: archive)
+
+        let models = root.appendingPathComponent("Models")
+        let stale = models.appendingPathComponent(LyricsAlignerModel.compiledName)
+        try FileManager.default.createDirectory(at: stale, withIntermediateDirectories: true)
+
+        XCTAssertThrowsError(try LyricsAlignerModel.install(archive: archive, expectedSHA256: String(repeating: "0", count: 64), into: models))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stale.path), "a bad archive changes nothing")
+        XCTAssertFalse(LyricsAlignerModel.isInstalled(in: models.appendingPathComponent("none")))
+
+        try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models)
+        let installed = models.appendingPathComponent("\(LyricsAlignerModel.packageName)/Manifest.json")
+        XCTAssertEqual(try String(contentsOf: installed, encoding: .utf8), "weights")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the old compiled model must be rebuilt from the new package")
+    }
+
+    private func chunk(start: Double) -> AudioSyncManager.WhisperChunkRequest {
+        AudioSyncManager.WhisperChunkRequest(
+            samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 }, sampleRate: 16000, chunkStartTime: start, playbackRate: 1
+        )
+    }
+}
+
+private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
+    let windowSampleCount: Int
+    let frameCount: Int
+    let vocabSize = 31
+    /// Peak frames (frame -> token) per call, in call order; later calls get all-blank output.
+    var peaksForCall: [[Int: Int]] = []
+    private(set) var windows: [[Float]] = []
+
+    init(windowSampleCount: Int, frameCount: Int) {
+        self.windowSampleCount = windowSampleCount
+        self.frameCount = frameCount
+    }
+
+    func logProbabilities(window: [Float]) -> [Float] {
+        windows.append(window)
+        let peaks = peaksForCall.isEmpty ? [:] : peaksForCall.removeFirst()
+        var values = [Float](repeating: -10, count: frameCount * vocabSize)
+        for frame in 0..<frameCount {
+            values[frame * vocabSize + (peaks[frame] ?? CTCForcedAlignment.blank)] = -0.01
+        }
+        return values
+    }
+}

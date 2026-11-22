@@ -354,6 +354,9 @@ final class AudioSyncManager {
         var resolveWhisperModelPath: @Sendable (String) -> String?
         var launchWhisper: @Sendable (_ serverPath: String, _ modelPath: String) async -> WhisperTranscribing?
         var whisperChunkDurationSeconds: Double
+        var launchLyricsAligner: @Sendable (_ lines: [LyricLine]) async -> WhisperTranscribing? = {
+            await LyricsAlignerModel.launch(lines: $0)
+        }
 
         static func live() -> Dependencies {
             Dependencies(
@@ -408,6 +411,8 @@ final class AudioSyncManager {
     private var whisperStartupTask: Task<Void, Never>?
     private var whisperProcessingTask: Task<Void, Never>?
     private var whisperEngine: WhisperTranscribing?
+    /// The engine this session's audio chunks go to: Whisper or lyrics alignment.
+    private var chunkEngine: AudioSyncEngine = .whisper
     /// Lyric language passed to Whisper, so it doesn't guess per chunk.
     private var whisperLanguage: String?
     private var whisperSampleRate: Double = 16000.0
@@ -602,7 +607,7 @@ final class AudioSyncManager {
     }
 
     private func discardWhisperChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
-        guard isLiveSyncActive, state.audioSyncEngine == .whisper else { return }
+        guard isLiveSyncActive, state.audioSyncEngine == chunkEngine else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let last = whisperLastPlayback
         whisperLastPlayback = (position, now, playbackRate, isPlaying)
@@ -660,7 +665,11 @@ final class AudioSyncManager {
         case .off:
             state.audioSyncStatus = .idle
         case .whisper:
+            chunkEngine = .whisper
             startWhisperSync(track: track, lines: lines)
+        case .lyricsAlignment:
+            chunkEngine = .lyricsAlignment
+            startLyricsAlignmentSync(track: track, lines: lines)
         }
     }
 
@@ -699,7 +708,7 @@ final class AudioSyncManager {
                   !Task.isCancelled,
                   self.syncGeneration == generation,
                   self.activeTrackId == track.id,
-                  self.state.audioSyncEngine == .whisper
+                  self.state.audioSyncEngine == self.chunkEngine
             else { return }
             guard let modelPath = resolvedModelPath else {
                 self.whisperStartupTask = nil
@@ -710,7 +719,7 @@ final class AudioSyncManager {
             guard !Task.isCancelled,
                   self.syncGeneration == generation,
                   self.activeTrackId == track.id,
-                  self.state.audioSyncEngine == .whisper
+                  self.state.audioSyncEngine == self.chunkEngine
             else {
                 engine?.shutdown()
                 return
@@ -727,6 +736,38 @@ final class AudioSyncManager {
         }
     }
 
+    private func startLyricsAlignmentSync(track: TrackInfo, lines: [LyricLine]) {
+        let generation = syncGeneration
+        let launch = dependencies.launchLyricsAligner
+        whisperSampleBuffer.removeAll(keepingCapacity: true)
+        whisperChunkStartPos = nil
+        whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
+        whisperPendingSeekPos = nil
+        whisperLanguage = nil
+        state.audioSyncStatus = .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: lines.count)
+
+        whisperStartupTask = Task { [weak self] in
+            let engine = await launch(lines)
+            guard let self,
+                  !Task.isCancelled,
+                  self.syncGeneration == generation,
+                  self.activeTrackId == track.id,
+                  self.state.audioSyncEngine == .lyricsAlignment
+            else {
+                engine?.shutdown()
+                return
+            }
+            self.whisperStartupTask = nil
+            guard let engine else {
+                self.state.audioSyncStatus = .unavailable("Lyrics alignment model not installed, or this Mac has no Neural Engine")
+                return
+            }
+            self.whisperEngine = engine
+            self.diagnostics.update { $0.localeIdentifier = "lyrics alignment" }
+            self.beginWhisperCapture(track: track, generation: generation)
+        }
+    }
+
     private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
         capture.onAudioSamples = { [weak self] samples, sampleRate in
             let capturedAt = ProcessInfo.processInfo.systemUptime
@@ -735,7 +776,7 @@ final class AudioSyncManager {
                       self.syncGeneration == generation,
                       self.isLiveSyncActive,
                       self.activeTrackId == track.id,
-                      self.state.audioSyncEngine == .whisper,
+                      self.state.audioSyncEngine == self.chunkEngine,
                       capturedAt > self.whisperSeekBoundary
                 else { return }
                 self.whisperSampleRate = sampleRate
@@ -776,7 +817,7 @@ final class AudioSyncManager {
             Self.sanitizedPlaybackRate(state.playbackRate),
             state.isPlaying
         )
-        startCaptureForCurrentTarget(trackId: track.id, engine: .whisper, generation: generation)
+        startCaptureForCurrentTarget(trackId: track.id, engine: chunkEngine, generation: generation)
     }
 
     /// Dispatches one `targetFrames` chunk when the worker is idle; called on sample delivery and worker completion.
@@ -784,7 +825,7 @@ final class AudioSyncManager {
         guard syncGeneration == generation,
               isLiveSyncActive,
               activeTrackId == trackId,
-              state.audioSyncEngine == .whisper,
+              state.audioSyncEngine == chunkEngine,
               whisperProcessingTask == nil,
               let engine = whisperEngine
         else { return }
@@ -824,12 +865,12 @@ final class AudioSyncManager {
             self.whisperProcessingTask = nil
             guard self.activeTrackId == trackId,
                   self.isLiveSyncActive,
-                  self.state.audioSyncEngine == .whisper
+                  self.state.audioSyncEngine == self.chunkEngine
             else { return }
             self.diagnostics.update { $0.record(words: words, replacing: false) }
             if !words.isEmpty {
                 self.recognizedWords.append(contentsOf: words)
-                self.applyAlignment(engine: .whisper)
+                self.applyAlignment(engine: self.chunkEngine)
             }
             self.dispatchWhisperChunkIfReady(trackId: trackId, generation: generation)
         }
