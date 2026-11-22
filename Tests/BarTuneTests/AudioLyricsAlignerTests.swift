@@ -249,7 +249,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
     func testAlignReplacesTextWithTranscribedWordsWhenEnabled() {
         let lines = [
-            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "Original written words"),
+            LyricLine(id: 0, timestamp: 10.0, duration: 2.5, text: "Actual written words"),
         ]
         let recognized = [
             RecognizedAudioWord(text: "actual", startTime: 10.1, duration: 0.4, confidence: 0.92),
@@ -873,5 +873,176 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(state.audioSyncStatus, .idle)
         XCTAssertFalse(state.hasLyrics)
         XCTAssertNil(cache.load(trackId: track.id))
+    }
+
+    // MARK: - #113: Transcription overwrite requires ordered overlap and trims unrelated speech
+
+    func testTranscriptionOverwriteRejectsSingleCommonWordWithUnrelatedSpeech() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "We are the champions"),
+        ]
+        let mixedWindow = [
+            RecognizedAudioWord(text: "checking", startTime: 9.8, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "the", startTime: 10.2, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "server", startTime: 10.5, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "status", startTime: 10.9, duration: 0.3, confidence: 0.9),
+        ]
+
+        let tokens = LyricsAudioAligner.tokenizeLine(lines[0].text)
+        XCTAssertFalse(LyricsAudioAligner.transcriptionMatchesLine(lineTokens: tokens, recognized: mixedWindow))
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: mixedWindow,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 0)
+        XCTAssertTrue(result.lines.isEmpty)
+    }
+
+    func testTranscriptionOverwriteRequiresOrderedOverlap() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "We are the champions"),
+        ]
+        let reversedSpeech = [
+            RecognizedAudioWord(text: "champions", startTime: 10.1, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "the", startTime: 10.5, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "are", startTime: 10.8, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "we", startTime: 11.1, duration: 0.2, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: reversedSpeech,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 0)
+        XCTAssertTrue(result.lines.isEmpty)
+    }
+
+    func testTranscriptionOverwriteKeepsOnlyMatchedSpanAndStripsSurroundingSpeech() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.5, text: "We are gonna shine tonight"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "unrelated", startTime: 9.6, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "talk", startTime: 9.95, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "we", startTime: 10.3, duration: 0.2, confidence: 0.95),
+            RecognizedAudioWord(text: "are", startTime: 10.6, duration: 0.2, confidence: 0.95),
+            RecognizedAudioWord(text: "going", startTime: 10.9, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "to", startTime: 11.2, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "shine", startTime: 11.4, duration: 0.3, confidence: 0.95),
+            RecognizedAudioWord(text: "tonight", startTime: 11.8, duration: 0.4, confidence: 0.95),
+            RecognizedAudioWord(text: "outro", startTime: 12.3, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "chatter", startTime: 12.7, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines.count, 1)
+        XCTAssertEqual(result.lines[0].text, "we are going to shine tonight")
+        XCTAssertEqual(result.lines[0].timestamp, 10.3, accuracy: 0.01)
+        XCTAssertFalse(result.lines[0].text.contains("unrelated"))
+        XCTAssertFalse(result.lines[0].text.contains("outro"))
+        XCTAssertFalse(result.lines[0].text.contains("chatter"))
+    }
+
+    func testTranscriptionOverwriteSingleWordLineKeepsOnlyMatchedWord() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 2.0, text: "Hello"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "unrelated", startTime: 9.7, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "hello", startTime: 10.1, duration: 0.3, confidence: 0.95),
+            RecognizedAudioWord(text: "chatter", startTime: 10.6, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines[0].text, "hello")
+        XCTAssertEqual(result.lines[0].timestamp, 10.1, accuracy: 0.01)
+    }
+
+    func testTranscriptionOverwriteTrimsSurroundingSpeechOnCJKVariation() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "闇夜を駆け抜けて"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "えっと", startTime: 9.7, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "闇夜", startTime: 10.1, duration: 0.4, confidence: 0.95),
+            RecognizedAudioWord(text: "を", startTime: 10.5, duration: 0.2, confidence: 0.95),
+            RecognizedAudioWord(text: "駆け抜けた", startTime: 10.8, duration: 0.6, confidence: 0.92),
+            RecognizedAudioWord(text: "あの", startTime: 11.6, duration: 0.2, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines[0].text, "闇夜 を 駆け抜けた")
+        XCTAssertFalse(result.lines[0].text.contains("えっと"))
+        XCTAssertFalse(result.lines[0].text.contains("あの"))
+    }
+
+    func testTranscriptionOverwriteUsesEligibleSpanWhenFullerSpanStartsTooLate() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 8.0, text: "We are the champions"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "we", startTime: 10.1, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "are", startTime: 10.3, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "we", startTime: 14.2, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "are", startTime: 14.4, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "the", startTime: 14.6, duration: 0.15, confidence: 0.9),
+            RecognizedAudioWord(text: "champions", startTime: 14.8, duration: 0.4, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 1)
+        XCTAssertEqual(result.lines.first?.text, "we are")
+        XCTAssertEqual(result.lines.first?.timestamp ?? -1, 10.1, accuracy: 0.01)
+    }
+
+    func testTranscriptionOverwriteRejectsCharacterOnlyMatchOnSpacedLyricsWithCJKWord() {
+        let tokens = LyricsAudioAligner.tokenizeLine("I   am   daydreaming   夢")
+        let recognized = [
+            RecognizedAudioWord(text: "daydreaming", startTime: 10.1, duration: 0.5, confidence: 0.9),
+        ]
+
+        XCTAssertNil(LyricsAudioAligner.matchedTranscriptionSpan(lineTokens: tokens, recognized: recognized))
+    }
+
+    func testTranscriptionOverwriteRejectsCharacterOnlyMatchOnSpacedLyrics() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "I am dreaming"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "dreaming", startTime: 10.1, duration: 0.5, confidence: 0.9),
+        ]
+
+        let tokens = LyricsAudioAligner.tokenizeLine(lines[0].text)
+        XCTAssertNil(LyricsAudioAligner.matchedTranscriptionSpan(lineTokens: tokens, recognized: recognized))
+
+        let result = LyricsAudioAligner.align(
+            lines: lines,
+            recognizedWords: recognized,
+            replaceTextWithTranscription: true
+        )
+        XCTAssertEqual(result.matchedLineCount, 0)
+        XCTAssertTrue(result.lines.isEmpty)
     }
 }
