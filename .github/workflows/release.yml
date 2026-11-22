@@ -49,6 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           fetch-tags: true
 
       - name: Cache SwiftPM build
@@ -89,23 +90,27 @@ jobs:
           fi
 
       - name: Build .app and DMG
+        env:
+          BARTUNE_RELEASE: ${{ steps.version.outputs.is_release == 'true' && '1' || '' }}
         run: |
           chmod +x build.sh
           ./build.sh --dmg
 
-      - name: Read DMG SHA256
+      - name: Read built version and DMG SHA256
         id: sha
         run: |
-          SHA="$(awk '{print $1}' "dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256")"
+          BUILT="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' BarTune.app/Contents/Info.plist)"
+          echo "version=$BUILT" >> "$GITHUB_OUTPUT"
+          SHA="$(awk '{print $1}' "dist/BarTune-${BUILT}.dmg.sha256")"
           echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
-          name: BarTune-${{ steps.version.outputs.version }}.dmg
+          name: BarTune-${{ steps.sha.outputs.version }}.dmg
           path: |
-            dist/BarTune-${{ steps.version.outputs.version }}.dmg
-            dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256
+            dist/BarTune-${{ steps.sha.outputs.version }}.dmg
+            dist/BarTune-${{ steps.sha.outputs.version }}.dmg.sha256
 
       - name: Create GitHub Release
         if: steps.version.outputs.is_release == 'true'

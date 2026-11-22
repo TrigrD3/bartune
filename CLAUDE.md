@@ -93,7 +93,7 @@ swiftformat Sources Tests
 
 ## Distribution
 
-- `VERSION` is the single source of truth for app versioning (read by `build.sh` and `release.yml`).
+- `VERSION` is the single source of truth for the stable release version (read by `build.sh` and `release.yml`); only `BARTUNE_RELEASE=1` builds (stable `v*` releases) report it. Every other build follows the newest `vX.Y.Z` tag: `X.Y.(Z + commits since that tag)`, e.g. `v0.4.0` + 15 commits = `0.4.15`, restarting at `0.5.0` once `v0.5.0` is tagged. Because PATCH numbers belong to builds from main, stable releases bump MINOR or MAJOR (`X.Y.0`); a stable patch release would make later main builds sort below builds already shipped. `build.sh` also stamps `CFBundleVersion` (total commit count), `BarTuneGitCommit` (short hash) and `BarTuneReleaseChannel` (`stable`/`dev`); never hand-edit those Info.plist values.
 - Releases are on-demand only via `.github/workflows/release.yml`: either push a `vX.Y.Z` tag (matching `VERSION`) or run **Build & Release DMG** via `workflow_dispatch` with `publish: true`. This builds `BarTune-X.Y.Z.dmg` + `.sha256`, creates the GitHub Release, and updates `Casks/bartune.rb` in `TrigrD3/homebrew-tap` (using `HOMEBREW_TAP_TOKEN`). PRs targeting `main` still run the DMG build as a CI check without publishing.
 - Users install via `brew install --cask TrigrD3/tap/bartune`.
 
