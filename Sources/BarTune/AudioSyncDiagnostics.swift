@@ -27,6 +27,10 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
     var medianOffset: Double?
     var lineResults: [LineResult] = []
     var note: String?
+    /// Latest delay between a captured sample and its delivery to BarTune, corrected for in word timings.
+    var captureDelay: Double?
+    /// Word timings changed by the vocal envelope on the latest alignment.
+    var waveformRefinement: WaveformTimingRefiner.Stats?
     var updatedAt = Date()
 
     mutating func record(words: [RecognizedAudioWord], replacing: Bool) {
@@ -90,6 +94,13 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
         out.append("Lines matched: \(matchedLineCount)/\(totalLines)")
         out.append("Words matched: \(matchedWordCount)")
         out.append("Timing offset: \(Self.formatOffset(medianOffset))")
+        out.append("Capture delay: \(captureDelay.map(Self.formatTime) ?? "—")")
+        if let waveformRefinement {
+            out.append(
+                "Waveform refinement: \(waveformRefinement.snapped) starts snapped, "
+                    + "\(waveformRefinement.extended) notes held, \(waveformRefinement.dropped) words in silence dropped"
+            )
+        }
         if let note {
             out.append("Note: \(note)")
         }
@@ -135,6 +146,12 @@ final class AudioSyncDiagnosticsModel: ObservableObject {
         let whole = Int(totalSeconds)
         guard let current = snapshot, whole != current.audioSeconds else { return }
         update { $0.audioSeconds = whole }
+    }
+
+    /// Records the capture delay when it changes by 10 ms or more, so the snapshot isn't republished per buffer.
+    func recordCaptureDelay(_ delay: Double) {
+        guard let current = snapshot, abs((current.captureDelay ?? -1) - delay) >= 0.01 else { return }
+        update { $0.captureDelay = delay }
     }
 
     func note(_ message: String) {

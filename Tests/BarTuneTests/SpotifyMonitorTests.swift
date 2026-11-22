@@ -697,7 +697,7 @@ private final class MonitorLockedBox<Value>: @unchecked Sendable {
 }
 
 private final class MonitorFakeAudioCapture: AudioCaptureProviding {
-    var onAudioSamples: (([Float], Double) -> Void)?
+    var onAudioSamples: ((CapturedAudio) -> Void)?
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []
