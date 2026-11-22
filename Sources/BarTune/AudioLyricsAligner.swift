@@ -816,7 +816,9 @@ enum LyricsAudioAligner {
         var matchedLineCount = 0
         var matchedLineIDs: [Int] = []
         var matchedWordCount = 0
-        var lastConsumedWordEnd: Double = 0.0
+        /// Later lines only match words starting after this: just past the last matched word's start, not
+        /// its end, because a stretched last word can run right up to the next line's first word.
+        var lastConsumedWordStart: Double = 0.0
         var previousLineEnd: Double = 0.0
         var previousEmittedTimestamp: Double?
         var previousBlankTimestamp: Double?
@@ -837,7 +839,8 @@ enum LyricsAudioAligner {
                 previousBlankTimestamp.map { $0 + 0.01 } ?? 0
             )
 
-            let windowStart = max(0, max(lastConsumedWordEnd, shiftedStart - localPadding))
+            // Words before `minAllowedStart` would be rejected below, so they can't outrank a later eligible one.
+            let windowStart = max(0, lastConsumedWordStart, minAllowedStart, shiftedStart - localPadding)
             let windowEnd = min(shiftedEnd + localPadding, nextShiftedStart + 0.4)
 
             let matches: [TokenMatch] = windowEnd > windowStart
@@ -856,7 +859,7 @@ enum LyricsAudioAligner {
 
             if replaceTextWithTranscription {
                 let windowWords = sortedRecognized.filter {
-                    $0.startTime >= max(lastConsumedWordEnd, shiftedStart - 0.6) && $0.startTime < min(shiftedEnd + 0.4, nextShiftedStart)
+                    $0.startTime >= max(lastConsumedWordStart, shiftedStart - 0.6) && $0.startTime < min(shiftedEnd + 0.4, nextShiftedStart)
                 }
                 let startIsEligible = { (start: Double) in abs(start - shiftedStart) <= 2.5 && start >= minAllowedStart }
                 if let matchedSpan = Self.matchedTranscriptionSpan(
@@ -879,7 +882,7 @@ enum LyricsAudioAligner {
                     let actualWordEnd = matchedSpan.map(\.endTime).max() ?? shiftedEnd
                     let clampedEnd = nextShiftedStart > startTs + 0.3 ? min(actualWordEnd, nextShiftedStart) : actualWordEnd
                     let emittedDuration = max(0.3, clampedEnd - startTs)
-                    lastConsumedWordEnd = max(lastConsumedWordEnd, actualWordEnd + 0.01)
+                    lastConsumedWordStart = max(lastConsumedWordStart, (matchedSpan.map(\.startTime).max() ?? startTs) + 0.001)
                     previousLineEnd = max(previousLineEnd, startTs + emittedDuration)
                     previousEmittedTimestamp = startTs
                     alignedLines.append(
@@ -909,11 +912,10 @@ enum LyricsAudioAligner {
                 if abs(newLineStart - shiftedStart) <= 2.5, newLineStart >= minAllowedStart {
                     let clampedEnd = nextShiftedStart > newLineStart + 0.3 ? min(rawEnd, nextShiftedStart) : rawEnd
                     let newDuration = max(0.3, clampedEnd - newLineStart)
-                    let actualMatchedEnd = matches.map(\.word.endTime).max() ?? clampedEnd
                     matchedLineCount += 1
                     matchedLineIDs.append(line.id)
                     matchedWordCount += matches.count
-                    lastConsumedWordEnd = max(lastConsumedWordEnd, actualMatchedEnd + 0.01)
+                    lastConsumedWordStart = max(lastConsumedWordStart, (matches.map(\.word.startTime).max() ?? newLineStart) + 0.001)
                     previousLineEnd = max(previousLineEnd, newLineStart + newDuration)
                     previousEmittedTimestamp = newLineStart
 
