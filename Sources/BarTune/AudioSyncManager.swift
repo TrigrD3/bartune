@@ -533,7 +533,9 @@ final class AudioSyncManager {
                 cache.remove(trackId: track.id)
             }
         } else if let cached = cache.load(trackId: track.id) {
-            let reliable = cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
+            let current = rawLines.isEmpty
+                || cached.matchesSource(rawLines, comparingText: !state.replaceLyricsWithTranscription)
+            let reliable = current && cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
             if reliable, rawLines.isEmpty || cached.isComplete(expectedSourceLineCount: expectedSourceLineCount) {
                 if baseLines.isEmpty {
                     baseLines = cached.lines

@@ -1456,6 +1456,24 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testRecordAlignedToOtherLyricsIsDiscarded() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let oldLyrics = tenLines().map { LyricLine(id: $0.id, timestamp: $0.timestamp, text: $0.text + " / annotation") }
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.2,
+            alignedLineCount: 8, sourceLineCount: 10, lines: oldLyrics
+        ))
+
+        let (manager, _, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+
+        XCTAssertTrue(started, "lyrics changed, so the old alignment must not be used")
+        XCTAssertNil(cache.load(trackId: sampleTrack().id))
+        state.updatePlayback(isPlaying: true, position: 10.2)
+        XCTAssertEqual(state.currentText, "amber river glows")
+    }
+
+    @MainActor
     func testCompleteCacheSkipsListening() {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         cache.save(AudioSyncedLyricsRecord(
