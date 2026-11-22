@@ -408,20 +408,27 @@ enum LyricsMatcher {
         return false
     }
 
+    private static func hasValidDuration(_ duration: Double) -> Bool {
+        duration.isFinite && duration > 0 && Int(exactly: duration.rounded()) != nil
+    }
+
     static func selectBestNetEaseSong(_ songs: [NetEaseSongCandidate], for track: TrackInfo) -> NetEaseSongCandidate? {
         let nonVariant = songs.filter {
             !isUnwantedVariant(candidateTitle: $0.name, expectedTitle: track.title)
         }
 
+        let hasValidDuration = hasValidDuration(track.duration)
+
         // 1. Prefer candidates with matching artist and title within 6s duration tolerance.
         let artistMatched = nonVariant.filter { song in
-            let durDiff = song.durationMs.map { abs($0 / 1000.0 - track.duration) } ?? 0
+            let durDiff = (hasValidDuration ? song.durationMs.map { abs($0 / 1000.0 - track.duration) } : nil) ?? 0
             return artistMatches(candidateArtists: song.artists, expectedArtist: track.artist)
                 && titleMatches(candidateTitle: song.name, expectedTitle: track.title)
                 && durDiff <= 6.0
         }
         if let best = artistMatched.min(by: {
-            abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
+            guard hasValidDuration else { return false }
+            return abs(($0.durationMs ?? 0) / 1000.0 - track.duration) < abs(($1.durationMs ?? 0) / 1000.0 - track.duration)
         }) {
             return best
         }
@@ -429,7 +436,7 @@ enum LyricsMatcher {
         // 2. Cross-script fallback (e.g. Kanji "澤野弘之" vs Romaji "Sawano Hiroyuki"):
         // require a non-ASCII artist name, exact normalized title, and duration within 1.5s.
         let expectedNormTitle = normalize(track.title)
-        guard !expectedNormTitle.isEmpty else { return nil }
+        guard !expectedNormTitle.isEmpty, hasValidDuration else { return nil }
         let crossScript = nonVariant.filter { song in
             let hasNonASCIIArtist = song.artists.contains { artist in
                 artist.unicodeScalars.contains { !$0.isASCII }
@@ -446,7 +453,8 @@ enum LyricsMatcher {
         _ records: [LyricsFetcher.LRCLibRecord],
         for track: TrackInfo
     ) -> LyricsFetcher.LRCLibRecord? {
-        records
+        let hasValidDuration = hasValidDuration(track.duration)
+        return records
             .filter { record in
                 guard (record.syncedLyrics ?? "").isEmpty == false else { return false }
                 if let trackName = record.trackName {
@@ -460,12 +468,13 @@ enum LyricsMatcher {
                    !artistMatches(candidateArtists: [artist], expectedArtist: track.artist) {
                     return false
                 }
-                if let dur = record.duration, abs(dur - track.duration) > 6.0 {
+                if hasValidDuration, let dur = record.duration, abs(dur - track.duration) > 6.0 {
                     return false
                 }
                 return true
             }
             .min { lhs, rhs in
+                guard hasValidDuration else { return false }
                 let d1 = abs((lhs.duration ?? track.duration) - track.duration)
                 let d2 = abs((rhs.duration ?? track.duration) - track.duration)
                 return d1 < d2
@@ -698,12 +707,16 @@ actor LyricsFetcher {
 
     private func fetchLRCLibExact(track: TrackInfo) async throws -> [LyricLine]? {
         try Task.checkCancellation()
+        guard track.duration.isFinite,
+              track.duration > 0,
+              let durationSeconds = Int(exactly: track.duration.rounded())
+        else { return nil }
         guard var components = URLComponents(string: "https://lrclib.net/api/get") else { return nil }
         components.queryItems = [
             URLQueryItem(name: "artist_name", value: track.artist),
             URLQueryItem(name: "track_name", value: track.title),
             URLQueryItem(name: "album_name", value: track.album),
-            URLQueryItem(name: "duration", value: String(Int(track.duration.rounded())))
+            URLQueryItem(name: "duration", value: String(durationSeconds))
         ]
         guard let url = components.url else { return nil }
 

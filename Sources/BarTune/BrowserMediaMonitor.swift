@@ -287,8 +287,12 @@ enum BrowserMediaParser {
 
         var artist = cleanArtist(parts[4])
         let album = parts[5].trimmingCharacters(in: .whitespacesAndNewlines)
-        var durationSec = SpotifyMonitor.parseLocaleDouble(parts[6]) ?? 0
-        var positionSec = SpotifyMonitor.parseLocaleDouble(parts[7]) ?? 0
+        let parsedDuration = SpotifyMonitor.parseLocaleDouble(parts[6]) ?? 0
+        var durationSec = (parsedDuration.isFinite && parsedDuration > 0 && Int(exactly: parsedDuration.rounded()) != nil)
+            ? parsedDuration
+            : 0
+        let parsedPosition = SpotifyMonitor.parseLocaleDouble(parts[7]) ?? 0
+        var positionSec = (parsedPosition.isFinite && parsedPosition >= 0) ? parsedPosition : 0
         let artworkURL = parts.count >= 9 && !parts[8].isEmpty ? parts[8] : nil
         let playbackRate = parts.count >= 11 ? parsePlaybackRate(parts[10]) : 1.0
 

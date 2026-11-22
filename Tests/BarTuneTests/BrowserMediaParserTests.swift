@@ -456,4 +456,90 @@ final class BrowserMediaParserTests: XCTestCase {
         )
         XCTAssertFalse(restrictedAppleScript.contains("www.youtube.com"))
     }
+
+    func testOutOfRangeBrowserDurationSkipsLRCLibExactAndCompletesFallback() async throws {
+        let sep = "\u{1F}"
+        for rawDuration in ["1e20", String(Double.greatestFiniteMagnitude), "9223372036854775808", "inf", "nan", "-5"] {
+            let payload = [
+                "BROWSER",
+                "playing",
+                "browser:music.youtube.com:Dawn|Iris",
+                "Dawn",
+                "Iris",
+                "Daybreak",
+                rawDuration,
+                "12.0",
+                "",
+            ].joined(separator: sep)
+            let parsedTrack = try XCTUnwrap(BrowserMediaParser.parsePayload(payload)?.track)
+            XCTAssertTrue(parsedTrack.duration.isFinite)
+            XCTAssertGreaterThanOrEqual(parsedTrack.duration, 0)
+            XCTAssertNotNil(Int(exactly: parsedTrack.duration.rounded()))
+        }
+
+        let payload = [
+            "BROWSER",
+            "playing",
+            "browser:music.youtube.com:Dawn|Iris",
+            "Dawn",
+            "Iris",
+            "Daybreak",
+            "1e20",
+            "12.0",
+            "",
+        ].joined(separator: sep)
+        let parsedTrack = try XCTUnwrap(BrowserMediaParser.parsePayload(payload)?.track)
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BarTuneDurationTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        final class RequestRecorder: @unchecked Sendable {
+            private let lock = NSLock()
+            private var paths: [String] = []
+            func record(_ path: String) {
+                lock.lock()
+                defer { lock.unlock() }
+                paths.append(path)
+            }
+            func allPaths() -> [String] {
+                lock.lock()
+                defer { lock.unlock() }
+                return paths
+            }
+        }
+
+        let recorder = RequestRecorder()
+        let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            recorder.record(url.path)
+            if url.host == "lrclib.net", url.path == "/api/search" {
+                let json = """
+                [{"trackName":"Dawn","artistName":"Iris","duration":200.0,"syncedLyrics":"[00:01.00]Fallback line"}]
+                """
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+                return (Data(json.utf8), response)
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+
+        let parsedLines = await fetcher.fetchLyrics(for: parsedTrack)
+        XCTAssertEqual(parsedLines.map(\.text), ["Fallback line"])
+        XCTAssertFalse(recorder.allPaths().contains("/api/get"))
+        XCTAssertTrue(recorder.allPaths().contains("/api/search"))
+
+        // Also verify LyricsFetcher directly guards unrepresented durations passed outside the parser.
+        let directTrack = TrackInfo(
+            id: "browser:music.youtube.com:Dawn|Iris|direct",
+            title: "Dawn",
+            artist: "Iris",
+            album: "Daybreak",
+            duration: 1e20,
+            artworkURL: nil
+        )
+        let directLines = await fetcher.fetchLyrics(for: directTrack)
+        XCTAssertEqual(directLines.map(\.text), ["Fallback line"])
+        XCTAssertFalse(recorder.allPaths().contains("/api/get"))
+    }
 }
