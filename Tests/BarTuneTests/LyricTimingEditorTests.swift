@@ -135,6 +135,21 @@ final class LyricTimingSessionTests: XCTestCase {
         XCTAssertNil(LyricTimingSession.parseTime("1:75.0"))
         XCTAssertEqual(LyricTimingSession.formatTime(83.45), "1:23.45")
     }
+
+    func testRomanizedPreviewsForJapaneseLinesAndWords() {
+        let preview = LyricTimingSession.romanizedPreview(forLine: "さよなら、僕らは目を覚ます")
+        XCTAssertNotNil(preview)
+        XCTAssertFalse(JapaneseRomanizer.containsJapaneseOrCJK(preview ?? ""))
+        XCTAssertNil(LyricTimingSession.romanizedPreview(forLine: "Hello world"))
+
+        let words = [EditableWord(text: "固まっ"), EditableWord(text: "て")]
+        let wordPreviews = LyricTimingSession.romanizedWordPreviews(for: words)
+        XCTAssertEqual(wordPreviews.count, 2)
+        XCTAssertTrue(wordPreviews.joined().contains("katamatte"))
+
+        let latinWords = [EditableWord(text: "Hello "), EditableWord(text: "world")]
+        XCTAssertEqual(LyricTimingSession.romanizedWordPreviews(for: latinWords), ["", ""])
+    }
 }
 
 final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
@@ -266,7 +281,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         XCTAssertNil(customStore.load(trackId: track.id))
     }
 
-    func testSeekTransportScriptFormatsPOSIXSecondsAndDisablesBrowsers() {
+    func testSeekTransportScriptFormatsPOSIXSecondsAndDisablesBrowsers() throws {
         let spotify = SpotifyMonitor.transportScriptSource(
             for: .seek(83.456),
             activeTrackId: "spotify:track:abc",
@@ -287,6 +302,48 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
             runningBundleIds: ["com.spotify.client", "com.apple.Music"]
         )
         XCTAssertNil(browser, "browser tracks must not seek a native player")
+
+        let chrome = BrowserMediaMonitor.BrowserTarget(bundleId: "com.google.Chrome", appName: "Google Chrome", isSafari: false)
+        let safari = BrowserMediaMonitor.BrowserTarget(bundleId: "com.apple.Safari", appName: "Safari", isSafari: true)
+        let tab = BrowserTabDescriptor(windowIndex: 1, tabIndex: 2, url: "https://music.youtube.com/watch?v=abc")
+
+        let chromeSeek = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(for: .seek(42.5), browser: chrome, tab: tab))
+        XCTAssertTrue(chromeSeek.contains("m.currentTime = 42.500"))
+        XCTAssertTrue(chromeSeek.contains("execute tab 2 of window 1 javascript"))
+
+        let safariPlayPause = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(for: .playPause, browser: safari, tab: tab))
+        XCTAssertTrue(safariPlayPause.contains("m.paused ? m.play() : m.pause()"))
+        XCTAssertTrue(safariPlayPause.contains("do JavaScript"))
+    }
+
+    @MainActor
+    func testEditorRetainsSessionWhenPlaybackPausesAndTrackClears() throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        let customStore = CustomLyricsStore(directory: tempDir.appendingPathComponent("custom-pause", isDirectory: true))
+        let track = TrackInfo(id: "browser:ytm:pause", title: "Paused Song", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let lines = [LyricLine(id: 0, timestamp: 5.0, text: "Stay visible")]
+        state.setTrack(track, lyrics: lines)
+
+        let model = LyricTimingEditorModel(
+            state: state,
+            customLyricsStore: customStore,
+            onSeek: { _ in },
+            onTogglePlayPause: {},
+            onSelectSource: { _, _ in },
+            onSaveCustom: { _, _ in },
+            onDeleteCustom: { _ in }
+        )
+        XCTAssertEqual(model.activeTrack?.id, track.id)
+        XCTAssertEqual(model.session.lines.count, 1)
+
+        // Pausing a browser track clears state.currentTrack, but the editor must stay open with its session.
+        state.setTrack(nil, lyrics: [])
+        model.loadCurrentTrack()
+        XCTAssertEqual(model.activeTrack?.id, track.id)
+        XCTAssertEqual(model.session.lines.count, 1)
     }
 
     @MainActor

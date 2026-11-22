@@ -42,14 +42,13 @@ final class LyricTimingEditorModel: ObservableObject {
         state.$currentTrack
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.loadCurrentTrack()
+            .sink { [weak self] newTrack in
+                guard let self, let newTrack else { return }
+                if newTrack.id != self.activeTrack?.id {
+                    self.loadCurrentTrack()
+                }
             }
             .store(in: &cancellables)
-    }
-
-    var isBrowserTrack: Bool {
-        activeTrack?.id.hasPrefix("browser:") == true
     }
 
     var availableSources: [TrackLyricSource] {
@@ -62,17 +61,12 @@ final class LyricTimingEditorModel: ObservableObject {
     }
 
     func loadCurrentTrack() {
-        let track = state.currentTrack
-        activeTrack = track
-        statusMessage = nil
-
-        guard let track else {
-            session = LyricTimingSession(lines: [])
-            selectedLineId = nil
-            hasCustomLyrics = false
-            selectedSource = .defaultSource
+        guard let track = state.currentTrack else {
+            // Keep any already-loaded track and session open when playback pauses or stops.
             return
         }
+        activeTrack = track
+        statusMessage = nil
 
         let customRecord = customLyricsStore.load(trackId: track.id)
         hasCustomLyrics = customRecord != nil
@@ -102,8 +96,11 @@ final class LyricTimingEditorModel: ObservableObject {
     }
 
     func seek(to seconds: Double) {
-        guard !isBrowserTrack else { return }
         onSeek(max(0.0, seconds))
+    }
+
+    func nudgePlayback(by delta: Double) {
+        seek(to: max(0.0, state.currentPlaybackPosition() + delta))
     }
 
     func stampNow() {
@@ -232,6 +229,37 @@ struct LyricTimingEditorView: View {
             Spacer(minLength: 12)
 
             if model.activeTrack != nil {
+                HStack(spacing: 4) {
+                    Button {
+                        model.seek(to: 0)
+                    } label: {
+                        Image(systemName: "backward.end.fill")
+                    }
+                    .help("Restart from 0:00")
+
+                    Button {
+                        model.nudgePlayback(by: -5.0)
+                    } label: {
+                        Image(systemName: "gobackward.5")
+                    }
+                    .help("Back 5 seconds")
+
+                    Button {
+                        model.togglePlayPause()
+                    } label: {
+                        Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                            .frame(width: 14)
+                    }
+                    .help(state.isPlaying ? "Pause" : "Play")
+
+                    Button {
+                        model.nudgePlayback(by: 5.0)
+                    } label: {
+                        Image(systemName: "goforward.5")
+                    }
+                    .help("Forward 5 seconds")
+                }
+
                 TimelineView(.periodic(from: .now, by: 0.05)) { context in
                     Text(LyricTimingSession.formatTime(state.currentPlaybackPosition(at: context.date)))
                         .font(.system(.body, design: .monospaced))
@@ -241,14 +269,6 @@ struct LyricTimingEditorView: View {
                         .padding(.vertical, 4)
                         .background(.quaternary.opacity(0.6), in: RoundedRectangle(cornerRadius: 6))
                 }
-
-                Button {
-                    model.togglePlayPause()
-                } label: {
-                    Label(state.isPlaying ? "Pause" : "Play", systemImage: state.isPlaying ? "pause.fill" : "play.fill")
-                }
-                .disabled(model.isBrowserTrack)
-                .help(model.isBrowserTrack ? "Playback controls are unavailable for browser tracks." : "Play or pause")
 
                 Picker("Source", selection: Binding(
                     get: { model.selectedSource },
@@ -347,7 +367,15 @@ struct LyricTimingEditorView: View {
                 let words = model.session.lines[lineIndex].words
                 if model.session.nextWordIndex < words.count {
                     let nextText = words[model.session.nextWordIndex].text.trimmingCharacters(in: .whitespaces)
-                    Text("Press Space → Word \(model.session.nextWordIndex + 1)/\(words.count): \"\(nextText)\"")
+                    let romajiHint: String = {
+                        guard state.romanizeJapanese else { return "" }
+                        let previews = LyricTimingSession.romanizedWordPreviews(for: words)
+                        let hint = previews.indices.contains(model.session.nextWordIndex)
+                            ? previews[model.session.nextWordIndex]
+                            : ""
+                        return hint.isEmpty ? "" : " (\(hint))"
+                    }()
+                    Text("Press Space → Word \(model.session.nextWordIndex + 1)/\(words.count): \"\(nextText)\"\(romajiHint)")
                         .font(.caption.weight(.medium))
                         .foregroundStyle(.orange)
                 } else {
@@ -419,10 +447,11 @@ struct LyricTimingEditorView: View {
                             LineEditorRow(
                                 index: index,
                                 line: line,
+                                romajiPreview: state.romanizeJapanese ? LyricTimingSession.romanizedPreview(forLine: line.text) : nil,
                                 isSelected: model.selectedLineId == line.id,
                                 isNextStamp: model.session.stampingMode == .lines && model.session.nextLineIndex == index,
                                 isOutOfOrder: outOfOrder.contains(index),
-                                canSeek: !model.isBrowserTrack,
+                                canSeek: true,
                                 onSelect: {
                                     model.selectedLineId = line.id
                                     if model.session.stampingMode == .lines {
@@ -502,11 +531,23 @@ struct LyricTimingEditorView: View {
                 let line = model.session.lines[idx]
                 let wordWarnings = model.session.outOfOrderWordIndices(inLine: idx)
                 let isWordStampingThisLine = model.session.stampingMode == .words(lineIndex: idx)
+                let wordRomaji = state.romanizeJapanese
+                    ? LyricTimingSession.romanizedWordPreviews(for: line.words)
+                    : Array(repeating: "", count: line.words.count)
 
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(line.text.isEmpty ? "(Empty line)" : line.text)
-                        .font(.callout.weight(.medium))
-                        .lineLimit(3)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(line.text.isEmpty ? "(Empty line)" : line.text)
+                            .font(.callout.weight(.medium))
+                            .lineLimit(3)
+                        if state.romanizeJapanese,
+                           let romaji = LyricTimingSession.romanizedPreview(forLine: line.text) {
+                            Text(romaji)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(3)
+                        }
+                    }
 
                     HStack(spacing: 8) {
                         Button(isWordStampingThisLine ? "Stop Word Pass" : "Start Word Pass") {
@@ -557,6 +598,7 @@ struct LyricTimingEditorView: View {
                             ForEach(Array(line.words.enumerated()), id: \.element.id) { wordIdx, word in
                                 WordEditorRow(
                                     word: word,
+                                    romajiPreview: wordRomaji.indices.contains(wordIdx) ? wordRomaji[wordIdx] : "",
                                     isNextStamp: isWordStampingThisLine && model.session.nextWordIndex == wordIdx,
                                     isOutOfOrder: wordWarnings.contains(wordIdx),
                                     onSelectForStamp: {
@@ -667,6 +709,7 @@ struct LyricTimingEditorView: View {
 private struct LineEditorRow: View {
     let index: Int
     let line: EditableLine
+    let romajiPreview: String?
     let isSelected: Bool
     let isNextStamp: Bool
     let isOutOfOrder: Bool
@@ -717,11 +760,21 @@ private struct LineEditorRow: View {
                     .help("Timestamp is earlier than a preceding line")
             }
 
-            TextField("Lyric line", text: Binding(
-                get: { line.text },
-                set: { onEditText($0) }
-            ))
-            .textFieldStyle(.plain)
+            VStack(alignment: .leading, spacing: 1) {
+                TextField("Lyric line", text: Binding(
+                    get: { line.text },
+                    set: { onEditText($0) }
+                ))
+                .textFieldStyle(.plain)
+
+                if let romajiPreview, !romajiPreview.isEmpty {
+                    Text(romajiPreview)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
 
             if !line.words.isEmpty {
                 let stampedCount = line.words.filter { $0.timestamp != nil }.count
@@ -766,6 +819,7 @@ private struct LineEditorRow: View {
 
 private struct WordEditorRow: View {
     let word: EditableWord
+    let romajiPreview: String
     let isNextStamp: Bool
     let isOutOfOrder: Bool
     let onSelectForStamp: () -> Void
@@ -779,10 +833,18 @@ private struct WordEditorRow: View {
                 .foregroundStyle(isNextStamp ? Color.orange : Color.clear)
                 .frame(width: 10)
 
-            Text(word.text.trimmingCharacters(in: .whitespaces))
-                .font(.callout)
-                .lineLimit(1)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(word.text.trimmingCharacters(in: .whitespaces))
+                    .font(.callout)
+                    .lineLimit(1)
+                if !romajiPreview.isEmpty {
+                    Text(romajiPreview)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
             if isOutOfOrder {
                 Image(systemName: "exclamationmark.triangle.fill")
