@@ -209,7 +209,11 @@ jobs:
           NOTES="Built from main at $GITHUB_SHA ($VERSION). Not a stable release: choose **Latest from main** in Settings → About to receive these builds."
 
           # A rerun of an older run must not replace a newer build.
-          CURRENT="$(gh api "repos/$REPO/git/refs/tags/dev" --jq .object.sha 2>/dev/null || true)"
+          # The singular ref endpoint matches exactly; a missing tag leaves CURRENT empty instead of holding the 404 body.
+          CURRENT=""
+          if REF_SHA="$(gh api "repos/$REPO/git/ref/tags/dev" --jq .object.sha 2>/dev/null)"; then
+            CURRENT="$REF_SHA"
+          fi
           if [[ -n "$CURRENT" && "$CURRENT" != "$GITHUB_SHA" ]]; then
             STATUS="$(gh api "repos/$REPO/compare/$CURRENT...$GITHUB_SHA" --jq .status)"
             if [[ "$STATUS" != "ahead" ]]; then
