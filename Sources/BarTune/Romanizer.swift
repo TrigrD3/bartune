@@ -36,12 +36,32 @@ enum JapaneseRomanizer {
         return joined.isEmpty ? text : joined
     }
 
+    struct RomanizedWordSpan: Equatable {
+        let text: String
+        let sourceRange: ClosedRange<Int>
+    }
+
     /// Romanizes the words of one timed line in context, so readings and small っ that span word
     /// boundaries come out as they do for the whole line. Returns one string per word; a word whose
     /// reading was merged into the previous word gets "".
     static func romanizeWords(_ words: [String]) -> [String] {
         let text = words.joined()
         guard containsJapaneseOrCJK(text) else { return words }
+        var out = Array(repeating: "", count: words.count)
+        for span in romanizeWordSpans(words) {
+            out[span.sourceRange.lowerBound] = span.text
+        }
+        return out
+    }
+
+    /// Romanizes timed words in context and returns each non-empty romanized span along with the
+    /// inclusive range of source word indices that contributed to it.
+    static func romanizeWordSpans(_ words: [String]) -> [RomanizedWordSpan] {
+        guard !words.isEmpty else { return [] }
+        let text = words.joined()
+        guard containsJapaneseOrCJK(text) else {
+            return words.enumerated().map { RomanizedWordSpan(text: $0.element, sourceRange: $0.offset...$0.offset) }
+        }
         var wordStarts: [Int] = []
         var location = 0
         for word in words {
@@ -49,11 +69,20 @@ enum JapaneseRomanizer {
             location += (word as NSString).length
         }
         var grouped = Array(repeating: [String](), count: words.count)
+        var endIndices = Array(0..<words.count)
         for part in romanizedParts(text) {
             let owner = wordStarts.lastIndex { $0 <= part.location } ?? 0
+            let lastWord = wordStarts.lastIndex { $0 < part.end } ?? owner
             grouped[owner].append(part.text)
+            if lastWord > endIndices[owner] {
+                endIndices[owner] = lastWord
+            }
         }
-        return grouped.map { finish($0.joined(separator: " ")) }
+        return grouped.enumerated().compactMap { index, parts in
+            let finished = finish(parts.joined(separator: " "))
+            guard !finished.isEmpty else { return nil }
+            return RomanizedWordSpan(text: finished, sourceRange: index...endIndices[index])
+        }
     }
 
     private static func finish(_ joined: String) -> String {
@@ -68,9 +97,9 @@ enum JapaneseRomanizer {
         )
     }
 
-    /// Romanized tokens and punctuation of `text`, each with its UTF-16 offset. A token ending in a
+    /// Romanized tokens and punctuation of `text`, each with its UTF-16 range. A token ending in a
     /// small っ is merged with the token after it, which supplies the doubled consonant.
-    private static func romanizedParts(_ text: String) -> [(location: Int, text: String)] {
+    private static func romanizedParts(_ text: String) -> [(location: Int, end: Int, text: String)] {
         let nsText = text as NSString
         let cfText = text as CFString
         let fullRange = CFRange(location: 0, length: CFStringGetLength(cfText))
@@ -82,10 +111,10 @@ enum JapaneseRomanizer {
             kCFStringTokenizerUnitWord,
             jaLocale
         ) else {
-            return [(0, text)]
+            return [(0, nsText.length, text)]
         }
 
-        var parts: [(location: Int, text: String)] = []
+        var parts: [(location: Int, end: Int, text: String)] = []
         var cursor = 0
 
         while !CFStringTokenizerAdvanceToNextToken(tokenizer).isEmpty {
@@ -104,10 +133,11 @@ enum JapaneseRomanizer {
                         .replacingOccurrences(of: "？", with: "?")
                         .replacingOccurrences(of: "「", with: "\"")
                         .replacingOccurrences(of: "」", with: "\"")
-                    parts.append((cursor, normalizedGap))
+                    parts.append((cursor, tokenRange.location, normalizedGap))
                 }
             }
 
+            let tokenEnd = tokenRange.location + tokenRange.length
             let rawToken = nsText.substring(with: NSRange(location: tokenRange.location, length: tokenRange.length))
             if containsJapaneseOrCJK(rawToken),
                let latin = CFStringTokenizerCopyCurrentTokenAttribute(
@@ -123,28 +153,29 @@ enum JapaneseRomanizer {
                     .replacingOccurrences(of: "ī", with: "ii")
                     .replacingOccurrences(of: "ē", with: "ee")
                 if rawToken == "は" && cleaned == "ha" {
-                    parts.append((tokenRange.location, "wa"))
+                    parts.append((tokenRange.location, tokenEnd, "wa"))
                 } else {
-                    parts.append((tokenRange.location, cleaned))
+                    parts.append((tokenRange.location, tokenEnd, cleaned))
                 }
             } else {
-                parts.append((tokenRange.location, rawToken))
+                parts.append((tokenRange.location, tokenEnd, rawToken))
             }
 
-            cursor = tokenRange.location + tokenRange.length
+            cursor = tokenEnd
         }
 
         if cursor < nsText.length {
             let tail = nsText.substring(from: cursor).trimmingCharacters(in: .whitespaces)
             if !tail.isEmpty {
-                parts.append((cursor, tail))
+                parts.append((cursor, nsText.length, tail))
             }
         }
 
-        var merged: [(location: Int, text: String)] = []
+        var merged: [(location: Int, end: Int, text: String)] = []
         for part in parts {
             if let last = merged.last, last.text.hasSuffix("~tsu") {
                 merged[merged.count - 1].text = last.text + part.text
+                merged[merged.count - 1].end = max(last.end, part.end)
             } else {
                 merged.append(part)
             }
