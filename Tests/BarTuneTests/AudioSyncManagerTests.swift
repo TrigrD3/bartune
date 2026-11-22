@@ -1403,7 +1403,223 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
     }
 
+    // MARK: - #118: Browser handoff updates audio capture target without resetting live alignment
+
+    @MainActor
+    func testUpdateSourceBundleRetargetsLiveCaptureAndPreservesAlignedWords() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+
+        let chromeTrack = TrackInfo(
+            id: "browser:www.youtube.com:Test Song|Test Artist|v:abc",
+            title: "Test Song",
+            artist: "Test Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let safariTrack = TrackInfo(
+            id: "browser:www.youtube.com:Test Song|Test Artist|v:abc",
+            title: "Test Song",
+            artist: "Test Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil,
+            sourceBundleId: "com.apple.Safari"
+        )
+
+        manager.handleTrackLoaded(track: chromeTrack, rawLines: sampleLines())
+        let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(chromeStarted)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.google.Chrome"])
+
+        recognizer.resultHandlers.first?([
+            SpeechRecognizedSegment(substring: "Hello", timestamp: 0.5, duration: 0.3, confidence: 0.9),
+        ], false, nil)
+        let wordRecorded = await waitUntil { manager.recognizedWords.count == 1 }
+        XCTAssertTrue(wordRecorded)
+
+        let callsBeforeHandoff = fakeCapture.calls.count
+        manager.updateSourceBundle(for: safariTrack)
+        let safariStarted = await waitUntil { fakeCapture.startCount == 2 }
+        XCTAssertTrue(safariStarted)
+        XCTAssertEqual(Array(fakeCapture.calls.dropFirst(callsBeforeHandoff)), ["stop", "start"])
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+        XCTAssertEqual(manager.recognizedWords.count, 1)
+
+        manager.resyncCurrentTrack()
+        let resyncStarted = await waitUntil { fakeCapture.startCount == 3 }
+        XCTAssertTrue(resyncStarted)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+    }
+
+    @MainActor
+    func testUpdateSourceBundleDuringWhisperDiscoveryUsesLatestBrowser() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+
+        let discoveryStarted = expectation(description: "Whisper model discovery started")
+        let releaseDiscovery = DispatchSemaphore(value: 0)
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in
+                discoveryStarted.fulfill()
+                releaseDiscovery.wait()
+                return "/tmp/ggml-tiny.bin"
+            }
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+
+        let chromeTrack = TrackInfo(
+            id: "browser:www.youtube.com:Test Song|Test Artist|v:abc",
+            title: "Test Song",
+            artist: "Test Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let safariTrack = TrackInfo(
+            id: "browser:www.youtube.com:Test Song|Test Artist|v:abc",
+            title: "Test Song",
+            artist: "Test Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil,
+            sourceBundleId: "com.apple.Safari"
+        )
+
+        manager.handleTrackLoaded(track: chromeTrack, rawLines: sampleLines())
+        await fulfillment(of: [discoveryStarted], timeout: 2.0)
+
+        manager.updateSourceBundle(for: safariTrack)
+        releaseDiscovery.signal()
+
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+    }
+
+    @MainActor
+    func testUpdateSourceBundleStartsNewWhisperChunkAtNewCapturePosition() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        let fakeCapture = FakeAudioCapture()
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+
+        manager.handleTrackLoaded(track: browserTrack(sourceBundleId: "com.google.Chrome"), rawLines: sampleLines())
+        let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(chromeStarted)
+
+        state.updatePlayback(isPlaying: false, position: 10.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 80), sampleRate: 100)
+        let chromeBuffered = await waitUntil { manager.bufferedWhisperSampleCount == 80 }
+        XCTAssertTrue(chromeBuffered)
+        XCTAssertEqual(manager.currentWhisperChunkStartPos, 10.0)
+
+        state.updatePlayback(isPlaying: false, position: 24.0)
+        manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 0)
+        XCTAssertNil(manager.currentWhisperChunkStartPos)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 30), sampleRate: 100)
+        let safariBuffered = await waitUntil { manager.bufferedWhisperSampleCount == 30 }
+        XCTAssertTrue(safariBuffered)
+        XCTAssertEqual(manager.currentWhisperChunkStartPos, 24.0)
+    }
+
+    @MainActor
+    func testUpdateSourceBundleDropsQueuedSamplesFromPreviousCapture() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Post-retarget Whisper chunk dispatched")
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+
+        manager.handleTrackLoaded(track: browserTrack(sourceBundleId: "com.google.Chrome"), rawLines: sampleLines())
+        let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(chromeStarted)
+
+        // Chrome audio captured but still queued for main-actor delivery when the handoff lands.
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
+        manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+
+        let requests = recordedRequests.withLock { $0 }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+    }
+
+    @MainActor
+    func testFailedRetargetCaptureTearsDownRecognitionSession() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+
+        manager.handleTrackLoaded(track: browserTrack(sourceBundleId: "com.google.Chrome"), rawLines: sampleLines())
+        let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(chromeStarted)
+        let speechTask = try XCTUnwrap(recognizer.createdTasks.first)
+
+        fakeCapture.startError = FakeCaptureError()
+        manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
+        let failed = await waitUntil { fakeCapture.startCount == 2 && !manager.isLiveSyncActive }
+        XCTAssertTrue(failed)
+
+        XCTAssertTrue(speechTask.isCancelled, "A failed replacement capture must end the recognition session")
+        XCTAssertNil(fakeCapture.onAudioSamples)
+        if case .permissionRequired = state.audioSyncStatus {} else {
+            XCTFail("Expected the capture failure to be reported, got \(state.audioSyncStatus)")
+        }
+    }
+
     // MARK: - Helpers
+
+    private func browserTrack(sourceBundleId: String) -> TrackInfo {
+        TrackInfo(
+            id: "browser:www.youtube.com:Test Song|Test Artist|v:abc",
+            title: "Test Song",
+            artist: "Test Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil,
+            sourceBundleId: sourceBundleId
+        )
+    }
 
     @MainActor
     private func waitUntil(
@@ -1465,22 +1681,31 @@ private final class FakeAudioCapture: AudioCaptureProviding {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []
+    private(set) var calls: [String] = []
+    var startError: Error?
 
     @MainActor
-    func start(targetBundleIds: Set<String>) {
+    func start(targetBundleIds: Set<String>) throws {
         startCount += 1
+        calls.append("start")
         lastTargetBundleIds = targetBundleIds
+        if let startError {
+            throw startError
+        }
     }
 
     @MainActor
     func stop() {
         stopCount += 1
+        calls.append("stop")
     }
 
     func emit(samples: [Float], sampleRate: Double) {
         onAudioSamples?(samples, sampleRate)
     }
 }
+
+private struct FakeCaptureError: Error {}
 
 private final class FakeSpeechTask: SpeechRecognitionTaskHandling {
     private(set) var isCancelled = false
