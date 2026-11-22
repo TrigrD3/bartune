@@ -115,16 +115,56 @@ struct KaraokeLineView: View {
 
     @State private var textWidth: CGFloat = 0
 
+    static func isTimelinePaused(
+        isPlaying: Bool,
+        karaokeEnabled: Bool,
+        textWidth: CGFloat,
+        availableWidth: CGFloat
+    ) -> Bool {
+        let hasOverflow = textWidth > availableWidth
+        return !isPlaying || (!karaokeEnabled && !hasOverflow)
+    }
+
+    static func scrollProgress(
+        state: LyricsState,
+        at date: Date,
+        karaokeEnabled _: Bool
+    ) -> Double {
+        state.liveProgress(at: date)
+    }
+
+    static func scrollOffset(
+        progress: Double,
+        textWidth: CGFloat,
+        availableWidth: CGFloat
+    ) -> CGFloat {
+        let overflow = max(0, textWidth - availableWidth)
+        return overflow > 0
+            ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
+            : 0
+    }
+
     var body: some View {
         GeometryReader { container in
             let availableWidth = container.size.width
-            let overflow = max(0, textWidth - availableWidth)
+            let timelinePaused = Self.isTimelinePaused(
+                isPlaying: isPlaying,
+                karaokeEnabled: karaokeEnabled,
+                textWidth: textWidth,
+                availableWidth: availableWidth
+            )
 
-            TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: !isPlaying || !karaokeEnabled)) { timeline in
-                let progress = karaokeEnabled ? state.liveProgress(at: timeline.date) : 1.0
-                let scrollOffset: CGFloat = overflow > 0
-                    ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
-                    : 0
+            TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: timelinePaused)) { timeline in
+                let progress = Self.scrollProgress(
+                    state: state,
+                    at: timeline.date,
+                    karaokeEnabled: karaokeEnabled
+                )
+                let scrollOffset = Self.scrollOffset(
+                    progress: progress,
+                    textWidth: textWidth,
+                    availableWidth: availableWidth
+                )
 
                 ZStack(alignment: .leading) {
                     if karaokeEnabled {
