@@ -4,11 +4,14 @@ struct EditableWord: Identifiable, Equatable, Sendable {
     let id: UUID
     var text: String
     var timestamp: Double?
+    /// Exact duration imported from source word timing; cleared once the word is retimed.
+    var preservedDuration: Double?
 
-    init(id: UUID = UUID(), text: String, timestamp: Double? = nil) {
+    init(id: UUID = UUID(), text: String, timestamp: Double? = nil, preservedDuration: Double? = nil) {
         self.id = id
         self.text = text
         self.timestamp = timestamp
+        self.preservedDuration = preservedDuration
     }
 }
 
@@ -42,17 +45,24 @@ enum StampingMode: Equatable, Sendable {
 
 /// Pure editing and tap-stamping model for the Lyric Timing Editor.
 struct LyricTimingSession: Equatable, Sendable {
-    private struct StampSnapshot: Equatable, Sendable {
-        let lines: [EditableLine]
-        let nextLineIndex: Int
-        let nextWordIndex: Int
+    private enum StampUndoAction: Equatable, Sendable {
+        case lineTimestamp(lineId: UUID, previousTimestamp: Double?, previousNextLineIndex: Int)
+        case lineEndTimestamp(lineId: UUID, previousEndTimestamp: Double?)
+        case wordTimestamp(
+            lineId: UUID,
+            wordId: UUID,
+            previousWordTimestamp: Double?,
+            previousWordDuration: Double?,
+            previousLineTimestamp: Double?,
+            previousNextWordIndex: Int
+        )
     }
 
     var lines: [EditableLine]
     var stampingMode: StampingMode = .off
     var nextLineIndex: Int = 0
     var nextWordIndex: Int = 0
-    private var stampUndoStack: [StampSnapshot] = []
+    private var stampUndoStack: [StampUndoAction] = []
 
     var canUndoStamp: Bool { !stampUndoStack.isEmpty }
 
@@ -71,7 +81,11 @@ struct LyricTimingSession: Equatable, Sendable {
                 explicitEnd = nil
             }
             let editableWords = line.words.map { word in
-                EditableWord(text: word.text, timestamp: max(0.0, word.timestamp))
+                EditableWord(
+                    text: word.text,
+                    timestamp: max(0.0, word.timestamp),
+                    preservedDuration: word.duration.map { max(0.0, $0) }
+                )
             }
             return EditableLine(
                 text: line.text,
@@ -235,7 +249,12 @@ struct LyricTimingSession: Equatable, Sendable {
             return false
         case .lines:
             guard nextLineIndex < lines.count else { return false }
-            pushUndo()
+            let target = lines[nextLineIndex]
+            stampUndoStack.append(.lineTimestamp(
+                lineId: target.id,
+                previousTimestamp: target.timestamp,
+                previousNextLineIndex: nextLineIndex
+            ))
             lines[nextLineIndex].timestamp = clamped
             nextLineIndex += 1
             return true
@@ -243,8 +262,18 @@ struct LyricTimingSession: Equatable, Sendable {
             guard lines.indices.contains(lineIndex),
                   nextWordIndex < lines[lineIndex].words.count
             else { return false }
-            pushUndo()
+            let line = lines[lineIndex]
+            let word = line.words[nextWordIndex]
+            stampUndoStack.append(.wordTimestamp(
+                lineId: line.id,
+                wordId: word.id,
+                previousWordTimestamp: word.timestamp,
+                previousWordDuration: word.preservedDuration,
+                previousLineTimestamp: line.timestamp,
+                previousNextWordIndex: nextWordIndex
+            ))
             lines[lineIndex].words[nextWordIndex].timestamp = clamped
+            lines[lineIndex].words[nextWordIndex].preservedDuration = nil
             if nextWordIndex == 0, lines[lineIndex].timestamp == nil {
                 lines[lineIndex].timestamp = clamped
             }
@@ -256,24 +285,49 @@ struct LyricTimingSession: Equatable, Sendable {
     @discardableResult
     mutating func stampLineEnd(at position: Double, forLine index: Int) -> Bool {
         guard lines.indices.contains(index) else { return false }
-        pushUndo()
+        let line = lines[index]
+        stampUndoStack.append(.lineEndTimestamp(
+            lineId: line.id,
+            previousEndTimestamp: line.endTimestamp
+        ))
         lines[index].endTimestamp = Self.clampTime(position)
         return true
     }
 
     @discardableResult
     mutating func undoLastStamp() -> Bool {
-        guard let previous = stampUndoStack.popLast() else { return false }
-        lines = previous.lines
-        nextLineIndex = previous.nextLineIndex
-        nextWordIndex = previous.nextWordIndex
-        return true
-    }
-
-    private mutating func pushUndo() {
-        stampUndoStack.append(
-            StampSnapshot(lines: lines, nextLineIndex: nextLineIndex, nextWordIndex: nextWordIndex)
-        )
+        while let action = stampUndoStack.popLast() {
+            switch action {
+            case let .lineTimestamp(lineId, previousTimestamp, previousNextLineIndex):
+                guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }) else { continue }
+                lines[lineIndex].timestamp = previousTimestamp
+                nextLineIndex = min(previousNextLineIndex, lines.count)
+                return true
+            case let .lineEndTimestamp(lineId, previousEndTimestamp):
+                guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }) else { continue }
+                lines[lineIndex].endTimestamp = previousEndTimestamp
+                return true
+            case let .wordTimestamp(
+                lineId,
+                wordId,
+                previousWordTimestamp,
+                previousWordDuration,
+                previousLineTimestamp,
+                previousNextWordIndex
+            ):
+                guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }),
+                      let wordIndex = lines[lineIndex].words.firstIndex(where: { $0.id == wordId })
+                else { continue }
+                lines[lineIndex].words[wordIndex].timestamp = previousWordTimestamp
+                lines[lineIndex].words[wordIndex].preservedDuration = previousWordDuration
+                if wordIndex == 0 {
+                    lines[lineIndex].timestamp = previousLineTimestamp
+                }
+                nextWordIndex = min(previousNextWordIndex, lines[lineIndex].words.count)
+                return true
+            }
+        }
+        return false
     }
 
     // MARK: - Fine-Tuning (Nudging & Direct Entry)
@@ -310,6 +364,7 @@ struct LyricTimingSession: Equatable, Sendable {
         else { return }
         let base = lines[lineIndex].words[wordIndex].timestamp ?? lines[lineIndex].timestamp ?? 0.0
         lines[lineIndex].words[wordIndex].timestamp = Self.clampTime(base + delta)
+        lines[lineIndex].words[wordIndex].preservedDuration = nil
     }
 
     mutating func setWordTimestamp(lineIndex: Int, wordIndex: Int, to seconds: Double?) {
@@ -317,6 +372,7 @@ struct LyricTimingSession: Equatable, Sendable {
               lines[lineIndex].words.indices.contains(wordIndex)
         else { return }
         lines[lineIndex].words[wordIndex].timestamp = seconds.map(Self.clampTime)
+        lines[lineIndex].words[wordIndex].preservedDuration = nil
     }
 
     private static func clampTime(_ seconds: Double) -> Double {
@@ -369,6 +425,14 @@ struct LyricTimingSession: Equatable, Sendable {
 
     // MARK: - Duration Derivation & Export
 
+    /// 1-based line numbers of non-empty lines that still have no start timestamp.
+    var unstampedLineNumbers: [Int] {
+        lines.enumerated().compactMap { index, line in
+            let hasText = !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return (hasText && line.timestamp == nil) ? (index + 1) : nil
+        }
+    }
+
     func buildLyricLines() -> [LyricLine] {
         let stampedLines: [(EditableLine, Double)] = lines.compactMap { line in
             guard let start = line.timestamp else { return nil }
@@ -394,15 +458,20 @@ struct LyricTimingSession: Equatable, Sendable {
             }
             let builtWords: [WordTimestamp] = stampedWords.enumerated().map { wordIndex, wordPair in
                 let (word, wordStart) = wordPair
-                let nextWordStart = (wordIndex + 1 < stampedWords.count) ? stampedWords[wordIndex + 1].1 : nil
-                let wordEnd: Double? = if let nextWordStart, nextWordStart > wordStart {
-                    nextWordStart
-                } else if let lineEnd, lineEnd > wordStart {
-                    lineEnd
+                let wordDuration: Double?
+                if let preserved = word.preservedDuration {
+                    wordDuration = preserved
                 } else {
-                    nil
+                    let nextWordStart = (wordIndex + 1 < stampedWords.count) ? stampedWords[wordIndex + 1].1 : nil
+                    let wordEnd: Double? = if let nextWordStart, nextWordStart > wordStart {
+                        nextWordStart
+                    } else if let lineEnd, lineEnd > wordStart {
+                        lineEnd
+                    } else {
+                        nil
+                    }
+                    wordDuration = wordEnd.map { $0 - wordStart }
                 }
-                let wordDuration = wordEnd.map { $0 - wordStart }
                 return WordTimestamp(timestamp: wordStart, duration: wordDuration, text: word.text)
             }
 

@@ -65,22 +65,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state: state,
             cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator),
             appUpdater: appUpdater,
-            diagnostics: audioSyncManager.diagnostics
+            diagnostics: audioSyncManager.diagnostics,
+            onOpenLyricTimingEditor: { [weak self] in
+                self?.openLyricTimingEditor()
+            }
         )
         lyricTimingEditorController = LyricTimingEditorWindowController(
             state: state,
             customLyricsStore: customLyricsStore,
-            onSeek: { [weak self] seconds in
-                self?.spotifyMonitor.sendCommand(.seek(seconds))
+            onSeek: { [weak self] trackId, seconds in
+                self?.spotifyMonitor.sendCommand(.seek(seconds), expectedTrackId: trackId)
             },
-            onTogglePlayPause: { [weak self] in
-                self?.spotifyMonitor.sendCommand(.playPause)
+            onTogglePlayPause: { [weak self] trackId in
+                self?.spotifyMonitor.sendCommand(.playPause, expectedTrackId: trackId)
             },
             onSelectSource: { [weak self] track, source in
                 self?.selectLyricSource(source, for: track)
             },
             onSaveCustom: { [weak self] track, lines in
-                self?.saveCustomLyrics(lines, for: track)
+                try self?.saveCustomLyrics(lines, for: track)
             },
             onDeleteCustom: { [weak self] track in
                 self?.deleteCustomLyrics(for: track)
@@ -376,6 +379,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                !Task.isCancelled,
                lastFetchedTrackId == track.id {
                 lastFetchedLines = lookup
+                if state.lyricSourceChoice(for: track.id) != .custom {
+                    applyResolvedLyricSource(for: lastLoadedTrack ?? track, fetchedLines: lookup)
+                }
             }
             return
         }
@@ -451,8 +457,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
     }
 
-    func saveCustomLyrics(_ lines: [LyricLine], for track: TrackInfo) {
-        guard !lines.isEmpty else { return }
+    func saveCustomLyrics(_ lines: [LyricLine], for track: TrackInfo) throws {
+        guard !lines.isEmpty else {
+            throw CustomLyricsStoreError.emptyLyrics
+        }
         let record = CustomLyricsRecord(
             trackId: track.id,
             title: track.title,
@@ -460,7 +468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             savedAt: Date(),
             lines: lines
         )
-        customLyricsStore.save(record)
+        try customLyricsStore.save(record)
         state.setLyricSourceChoice(.custom, for: track.id)
         guard lastLoadedTrack?.id == track.id else { return }
         applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)

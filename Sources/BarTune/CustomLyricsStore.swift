@@ -24,6 +24,17 @@ struct CustomLyricsRecord: Equatable, Codable, Sendable {
     let lines: [LyricLine]
 }
 
+enum CustomLyricsStoreError: LocalizedError, Equatable {
+    case emptyLyrics
+
+    var errorDescription: String? {
+        switch self {
+        case .emptyLyrics:
+            return "Cannot save empty lyrics."
+        }
+    }
+}
+
 /// Persists user-timed Custom lyrics under Application Support, outside the lyrics cache so cache
 /// clears and pruning never delete them.
 struct CustomLyricsStore: Sendable {
@@ -55,13 +66,15 @@ struct CustomLyricsStore: Sendable {
         load(trackId: trackId) != nil
     }
 
-    func save(_ record: CustomLyricsRecord) {
-        guard !record.lines.isEmpty else { return }
-        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    func save(_ record: CustomLyricsRecord) throws {
+        guard !record.lines.isEmpty else {
+            throw CustomLyricsStoreError.emptyLyrics
+        }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
-        guard let data = try? encoder.encode(record) else { return }
-        try? data.write(to: fileURL(for: record.trackId), options: .atomic)
+        let data = try encoder.encode(record)
+        try data.write(to: fileURL(for: record.trackId), options: .atomic)
     }
 
     func remove(trackId: String) {
