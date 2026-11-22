@@ -424,6 +424,51 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(freshEngine.shutdownCount, 0)
     }
 
+    func testRecognitionLevelRaisesQuietAudioAndLeavesSilenceAlone() {
+        let quiet: [Float] = [0.02, -0.024, 0.01, 0]
+        let raised = AudioLevel.normalizedForRecognition(quiet)
+        XCTAssertEqual(raised.map { abs($0) }.max() ?? 0, 0.95, accuracy: 0.001)
+        XCTAssertEqual(raised[0] / raised[2], 2.0, accuracy: 0.001, "one gain for the whole chunk")
+
+        let nearSilence: [Float] = [0.00005, -0.00003]
+        XCTAssertEqual(AudioLevel.normalizedForRecognition(nearSilence), nearSilence)
+
+        let faint: [Float] = [0.001, -0.0005]
+        XCTAssertEqual(AudioLevel.normalizedForRecognition(faint)[0], 0.1, accuracy: 0.0001, "gain is capped at 100x")
+    }
+
+    @MainActor
+    func testWhisperChunksAreRaisedToRecognitionLevel() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let peaks = LockedBox<[Float]>([])
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            runWhisperChunk: { request in
+                peaks.withLock { $0.append(request.samples.map { abs($0) }.max() ?? 0) }
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Player volume turned down: the captured chunk peaks at 0.024.
+        fakeCapture.emit(samples: (0..<100).map { $0.isMultiple(of: 2) ? 0.024 : -0.012 }, sampleRate: 100)
+        let sent = await waitUntil { !peaks.withLock { $0 }.isEmpty }
+
+        XCTAssertTrue(sent)
+        XCTAssertEqual(peaks.withLock { $0 }.first ?? 0, 0.95, accuracy: 0.001)
+    }
+
     @MainActor
     func testWhisperChunksCarryTheLyricLanguage() async {
         let state = LyricsState(userDefaults: defaults)
@@ -720,7 +765,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertNil(manager.currentWhisperChunkStartPos)
 
         // Emit 60 post-seek frames: must NOT trigger a mixed chunk immediately (50 + 60 >= 100).
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 60), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 60), sampleRate: 100.0)
         for _ in 0..<10 {
             await Task.yield()
         }
@@ -729,14 +774,14 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(manager.currentWhisperChunkStartPos ?? -1, 90.0, accuracy: 0.01)
 
         // Emit remaining 40 post-seek frames to complete the clean post-seek chunk.
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 40), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 40), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
 
         let requests = recordedRequests.withLock { $0 }
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
         XCTAssertEqual(requests.first?.samples.count, 100)
-        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.95) < 0.001 } ?? false)
     }
 
     @MainActor
@@ -777,13 +822,13 @@ final class AudioSyncManagerTests: XCTestCase {
         // Pre-seek audio captured but still queued for main-actor delivery when the seek lands.
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
         manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
 
         let requests = recordedRequests.withLock { $0 }
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
-        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.95) < 0.001 } ?? false)
     }
 
     @MainActor
@@ -794,7 +839,7 @@ final class AudioSyncManagerTests: XCTestCase {
         }
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
-        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.95) < 0.001 } ?? false)
     }
 
     @MainActor
@@ -804,7 +849,7 @@ final class AudioSyncManagerTests: XCTestCase {
         }
         XCTAssertEqual(requests.count, 1)
         XCTAssertEqual(requests.first?.playbackRate ?? -1, 2.0, accuracy: 0.001)
-        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.95) < 0.001 } ?? false)
     }
 
     /// Queues pre-change audio with an empty chunk buffer, applies `change` to live state first (as AppDelegate does), then reports it.
@@ -841,7 +886,7 @@ final class AudioSyncManagerTests: XCTestCase {
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
         change(state)
         manager.handlePlaybackStateChanged(isPlaying: false, position: state.playbackAnchorPosition)
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
         return recordedRequests.withLock { $0 }
     }
@@ -886,7 +931,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.playbackAnchorPosition = 140.0
         manager.handlePlaybackStateChanged(isPlaying: false, position: 140.0)
 
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
 
         let requests = recordedRequests.withLock { $0 }
@@ -1473,12 +1518,12 @@ final class AudioSyncManagerTests: XCTestCase {
         // Chrome audio captured but still queued for main-actor delivery when the handoff lands.
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
         manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
-        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
 
         let requests = recordedRequests.withLock { $0 }
         XCTAssertEqual(requests.count, 1)
-        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.95) < 0.001 } ?? false)
     }
 
     @MainActor
