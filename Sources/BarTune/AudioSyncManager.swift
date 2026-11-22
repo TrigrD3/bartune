@@ -440,6 +440,8 @@ final class AudioSyncManager {
     private var speechRecognizer: SpeechRecognizing?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SpeechRecognitionTaskHandling?
+    /// Timed segments heard so far this session, in recognizer stream time.
+    private var speechSegments: [SpeechRecognizedSegment] = []
     /// Track position and playback rate at each stream time where playback (re)started; a same-track seek or rate change appends one.
     private var speechTimelineAnchors: [(streamTime: Double, trackPosition: Double, playbackRate: Double)] = []
     private var speechStreamDuration: Double = 0
@@ -491,6 +493,7 @@ final class AudioSyncManager {
         speechRecognizer = nil
         speechTimelineAnchors.removeAll(keepingCapacity: false)
         speechStreamDuration = 0
+        speechSegments.removeAll(keepingCapacity: false)
         whisperStartupTask?.cancel()
         whisperStartupTask = nil
         whisperProcessingTask?.cancel()
@@ -746,6 +749,19 @@ final class AudioSyncManager {
         }
     }
 
+    /// Apple Speech restarts its transcript after a pause and reports partial-result segments untimed
+    /// (timestamp and duration 0), so earlier timed segments are kept and each result only revises
+    /// from its own first timed segment onward.
+    nonisolated static func mergeSpeechSegments(
+        _ committed: [SpeechRecognizedSegment],
+        with incoming: [SpeechRecognizedSegment]
+    ) -> [SpeechRecognizedSegment] {
+        let timed = incoming.filter { $0.timestamp > 0 || $0.duration > 0 }
+        guard let cutoff = timed.first?.timestamp else { return committed }
+        // The tolerance absorbs a revised first word whose start moved slightly later.
+        return committed.filter { $0.timestamp < cutoff - 0.25 } + timed
+    }
+
     private func handleCaptureStartFailure(_ error: Error, generation: UInt64) {
         guard syncGeneration == generation else { return }
         stop()
@@ -838,7 +854,8 @@ final class AudioSyncManager {
                       self.state.audioSyncEngine == .appleSpeech
                 else { return }
                 if let segments {
-                    let words: [RecognizedAudioWord] = segments.map { seg in
+                    self.speechSegments = Self.mergeSpeechSegments(self.speechSegments, with: segments)
+                    let words: [RecognizedAudioWord] = self.speechSegments.map { seg in
                         let rate = self.speechPlaybackRate(forStreamTime: seg.timestamp)
                         return RecognizedAudioWord(
                             text: seg.substring,

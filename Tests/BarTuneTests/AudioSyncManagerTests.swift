@@ -1313,6 +1313,62 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(snapshot?.lineResults.map(\.matched), [false, false])
     }
 
+    // MARK: - #136: Apple Speech restarts its transcript after a pause
+
+    private func segment(_ text: String, _ timestamp: TimeInterval, duration: TimeInterval = 0.2) -> SpeechRecognizedSegment {
+        SpeechRecognizedSegment(substring: text, timestamp: timestamp, duration: duration, confidence: 0.9)
+    }
+
+    func testMergeKeepsEarlierSegmentsWhenTranscriptRestarts() {
+        let committed = [segment("hello", 1.0), segment("world", 1.5)]
+        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: [segment("again", 5.0)])
+        XCTAssertEqual(merged.map(\.substring), ["hello", "world", "again"])
+    }
+
+    func testMergeLetsAContinuingTranscriptReviseItsOwnWords() {
+        let committed = [segment("early", 0.5), segment("hello", 1.0), segment("word", 1.5)]
+        let revised = [segment("hello", 1.1), segment("world", 1.5), segment("again", 2.0)]
+        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: revised)
+        XCTAssertEqual(merged.map(\.substring), ["early", "hello", "world", "again"])
+    }
+
+    func testMergeIgnoresUntimedPartialSegments() {
+        let committed = [segment("hello", 1.0)]
+        let partial = [segment("hel", 0, duration: 0), segment("lo", 0, duration: 0)]
+        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: partial)
+        XCTAssertEqual(merged.map(\.substring), ["hello"])
+    }
+
+    @MainActor
+    func testAppleSpeechAlignsLinesHeardBeforeATranscriptRestart() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        let firstPhrase = [segment("hello", 0.1), segment("world", 0.4), segment("from", 0.7), segment("test", 1.0)]
+        recognizer.resultHandlers.first?(firstPhrase, false, nil)
+        let firstMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 1 }
+        XCTAssertTrue(firstMatched)
+
+        // After a pause the transcript holds only the new phrase.
+        let secondPhrase = [segment("second", 5.1), segment("line", 5.4), segment("of", 5.7), segment("lyrics", 6.0)]
+        recognizer.resultHandlers.first?(secondPhrase, false, nil)
+        let bothMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 2 }
+
+        XCTAssertTrue(bothMatched, "got \(String(describing: manager.diagnostics.snapshot?.matchedLineCount)) matched lines")
+        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+        XCTAssertEqual(manager.recognizedWords.map(\.text), ["hello", "world", "from", "test", "second", "line", "of", "lyrics"])
+    }
+
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
     @MainActor
