@@ -840,6 +840,18 @@ struct SettingsView: View {
             }
 
             Section("Software Update") {
+                VStack(alignment: .leading, spacing: 4) {
+                    Picker("Update Channel", selection: $updater.channel) {
+                        ForEach(UpdateChannel.allCases) { channel in
+                            Text(channel.title).tag(channel)
+                        }
+                    }
+                    .disabled(updater.isBusy)
+                    Text(updater.channel.summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 HStack {
                     Text("Installed Version")
                     Spacer()
@@ -854,7 +866,7 @@ struct SettingsView: View {
                         " (\(ByteCountFormatter.string(fromByteCount: $0.sizeBytes, countStyle: .file)))"
                     } ?? ""
                     HStack {
-                        Text("Latest Release")
+                        Text(updater.channel == .stable ? "Latest Release" : "Latest Build")
                         Spacer()
                         Text("\(release.version.tagFormatted)\(sizeLabel)")
                             .monospacedDigit()
@@ -957,7 +969,7 @@ struct SettingsView: View {
     private var updateActionButtons: some View {
         switch updater.state {
         case let .updateAvailable(release, _), let .failed(_, release?):
-            if release.dmgAsset != nil {
+            if release.canDownload {
                 Button("Download Update") {
                     updater.downloadLatestUpdate()
                 }
@@ -965,6 +977,9 @@ struct SettingsView: View {
                 Button("Open Release") {
                     NSWorkspace.shared.open(release.htmlURL)
                 }
+                .help(release.dmgAsset == nil
+                    ? "This release has no BarTune installer for this version."
+                    : "This release has no checksum, so BarTune can't verify a download.")
             }
         case let .downloaded(_, fileURL):
             Button("Reveal in Finder") {

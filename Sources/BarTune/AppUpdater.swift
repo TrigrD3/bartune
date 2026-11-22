@@ -107,18 +107,26 @@ struct AppVersion: Comparable, Equatable, Hashable, Sendable {
 struct AppVersionInfo: Equatable, Sendable {
     let shortVersion: String?
     let buildNumber: String?
+    let gitCommit: String?
+    /// "stable" for tagged releases, "dev" for builds from main or a local checkout.
+    let releaseChannel: String?
 
-    init(shortVersion: String?, buildNumber: String?) {
+    init(shortVersion: String?, buildNumber: String?, gitCommit: String? = nil, releaseChannel: String? = nil) {
         let trimmedShort = shortVersion?.trimmingCharacters(in: .whitespacesAndNewlines)
         let trimmedBuild = buildNumber?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCommit = gitCommit?.trimmingCharacters(in: .whitespacesAndNewlines)
         self.shortVersion = (trimmedShort?.isEmpty == false) ? trimmedShort : nil
         self.buildNumber = (trimmedBuild?.isEmpty == false) ? trimmedBuild : nil
+        self.gitCommit = (trimmedCommit?.isEmpty == false) ? trimmedCommit : nil
+        self.releaseChannel = releaseChannel
     }
 
     init(infoDictionary: [String: Any]?) {
         self.init(
             shortVersion: infoDictionary?["CFBundleShortVersionString"] as? String,
-            buildNumber: infoDictionary?["CFBundleVersion"] as? String
+            buildNumber: infoDictionary?["CFBundleVersion"] as? String,
+            gitCommit: infoDictionary?["BarTuneGitCommit"] as? String,
+            releaseChannel: infoDictionary?["BarTuneReleaseChannel"] as? String
         )
     }
 
@@ -141,6 +149,9 @@ struct AppVersionInfo: Equatable, Sendable {
     var displayVersion: String {
         guard let version = normalizedShortVersion else {
             return "Dev Build"
+        }
+        if releaseChannel == "dev", let gitCommit {
+            return "v\(version) (dev · \(gitCommit))"
         }
         if let build = buildNumber, build != version {
             return "v\(version) (\(build))"
@@ -174,6 +185,12 @@ struct AppReleaseInfo: Equatable, Sendable {
     let htmlURL: URL
     let dmgAsset: AppReleaseAsset?
     let checksumAssetURL: URL?
+
+    /// The installer can only be downloaded when it has a checksum to verify against.
+    var canDownload: Bool {
+        guard let dmgAsset else { return false }
+        return dmgAsset.sha256Digest != nil || checksumAssetURL != nil
+    }
 }
 
 enum AppUpdateError: LocalizedError, Equatable, Sendable {
@@ -293,7 +310,7 @@ enum AppReleaseParser {
         }
     }
 
-    static func parseLatestRelease(data: Data) throws -> AppReleaseInfo {
+    static func parseLatestRelease(data: Data, channel: UpdateChannel = .stable) throws -> AppReleaseInfo {
         let dto: GitHubReleaseDTO
         do {
             dto = try JSONDecoder().decode(GitHubReleaseDTO.self, from: data)
@@ -301,12 +318,13 @@ enum AppReleaseParser {
             throw AppUpdateError.invalidResponse
         }
 
-        if dto.draft || dto.prerelease {
-            throw AppUpdateError.noReleaseFound
-        }
-
-        guard let version = AppVersion(dto.tagName) else {
-            throw AppUpdateError.invalidResponse
+        switch channel {
+        case .stable:
+            guard !dto.draft, !dto.prerelease else { throw AppUpdateError.noReleaseFound }
+        case .main:
+            guard !dto.draft, dto.prerelease, dto.tagName == AppUpdateService.mainChannelTag else {
+                throw AppUpdateError.noReleaseFound
+            }
         }
 
         guard let htmlURL = URL(string: dto.htmlURL),
@@ -331,15 +349,31 @@ enum AppReleaseParser {
             )
         }
 
-        let expectedDMGName = "BarTune-\(version.formatted).dmg".lowercased()
-        let preferredDMG = validDMGs.first { $0.name.lowercased() == expectedDMGName }
+        let version: AppVersion
+        switch channel {
+        case .stable:
+            guard let tagVersion = AppVersion(dto.tagName) else {
+                throw AppUpdateError.invalidResponse
+            }
+            version = tagVersion
+        case .main:
+            // The rolling pre-release keeps one tag, so the build is identified by its DMG name.
+            guard let newest = validDMGs.compactMap({ releaseVersion(fromDMGName: $0.name) }).max() else {
+                throw AppUpdateError.noReleaseFound
+            }
+            version = newest
+        }
+
+        // Exact names only: release.yml publishes "BarTune-<version>.dmg" and nothing else counts.
+        let expectedDMGName = "BarTune-\(version.formatted).dmg"
+        let preferredDMG = validDMGs.first { $0.name == expectedDMGName }
 
         var checksumAssetURL: URL?
         if let dmg = preferredDMG {
-            let expectedChecksumName = "\(dmg.name).sha256".lowercased()
+            let expectedChecksumName = "\(dmg.name).sha256"
             if let checksumDTO = assets.first(where: {
                 AppReleaseURLValidator.isSafeFilename($0.name)
-                    && $0.name.lowercased() == expectedChecksumName
+                    && $0.name == expectedChecksumName
             }),
                 let url = URL(string: checksumDTO.browserDownloadURL),
                 AppReleaseURLValidator.isTrustedDownloadURL(url) {
@@ -358,6 +392,17 @@ enum AppReleaseParser {
             dmgAsset: preferredDMG,
             checksumAssetURL: checksumAssetURL
         )
+    }
+
+    private static func releaseVersion(fromDMGName name: String) -> AppVersion? {
+        let lower = name.lowercased()
+        guard lower.hasPrefix("bartune-"), lower.hasSuffix(".dmg") else { return nil }
+        let raw = lower.dropFirst("bartune-".count).dropLast(".dmg".count)
+        // Only the exact name build.sh writes, so "BarTune-0.5.dmg" can't outrank a real installer.
+        guard let version = AppVersion(String(raw)), version.prerelease == nil,
+              name == "BarTune-\(version.formatted).dmg"
+        else { return nil }
+        return version
     }
 
     static func parseSHA256Digest(_ raw: String?) -> String? {
@@ -414,6 +459,8 @@ struct AppUpdateService: Sendable {
     typealias DestinationProvider = @Sendable () -> URL
 
     static let latestReleaseURLString = "https://api.github.com/repos/TrigrD3/bartune/releases/latest"
+    static let mainChannelTag = "dev"
+    static let mainChannelReleaseURLString = "https://api.github.com/repos/TrigrD3/bartune/releases/tags/\(mainChannelTag)"
     static let repositoryURLString = "https://github.com/TrigrD3/bartune"
     static let releasesPageURLString = "https://github.com/TrigrD3/bartune/releases"
 
@@ -436,8 +483,9 @@ struct AppUpdateService: Sendable {
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads", isDirectory: true)
     }
 
-    func fetchLatestRelease(userAgentVersion: String = "dev") async throws -> AppReleaseInfo {
-        guard let url = URL(string: Self.latestReleaseURLString) else {
+    func fetchLatestRelease(channel: UpdateChannel = .stable, userAgentVersion: String = "dev") async throws -> AppReleaseInfo {
+        let urlString = channel == .stable ? Self.latestReleaseURLString : Self.mainChannelReleaseURLString
+        guard let url = URL(string: urlString) else {
             throw AppUpdateError.invalidEndpoint
         }
 
@@ -456,7 +504,7 @@ struct AppUpdateService: Sendable {
             }
         }
 
-        return try AppReleaseParser.parseLatestRelease(data: data)
+        return try AppReleaseParser.parseLatestRelease(data: data, channel: channel)
     }
 
     func downloadUpdate(
@@ -592,6 +640,27 @@ struct AppUpdateService: Sendable {
     }
 }
 
+enum UpdateChannel: String, CaseIterable, Identifiable, Sendable {
+    case stable
+    case main
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .stable: return "Stable"
+        case .main: return "Latest from main"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .stable: return "Tagged GitHub releases. Recommended."
+        case .main: return "A build of every change merged to main. Newer, but less tested."
+        }
+    }
+}
+
 enum AppUpdateState: Equatable, Sendable {
     case idle
     case checking
@@ -604,27 +673,47 @@ enum AppUpdateState: Equatable, Sendable {
 
 @MainActor
 final class AppUpdaterModel: ObservableObject {
+    static let channelDefaultsKey = "bartune.updateChannel"
+
     let currentVersion: AppVersionInfo
     @Published private(set) var state: AppUpdateState = .idle
+    @Published var channel: UpdateChannel {
+        didSet {
+            guard channel != oldValue else { return }
+            defaults.set(channel.rawValue, forKey: Self.channelDefaultsKey)
+            // Drop any result or in-flight check from the other channel.
+            operationID += 1
+            state = .idle
+        }
+    }
 
     private let service: AppUpdateService
+    private let defaults: UserDefaults
     private let isAppleSilicon: Bool
     private var operationID = 0
 
     #if arch(arm64)
         nonisolated static let runningOnAppleSilicon = true
     #else
-        nonisolated static let runningOnAppleSilicon = false
+        // An x86_64 build under Rosetta still runs on Apple Silicon, so it can install the arm64 DMG.
+        nonisolated static let runningOnAppleSilicon: Bool = {
+            var value: Int32 = 0
+            var size = MemoryLayout<Int32>.size
+            return sysctlbyname("hw.optional.arm64", &value, &size, nil, 0) == 0 && value == 1
+        }()
     #endif
 
     init(
         currentVersion: AppVersionInfo = .fromBundle(),
         service: AppUpdateService = AppUpdateService(),
-        isAppleSilicon: Bool = AppUpdaterModel.runningOnAppleSilicon
+        isAppleSilicon: Bool = AppUpdaterModel.runningOnAppleSilicon,
+        defaults: UserDefaults = .standard
     ) {
         self.currentVersion = currentVersion
         self.service = service
         self.isAppleSilicon = isAppleSilicon
+        self.defaults = defaults
+        channel = defaults.string(forKey: Self.channelDefaultsKey).flatMap(UpdateChannel.init) ?? .stable
     }
 
     var isBusy: Bool {
@@ -671,13 +760,16 @@ final class AppUpdaterModel: ObservableObject {
         state = .checking
         let userAgentVersion = currentVersion.userAgentVersion
         let currentSemantic = currentVersion.semanticVersion
+        let channel = channel
         let service = service
 
         return Task {
             do {
-                let release = try await service.fetchLatestRelease(userAgentVersion: userAgentVersion)
+                let release = try await service.fetchLatestRelease(channel: channel, userAgentVersion: userAgentVersion)
                 guard id == operationID else { return }
 
+                // Builds from main follow the newest stable tag (v0.4.0 + 15 commits = 0.4.15), so both
+                // channels compare plain versions and switching channels never offers an older build.
                 if let currentSemantic {
                     if release.version > currentSemantic {
                         state = .updateAvailable(release, isDevBuild: false)
@@ -710,6 +802,7 @@ final class AppUpdaterModel: ObservableObject {
         let id = operationID
         state = .downloading(targetRelease)
         let userAgentVersion = currentVersion.userAgentVersion
+        let channel = channel
         let service = service
 
         return Task {
@@ -717,6 +810,14 @@ final class AppUpdaterModel: ObservableObject {
                 let fileURL = try await service.downloadUpdate(for: targetRelease, userAgentVersion: userAgentVersion)
                 guard id == operationID else { return }
                 state = .downloaded(targetRelease, fileURL: fileURL)
+            } catch AppUpdateError.invalidChecksumFile {
+                guard id == operationID else { return }
+                // Retrying would fetch the same unreadable checksum file.
+                state = .failed(message: AppUpdateError.invalidChecksumFile.localizedDescription, release: nil)
+            } catch AppUpdateError.httpError(404) where channel == .main {
+                guard id == operationID else { return }
+                // A newer push replaced this build's assets; retrying the same URL can't succeed.
+                state = .failed(message: "A newer build from main replaced this one. Check for updates again.", release: nil)
             } catch {
                 guard id == operationID else { return }
                 state = .failed(message: error.localizedDescription, release: targetRelease)

@@ -50,6 +50,23 @@ final class AppUpdaterTests: XCTestCase {
         let matchingBuild = AppVersionInfo(shortVersion: "0.4.0", buildNumber: "0.4.0")
         XCTAssertEqual(matchingBuild.displayVersion, "v0.4.0")
 
+        let mainBuild = AppVersionInfo(infoDictionary: [
+            "CFBundleShortVersionString": "0.4.15",
+            "CFBundleVersion": "130",
+            "BarTuneGitCommit": "a1b2c3d",
+            "BarTuneReleaseChannel": "dev",
+        ])
+        XCTAssertEqual(mainBuild.displayVersion, "v0.4.15 (dev · a1b2c3d)")
+        XCTAssertEqual(mainBuild.semanticVersion, AppVersion("0.4.15"))
+
+        let stableBuild = AppVersionInfo(infoDictionary: [
+            "CFBundleShortVersionString": "0.4.0",
+            "CFBundleVersion": "98",
+            "BarTuneGitCommit": "a1b2c3d",
+            "BarTuneReleaseChannel": "stable",
+        ])
+        XCTAssertEqual(stableBuild.displayVersion, "v0.4.0 (98)")
+
         let dev = AppVersionInfo(infoDictionary: nil)
         XCTAssertEqual(dev.displayVersion, "Dev Build")
         XCTAssertEqual(dev.sidebarLabel, "BarTune (Dev)")
@@ -395,9 +412,12 @@ final class AppUpdaterTests: XCTestCase {
     }
 
     @MainActor
-    func testUpdaterModelTransitionsForAvailableUpToDateDevBuildAndRetry() async {
+    func testUpdaterModelTransitionsForAvailableUpToDateDevBuildAndRetry() async throws {
         let tempRoot = makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "com.bartune.tests.updatetransitions.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
 
         let payload = Data("bar-tune-0.4.0-dmg".utf8)
         let digest = sha256Hex(payload)
@@ -425,7 +445,9 @@ final class AppUpdaterTests: XCTestCase {
 
         let outdatedModel = AppUpdaterModel(
             currentVersion: AppVersionInfo(shortVersion: "0.3.0", buildNumber: "2"),
-            service: service
+            service: service,
+            isAppleSilicon: true,
+            defaults: defaults
         )
         XCTAssertEqual(outdatedModel.state, .idle)
         await outdatedModel.checkForUpdates()?.value
@@ -459,7 +481,9 @@ final class AppUpdaterTests: XCTestCase {
 
         let currentModel = AppUpdaterModel(
             currentVersion: AppVersionInfo(shortVersion: "0.4.0", buildNumber: "2"),
-            service: service
+            service: service,
+            isAppleSilicon: true,
+            defaults: defaults
         )
         await currentModel.checkForUpdates()?.value
         XCTAssertEqual(currentModel.state, .upToDate(release))
@@ -467,11 +491,231 @@ final class AppUpdaterTests: XCTestCase {
 
         let devModel = AppUpdaterModel(
             currentVersion: AppVersionInfo(infoDictionary: nil),
-            service: service
+            service: service,
+            isAppleSilicon: true,
+            defaults: defaults
         )
         await devModel.checkForUpdates()?.value
         XCTAssertEqual(devModel.state, .updateAvailable(release, isDevBuild: true))
         XCTAssertFalse(devModel.hasAvailableUpdate)
+    }
+
+    func testParsesRollingMainPrereleaseByItsDMGName() throws {
+        let digestHex = String(repeating: "b", count: 64)
+        let json = makeMainReleaseJSON(version: "0.4.15", sha256Digest: digestHex)
+
+        let release = try AppReleaseParser.parseLatestRelease(data: Data(json.utf8), channel: .main)
+        XCTAssertEqual(release.version, AppVersion("0.4.15"))
+        XCTAssertEqual(release.dmgAsset?.name, "BarTune-0.4.15.dmg")
+        XCTAssertEqual(release.dmgAsset?.sha256Digest, digestHex)
+        XCTAssertEqual(
+            release.checksumAssetURL?.absoluteString,
+            "https://github.com/TrigrD3/bartune/releases/download/dev/BarTune-0.4.15.dmg.sha256"
+        )
+
+        // The stable channel never accepts the rolling pre-release.
+        XCTAssertThrowsError(try AppReleaseParser.parseLatestRelease(data: Data(json.utf8), channel: .stable)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .noReleaseFound)
+        }
+
+        // The main channel only accepts the dev tag, not other pre-releases.
+        let otherTag = json.replacingOccurrences(of: "\"tag_name\": \"dev\"", with: "\"tag_name\": \"v0.5.0-rc.1\"")
+        XCTAssertThrowsError(try AppReleaseParser.parseLatestRelease(data: Data(otherTag.utf8), channel: .main)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .noReleaseFound)
+        }
+
+        // A dev tag that isn't marked pre-release is not the rolling build.
+        let notPrerelease = json.replacingOccurrences(of: "\"prerelease\": true", with: "\"prerelease\": false")
+        XCTAssertThrowsError(try AppReleaseParser.parseLatestRelease(data: Data(notPrerelease.utf8), channel: .main)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .noReleaseFound)
+        }
+
+        // A non-canonical name that parses as a higher version doesn't hide the real installer.
+        let stray = json.replacingOccurrences(of: "\"assets\": [", with: """
+        "assets": [
+            {
+              "name": "BarTune-0.5.dmg",
+              "browser_download_url": "https://github.com/TrigrD3/bartune/releases/download/dev/BarTune-0.5.dmg",
+              "size": 3000000
+            },
+        """)
+        let withStray = try AppReleaseParser.parseLatestRelease(data: Data(stray.utf8), channel: .main)
+        XCTAssertEqual(withStray.version, AppVersion("0.4.15"))
+        XCTAssertEqual(withStray.dmgAsset?.name, "BarTune-0.4.15.dmg")
+        XCTAssertTrue(withStray.canDownload)
+
+        // Names must match exactly, including case.
+        let lowercased = json.replacingOccurrences(of: "BarTune-0.4.15.dmg", with: "bartune-0.4.15.dmg")
+        XCTAssertThrowsError(try AppReleaseParser.parseLatestRelease(data: Data(lowercased.utf8), channel: .main)) { error in
+            XCTAssertEqual(error as? AppUpdateError, .noReleaseFound)
+        }
+        let stableLowercased = makeReleaseJSON(version: "v0.4.0", sha256Digest: digestHex)
+            .replacingOccurrences(of: "BarTune-0.4.0.dmg", with: "bartune-0.4.0.dmg")
+        XCTAssertNil(try AppReleaseParser.parseLatestRelease(data: Data(stableLowercased.utf8)).dmgAsset)
+    }
+
+    @MainActor
+    func testUnreadableChecksumFileDropsTheOfferInsteadOfRetrying() async throws {
+        let tempRoot = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "com.bartune.tests.badchecksum.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        // No inline digest, so the .sha256 asset is the only checksum source, and it is malformed.
+        let json = makeMainReleaseJSON(version: "0.4.15", sha256Digest: "")
+            .replacingOccurrences(of: "\"digest\": \"sha256:\"", with: "\"digest\": null")
+        let service = AppUpdateService(
+            dataLoader: { request in
+                let url = try XCTUnwrap(request.url)
+                let body = url.absoluteString.hasSuffix(".sha256") ? "not a checksum" : json
+                return try (Data(body.utf8), self.httpResponse(url: url, statusCode: 200))
+            },
+            fileDownloader: { _ in
+                XCTFail("The installer must not be downloaded without a readable checksum")
+                throw URLError(.cancelled)
+            },
+            destinationDirectory: { tempRoot.appendingPathComponent("downloads", isDirectory: true) }
+        )
+        let model = AppUpdaterModel(
+            currentVersion: AppVersionInfo(shortVersion: "0.4.12", buildNumber: "120"),
+            service: service,
+            isAppleSilicon: true,
+            defaults: defaults
+        )
+        model.channel = .main
+        await model.checkForUpdates()?.value
+        guard case let .updateAvailable(release, _) = model.state else {
+            XCTFail("Expected the main build to be offered, got \(model.state)")
+            return
+        }
+        XCTAssertNil(release.dmgAsset?.sha256Digest)
+        XCTAssertTrue(release.canDownload)
+
+        await model.downloadLatestUpdate()?.value
+        guard case .failed(_, nil) = model.state else {
+            XCTFail("Expected the offer to be dropped after an unreadable checksum, got \(model.state)")
+            return
+        }
+    }
+
+    func testReleaseWithoutChecksumIsNotDownloadable() throws {
+        XCTAssertFalse(try makeSampleRelease(sha256Digest: nil, checksumAssetURL: nil).canDownload)
+        XCTAssertTrue(try makeSampleRelease(sha256Digest: String(repeating: "a", count: 64), checksumAssetURL: nil).canDownload)
+    }
+
+    @MainActor
+    func testMainChannelDropsAReplacedBuildInsteadOfRetryingIt() async throws {
+        let tempRoot = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "com.bartune.tests.replacedbuild.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let mainJSON = makeMainReleaseJSON(version: "0.4.15", sha256Digest: String(repeating: "b", count: 64))
+        let stableJSON = makeReleaseJSON(version: "v0.5.0", sha256Digest: String(repeating: "a", count: 64))
+        let service = AppUpdateService(
+            dataLoader: { request in
+                let url = try XCTUnwrap(request.url)
+                let body = url.absoluteString.hasSuffix("/releases/tags/dev") ? mainJSON : stableJSON
+                return try (Data(body.utf8), self.httpResponse(url: url, statusCode: 200))
+            },
+            fileDownloader: { request in
+                let tmp = tempRoot.appendingPathComponent("gone-\(UUID().uuidString).tmp")
+                try Data().write(to: tmp)
+                return try (tmp, self.httpResponse(url: XCTUnwrap(request.url), statusCode: 404))
+            },
+            destinationDirectory: { tempRoot.appendingPathComponent("downloads", isDirectory: true) }
+        )
+        let model = AppUpdaterModel(
+            currentVersion: AppVersionInfo(shortVersion: "0.4.12", buildNumber: "120"),
+            service: service,
+            isAppleSilicon: true,
+            defaults: defaults
+        )
+
+        model.channel = .main
+        await model.checkForUpdates()?.value
+        guard case .updateAvailable = model.state else {
+            XCTFail("Expected the main build to be offered before downloading, got \(model.state)")
+            return
+        }
+        await model.downloadLatestUpdate()?.value
+        guard case .failed(_, nil) = model.state else {
+            XCTFail("Expected the replaced main build to be dropped, got \(model.state)")
+            return
+        }
+
+        // A stable release isn't replaced in place, so a 404 there keeps the offer for a retry.
+        model.channel = .stable
+        await model.checkForUpdates()?.value
+        await model.downloadLatestUpdate()?.value
+        guard case .failed(_, .some) = model.state else {
+            XCTFail("Expected the stable release to stay offered, got \(model.state)")
+            return
+        }
+    }
+
+    @MainActor
+    func testUpdateChannelsCompareTheRightVersionsAndPersist() async throws {
+        let suiteName = "com.bartune.tests.updatechannel.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let requestedURLs = LockedBox<[String]>([])
+        let stableJSON = LockedBox(makeReleaseJSON(version: "v0.4.0", sha256Digest: String(repeating: "a", count: 64)))
+        let mainJSON = makeMainReleaseJSON(version: "0.4.15", sha256Digest: String(repeating: "b", count: 64))
+        let service = AppUpdateService(dataLoader: { request in
+            let url = try XCTUnwrap(request.url)
+            requestedURLs.withLock { $0.append(url.absoluteString) }
+            let body = url.absoluteString.hasSuffix("/releases/tags/dev") ? mainJSON : stableJSON.withLock { $0 }
+            return try (Data(body.utf8), self.httpResponse(url: url, statusCode: 200))
+        })
+
+        // A main build ahead of the 0.4.0 release is not offered that older release.
+        let mainBuild = AppVersionInfo(shortVersion: "0.4.12", buildNumber: "120", gitCommit: "a1b2c3d", releaseChannel: "dev")
+        let model = AppUpdaterModel(currentVersion: mainBuild, service: service, isAppleSilicon: true, defaults: defaults)
+        XCTAssertEqual(model.channel, .stable)
+        await model.checkForUpdates()?.value
+        guard case .upToDate = model.state else {
+            XCTFail("Expected .upToDate on stable, got \(model.state)")
+            return
+        }
+
+        // Switching channel resets the result and is remembered.
+        model.channel = .main
+        XCTAssertEqual(model.state, .idle)
+        XCTAssertEqual(defaults.string(forKey: AppUpdaterModel.channelDefaultsKey), "main")
+        await model.checkForUpdates()?.value
+        guard case let .updateAvailable(mainRelease, false) = model.state else {
+            XCTFail("Expected main build 0.4.15 to update 0.4.12, got \(model.state)")
+            return
+        }
+        XCTAssertEqual(mainRelease.version, AppVersion("0.4.15"))
+        XCTAssertEqual(requestedURLs.withLock { $0 }.last, AppUpdateService.mainChannelReleaseURLString)
+
+        let reloaded = AppUpdaterModel(currentVersion: mainBuild, service: service, isAppleSilicon: true, defaults: defaults)
+        XCTAssertEqual(reloaded.channel, .main)
+
+        // The same or an older main build is not an update.
+        let newestMain = AppVersionInfo(shortVersion: "0.4.15", buildNumber: "130")
+        let upToDateMain = AppUpdaterModel(currentVersion: newestMain, service: service, isAppleSilicon: true, defaults: defaults)
+        await upToDateMain.checkForUpdates()?.value
+        guard case .upToDate = upToDateMain.state else {
+            XCTFail("Expected .upToDate for the newest main build, got \(upToDateMain.state)")
+            return
+        }
+
+        // The next stable release (0.5.0) is offered to a main build on the stable channel.
+        stableJSON.withLock { $0 = self.makeReleaseJSON(version: "v0.5.0", sha256Digest: String(repeating: "a", count: 64)) }
+        model.channel = .stable
+        await model.checkForUpdates()?.value
+        guard case let .updateAvailable(stableRelease, false) = model.state else {
+            XCTFail("Expected 0.5.0 to be offered, got \(model.state)")
+            return
+        }
+        XCTAssertEqual(stableRelease.version, AppVersion("0.5.0"))
+        XCTAssertEqual(stableRelease.dmgAsset?.name, "BarTune-0.5.0.dmg")
     }
 
     @MainActor
@@ -534,6 +778,32 @@ final class AppUpdaterTests: XCTestCase {
         )
     }
 
+    private func makeMainReleaseJSON(version: String, sha256Digest: String) -> String {
+        let dmg = "BarTune-\(version).dmg"
+        return """
+        {
+          "tag_name": "dev",
+          "name": "Latest (main)",
+          "html_url": "https://github.com/TrigrD3/bartune/releases/tag/dev",
+          "draft": false,
+          "prerelease": true,
+          "assets": [
+            {
+              "name": "\(dmg)",
+              "browser_download_url": "https://github.com/TrigrD3/bartune/releases/download/dev/\(dmg)",
+              "size": 3000000,
+              "digest": "sha256:\(sha256Digest)"
+            },
+            {
+              "name": "\(dmg).sha256",
+              "browser_download_url": "https://github.com/TrigrD3/bartune/releases/download/dev/\(dmg).sha256",
+              "size": 90
+            }
+          ]
+        }
+        """
+    }
+
     private func makeReleaseJSON(version: String, sha256Digest: String) -> String {
         """
         {
@@ -544,8 +814,8 @@ final class AppUpdaterTests: XCTestCase {
           "prerelease": false,
           "assets": [
             {
-              "name": "BarTune-0.4.0.dmg",
-              "browser_download_url": "https://github.com/TrigrD3/bartune/releases/download/\(version)/BarTune-0.4.0.dmg",
+              "name": "BarTune-\(version.dropFirst()).dmg",
+              "browser_download_url": "https://github.com/TrigrD3/bartune/releases/download/\(version)/BarTune-\(version.dropFirst()).dmg",
               "size": 2999060,
               "digest": "sha256:\(sha256Digest)"
             }
