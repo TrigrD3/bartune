@@ -1358,6 +1358,19 @@ private struct AudioSyncDiagnosticsSection: View {
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
+                if !snapshot.lineResults.isEmpty {
+                    Text("Line Alignment (source → aligned)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ScrollView {
+                        Text(snapshot.formattedLineResults())
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 160)
+                }
+
                 HStack {
                     Spacer()
                     Button("Copy Diagnostics") {

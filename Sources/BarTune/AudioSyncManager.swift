@@ -457,6 +457,7 @@ final class AudioSyncManager {
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
     func handleTrackLoaded(track: TrackInfo, rawLines: [LyricLine], forceResync: Bool = false) {
+        let trackChanged = activeTrackId != track.id
         stop()
         activeTrackId = track.id
         activeSourceBundleId = track.sourceBundleId
@@ -464,6 +465,9 @@ final class AudioSyncManager {
         recognizedWords = []
         cachedAlignedLineCount = 0
         priorHeardWords = []
+        if trackChanged {
+            diagnostics.clear()
+        }
 
         let engine = state.audioSyncEngine
         guard engine != .off else {
@@ -495,6 +499,12 @@ final class AudioSyncManager {
                 state.applyAudioSyncedLines(cached.lines)
                 cachedAlignedLineCount = cached.alignedLineCount
                 priorHeardWords = cached.heardWords ?? []
+            } else if current {
+                // Keep recognized words for refinement without applying unreliable timings.
+                priorHeardWords = cached.heardWords ?? []
+                if priorHeardWords.isEmpty {
+                    cache.remove(trackId: track.id)
+                }
             } else {
                 cache.remove(trackId: track.id)
             }
@@ -911,6 +921,7 @@ final class AudioSyncManager {
         )
         guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
 
+        cachedAlignedLineCount = result.matchedLineCount
         state.applyAudioSyncedLines(result.lines)
         state.audioSyncStatus = .syncing(
             engine: engine,
@@ -961,6 +972,7 @@ final class AudioSyncManager {
             heardWords: allHeardWords
         )
         cache.save(record)
+        cachedAlignedLineCount = max(cachedAlignedLineCount, result.matchedLineCount)
     }
 
     struct WhisperChunkRequest: Sendable {

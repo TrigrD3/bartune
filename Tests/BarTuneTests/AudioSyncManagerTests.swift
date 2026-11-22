@@ -1265,6 +1265,106 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(capture.startCount, 0)
     }
 
+    @MainActor
+    func testUnreliablePartialCacheRetainsHeardWordsWithoutApplyingTimings() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let firstPlay = heardWords(lines: 0..<1)
+        var shiftedLines = tenLines()
+        shiftedLines[0] = LyricLine(id: 0, timestamp: shiftedLines[0].timestamp + 0.5, text: shiftedLines[0].text)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: 0.5,
+            alignedLineCount: 1, sourceLineCount: 10, lines: shiftedLines, heardWords: firstPlay
+        ))
+
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Unreliable timings (+0.5s shift) must not be applied to display.
+        state.updatePlayback(isPlaying: true, position: 10.2)
+        XCTAssertEqual(state.currentText, "amber river glows")
+        state.updatePlayback(isPlaying: false, position: 10.0)
+
+        // Hearing 5 more lines combines with the 1 retained line to reach 6/10 completion.
+        _ = await hear(heardWords(lines: 1..<6), manager: manager, capture: capture, feed: feed)
+        let completed = await waitUntil { state.audioSyncStatus == .cached(.whisper) }
+        XCTAssertTrue(completed, "1 retained + 5 new lines must reach 6/10; status \(state.audioSyncStatus)")
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 6)
+    }
+
+    @MainActor
+    func testDiagnosticsResetWhenTrackChangesToCachedOrDisabledTrack() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        _ = await hear(heardWords(lines: 0..<6), manager: manager, capture: capture, feed: feed)
+        let completed = await waitUntil { state.audioSyncStatus == .cached(.whisper) }
+        XCTAssertTrue(completed)
+        XCTAssertNotNil(manager.diagnostics.snapshot, "final snapshot is preserved when the same track finishes")
+
+        let trackB = TrackInfo(id: "spotify:track:second", title: "Second Song", artist: "Artist B", album: "", duration: 200, artworkURL: nil)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: trackB.id, engine: .whisper, syncedAt: Date(), medianOffset: 0.0,
+            alignedLineCount: 6, sourceLineCount: 10, lines: tenLines()
+        ))
+        manager.handleTrackLoaded(track: trackB, rawLines: tenLines())
+        XCTAssertNil(manager.diagnostics.snapshot, "switching to a cached track must clear the previous track's diagnostics")
+
+        // Start live sync again on track A, then switch to track C with audio sync disabled.
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: tenLines(), forceResync: true)
+        let restarted = await waitUntil { manager.isLiveSyncActive }
+        XCTAssertTrue(restarted)
+        XCTAssertNotNil(manager.diagnostics.snapshot)
+
+        state.audioSyncEngine = .off
+        let trackC = TrackInfo(id: "spotify:track:third", title: "Third Song", artist: "Artist C", album: "", duration: 200, artworkURL: nil)
+        manager.handleTrackLoaded(track: trackC, rawLines: tenLines())
+        XCTAssertNil(manager.diagnostics.snapshot, "switching to a track with sync disabled must clear previous diagnostics")
+    }
+
+    @MainActor
+    func testWeakerRevisionInSameSessionDoesNotDowngradeAcceptedAlignment() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let priorWords = heardWords(lines: 0..<3)
+        let priorResult = LyricsAudioAligner.align(lines: tenLines(), recognizedWords: priorWords)
+        XCTAssertEqual(priorResult.matchedLineCount, 3)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: priorResult.medianOffset,
+            alignedLineCount: 3, sourceLineCount: 10, lines: priorResult.lines, heardWords: priorWords
+        ))
+
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Chunk 1 adds lines 3..<5, reaching 5/10 matched lines (still partial, below 6/10).
+        let fiveHeard = await hear(heardWords(lines: 3..<5), manager: manager, capture: capture, feed: feed)
+        XCTAssertTrue(fiveHeard)
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 5)
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 5, totalLines: 10))
+
+        // Chunk 2 hears garbled speech overlapping prior line 0, dropping the merged alignment from 5 to 4 lines.
+        let garbledLine0 = [
+            RecognizedAudioWord(text: "mumble", startTime: 10.0, duration: 0.4, confidence: 0.5),
+            RecognizedAudioWord(text: "static", startTime: 10.6, duration: 0.4, confidence: 0.5),
+        ]
+        let weakerHeard = await hear(garbledLine0, manager: manager, capture: capture, feed: feed)
+        XCTAssertTrue(weakerHeard)
+        XCTAssertEqual(
+            manager.diagnostics.snapshot?.matchedLineCount,
+            4,
+            "overlapping garbled words must drop merged alignment to 4 lines (still above initial cache count 3)"
+        )
+
+        // Pause triggers persistCurrentAlignmentIfReady() as well.
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 25.0)
+
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 5, "a weaker later revision must not overwrite the 5-line cache")
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 5, totalLines: 10))
+    }
+
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
     @MainActor

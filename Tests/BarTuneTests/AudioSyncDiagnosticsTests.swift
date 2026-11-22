@@ -52,5 +52,9 @@ final class AudioSyncDiagnosticsTests: XCTestCase {
         XCTAssertTrue(report.contains("✓ 10.00s → 10.40s  Hello world from test"))
         XCTAssertTrue(report.contains("· 15.00s → 15.00s  Second line of lyrics"))
         XCTAssertTrue(report.contains("10.40s  hello  (0.80)"))
+        XCTAssertEqual(
+            diagnostics.formattedLineResults(),
+            "✓ 10.00s → 10.40s  Hello world from test\n· 15.00s → 15.00s  Second line of lyrics"
+        )
     }
 }

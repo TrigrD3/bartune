@@ -68,6 +68,15 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
         return String(format: "%+.2fs", offset)
     }
 
+    func formattedLineResults() -> String {
+        lineResults
+            .map { line in
+                let mark = line.matched ? "✓" : "·"
+                return "\(mark) \(Self.formatTime(line.sourceTimestamp)) → \(Self.formatTime(line.alignedTimestamp))  \(line.text)"
+            }
+            .joined(separator: "\n")
+    }
+
     /// Plain-text report copied by "Copy Diagnostics".
     func report() -> String {
         var out: [String] = []
@@ -104,6 +113,10 @@ final class AudioSyncDiagnosticsModel: ObservableObject {
     @Published private(set) var snapshot: AudioSyncDiagnostics?
 
     static let logger = Logger(subsystem: "com.arya.BarTune", category: "audio-sync")
+
+    func clear() {
+        snapshot = nil
+    }
 
     func begin(engine: AudioSyncEngine, track: TrackInfo, totalLines: Int) {
         var fresh = AudioSyncDiagnostics(engine: engine, trackDescription: "\(track.artist) — \(track.title)")
