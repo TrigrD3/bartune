@@ -14,6 +14,9 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   SpotifyMonitor.swift     # Event-driven AppleScript playback monitor (Spotify, Apple Music, browser fallback)
   BrowserMediaMonitor.swift # Browser tab music monitor (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web)
   LyricsFetcher.swift      # NetEase YRC & LRCLIB lyrics fetching and caching
+  CustomLyricsStore.swift  # Application Support persistence for user-timed Custom lyrics & per-song source resolution
+  LyricTimingSession.swift # Pure tap-stamping, word-splitting, nudging & duration-derivation model for the timing editor
+  LyricTimingEditorView.swift # Manual Lyric Timing Editor window (tap-to-time lines/words, fine-tune, per-song source picker)
   WhisperServer.swift      # One local whisper-server per Whisper sync session (model loaded once)
   LyricsForcedAligner.swift # Lyrics Alignment engine: CTC Viterbi of romanized lyrics over a Core ML acoustic model (Neural Engine)
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)

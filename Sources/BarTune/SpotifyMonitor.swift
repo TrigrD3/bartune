@@ -19,10 +19,11 @@ private final class CompiledScriptBox: @unchecked Sendable {
     }
 }
 
-enum PlaybackCommand: Sendable {
+enum PlaybackCommand: Sendable, Equatable {
     case playPause
     case nextTrack
     case previousTrack
+    case seek(Double)
 }
 
 struct PlaybackSnapshot {
@@ -218,10 +219,15 @@ final class SpotifyMonitor {
     ) -> String? {
         // Browser tabs can't be controlled yet; never fall back to a native player that isn't displayed.
         guard !activeTrackId.hasPrefix("browser:") else { return nil }
-        let verb = switch command {
-        case .playPause: "playpause"
-        case .nextTrack: "next track"
-        case .previousTrack: "previous track"
+        let verb: String
+        switch command {
+        case .playPause: verb = "playpause"
+        case .nextTrack: verb = "next track"
+        case .previousTrack: verb = "previous track"
+        case let .seek(seconds):
+            let clamped = (seconds.isFinite && seconds > 0) ? seconds : 0.0
+            let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), clamped)
+            verb = "set player position to \(formatted)"
         }
         if activeTrackId.hasPrefix("music:"), runningBundleIds.contains("com.apple.Music") {
             return "tell application \"Music\" to \(verb)"
