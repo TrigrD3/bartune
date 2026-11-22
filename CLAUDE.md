@@ -19,6 +19,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   AlbumArtColorExtractor.swift # Dominant/accent color extraction from album artwork
   Romanizer.swift          # Offline Japanese → Romaji conversion via CFStringTokenizer
   SettingsView.swift       # SwiftUI Settings window
+  AppUpdater.swift         # GitHub Releases update check & SHA-256-verified DMG download (About tab)
 Tests/BarTuneTests/        # XCTest unit tests (LRCParserTests, BrowserMediaParserTests, etc.)
 Casks/
   bartune.rb               # Homebrew Cask template synced to TrigrD3/homebrew-tap on v* tags
