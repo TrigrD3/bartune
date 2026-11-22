@@ -405,7 +405,7 @@ final class AudioSyncManagerTests: XCTestCase {
                 pendingAuthCallback = handler
             },
             makeSpeechRecognizer: { _ in recognizer },
-            locateWhisperCLI: { "/usr/local/bin/whisper-cli" },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
             resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" }
         )
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
@@ -437,51 +437,185 @@ final class AudioSyncManagerTests: XCTestCase {
 
     // MARK: - #64: Whisper Pipe deadlock & unbounded sample buffer
 
-    func testRunWhisperChunkDoesNotDeadlockOnLargeStdoutAndStderr() throws {
-        let scriptURL = tempDir.appendingPathComponent("fake-whisper.sh")
-        let script = """
-        #!/bin/sh
-        out_prefix=""
-        while [ $# -gt 0 ]; do
-          if [ "$1" = "-of" ]; then
-            out_prefix="$2"
-            shift 2
-          else
-            shift
-          fi
-        done
-        # Emit >128 KB to both stdout and stderr (exceeds macOS 64 KB pipe buffer).
-        dd if=/dev/zero bs=1024 count=160 2>/dev/null | tr '\\0' 'O'
-        dd if=/dev/zero bs=1024 count=160 2>/dev/null | tr '\\0' 'E' >&2
-        cat > "${out_prefix}.json" <<'EOF'
-        {"transcription":[{"offsets":{"from":0,"to":1000},"text":" Hello","tokens":[{"text":" Hello","offsets":{"from":100,"to":500},"p":0.95}]}]}
-        EOF
-        """
+    func testWhisperServerKeepsOneProcessAcrossChunksAndStopsOnShutdown() async throws {
+        let searchPath = ProcessInfo.processInfo.environment["PATH"] ?? "/usr/bin"
+        let python = searchPath.split(separator: ":").map { "\($0)/python3" }
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+        try XCTSkipUnless(python != nil, "python3 runs the fake whisper-server")
+        let scriptURL = tempDir.appendingPathComponent("fake-whisper-server")
+        let logURL = tempDir.appendingPathComponent("fake-whisper-server.log")
+        let script = #"""
+        #!/usr/bin/env python3
+        import sys
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        args = sys.argv[1:]
+        port = int(args[args.index("--port") + 1])
+        prefix = args[args.index("--request-path") + 1]
+        log_path = sys.argv[0] + ".log"
+        with open(log_path, "a") as log:
+            log.write("load " + args[args.index("-m") + 1] + "\n")
+
+        RESPONSE = b'{"segments":[{"start":0.0,"end":1.0,"text":" Hello","words":[{"word":" Hello","start":0.1,"end":0.5,"probability":0.95}]}]}'
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200 if self.path == prefix + "/" else 404)
+                self.end_headers()
+
+            def do_POST(self):
+                body = self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path != prefix + "/inference":
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                with open(log_path, "a") as log:
+                    log.write("inference verbose_json=%s prompt=%s wav=%s\n" % (b"verbose_json" in body, b"Hello world" in body, b"RIFF" in body))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(RESPONSE)))
+                self.end_headers()
+                self.wfile.write(RESPONSE)
+
+            def log_message(self, *args):
+                pass
+
+        HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        """#
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
+        let launched = await WhisperServer.launch(serverPath: scriptURL.path, modelPath: "/models/ggml-test.bin", readyTimeout: 10)
+        let server = try XCTUnwrap(launched)
         let request = AudioSyncManager.WhisperChunkRequest(
-            cliPath: scriptURL.path,
-            modelPath: tempDir.appendingPathComponent("dummy.bin").path,
             samples: [Float](repeating: 0.1, count: 160),
             sampleRate: 16000,
             chunkStartTime: 10.0,
-            prompt: ""
+            prompt: "Hello world"
         )
 
-        let done = expectation(description: "Whisper chunk completes without pipe deadlock")
-        let parsedWordsBox = LockedBox<[RecognizedAudioWord]>([])
-        DispatchQueue.global(qos: .userInitiated).async {
-            let words = AudioSyncManager.runWhisperChunk(request)
-            parsedWordsBox.withLock { $0 = words }
-            done.fulfill()
+        let first = try await server.transcribe(request)
+        let second = try await server.transcribe(request)
+
+        XCTAssertEqual(first.map(\.text), ["Hello"])
+        XCTAssertEqual(first.first?.startTime ?? 0, 10.1, accuracy: 0.01)
+        XCTAssertEqual(second.map(\.text), ["Hello"])
+        let log = try String(contentsOf: logURL, encoding: .utf8).split(separator: "\n").map(String.init)
+        XCTAssertEqual(log, [
+            "load /models/ggml-test.bin",
+            "inference verbose_json=True prompt=True wav=True",
+            "inference verbose_json=True prompt=True wav=True",
+        ])
+
+        server.shutdown()
+        let deadline = Date().addingTimeInterval(2)
+        while server.isRunning, Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertFalse(server.isRunning)
+        do {
+            _ = try await server.transcribe(request)
+            XCTFail("A stopped server must report that it exited, not an empty transcript")
+        } catch {
+            XCTAssertEqual(error as? WhisperServerError, .exited)
+        }
+    }
+
+    @MainActor
+    func testWhisperSessionLaunchesModelOnceAndShutsItDownOnStop() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let launches = LockedBox<Int>(0)
+        let chunks = LockedBox<Int>(0)
+        let engine = FakeWhisperEngine { _ in
+            chunks.withLock { $0 += 1 }
+            return []
         }
 
-        wait(for: [done], timeout: 5.0)
-        let parsedWords = parsedWordsBox.withLock { $0 }
-        XCTAssertEqual(parsedWords.count, 1)
-        XCTAssertEqual(parsedWords.first?.text, "Hello")
-        XCTAssertEqual(parsedWords.first?.startTime ?? 0, 10.1, accuracy: 0.01)
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            launchWhisper: { _, _ in
+                launches.withLock { $0 += 1 }
+                return engine
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        for expected in 1...3 {
+            fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+            let processed = await waitUntil { chunks.withLock { $0 } == expected && !manager.isWhisperProcessing }
+            XCTAssertTrue(processed, "chunk \(expected) was not transcribed")
+        }
+
+        XCTAssertEqual(launches.withLock { $0 }, 1, "The model must load once per session, not once per chunk")
+        XCTAssertEqual(engine.shutdownCount, 0)
+
+        manager.stop()
+        XCTAssertEqual(engine.shutdownCount, 1)
+    }
+
+    @MainActor
+    func testWhisperSessionStopsWhenTheServerExits() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let launches = LockedBox<Int>(0)
+        let engine = FakeWhisperEngine { _ in throw WhisperServerError.exited }
+        let freshChunks = LockedBox<Int>(0)
+        let freshEngine = FakeWhisperEngine { _ in
+            freshChunks.withLock { $0 += 1 }
+            return []
+        }
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            launchWhisper: { _, _ in
+                let count = launches.withLock { value -> Int in
+                    value += 1
+                    return value
+                }
+                return count == 1 ? engine : freshEngine
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+        let stopsBeforeFailure = fakeCapture.stopCount
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let stopped = await waitUntil { !manager.isLiveSyncActive }
+        XCTAssertTrue(stopped, "A dead whisper-server must end the session instead of listening forever")
+        guard case .unavailable = state.audioSyncStatus else {
+            XCTFail("Expected .unavailable, got \(state.audioSyncStatus)")
+            return
+        }
+        XCTAssertEqual(engine.shutdownCount, 1)
+        XCTAssertEqual(fakeCapture.stopCount, stopsBeforeFailure + 1)
+        XCTAssertEqual(launches.withLock { $0 }, 1)
+
+        // The next track starts a fresh server.
+        let nextTrack = TrackInfo(id: "spotify:track:test-2", title: "Next", artist: "Test Artist", album: "Test Album", duration: 180, artworkURL: nil)
+        manager.handleTrackLoaded(track: nextTrack, rawLines: sampleLines())
+        let relaunched = await waitUntil { launches.withLock { $0 } == 2 && manager.isLiveSyncActive }
+        XCTAssertTrue(relaunched)
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let transcribed = await waitUntil { freshChunks.withLock { $0 } == 1 && !manager.isWhisperProcessing }
+        XCTAssertTrue(transcribed, "The fresh server must receive the next track's audio")
+        XCTAssertTrue(manager.isLiveSyncActive)
+        XCTAssertEqual(freshEngine.shutdownCount, 0)
     }
 
     @MainActor
@@ -502,7 +636,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let deps = makeDependencies(
             capture: fakeCapture,
-            locateWhisperCLI: { "/usr/local/bin/whisper-cli" },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
             resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
             runWhisperChunk: { request in
                 let count = recordedRequests.withLock { list -> Int in
@@ -603,7 +737,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let deps = makeDependencies(
             capture: fakeCapture,
-            locateWhisperCLI: { "/usr/local/bin/whisper-cli" },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
             resolveWhisperModelPath: { _ in
                 ranOnMainThread.withLock { $0 = Thread.isMainThread }
                 discoveryStarted.fulfill()
@@ -717,7 +851,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let deps = makeDependencies(
             capture: fakeCapture,
-            locateWhisperCLI: { "/usr/local/bin/whisper-cli" },
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
             resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
             runWhisperChunk: { _ in
                 let count = requestCount.withLock { value -> Int in
@@ -806,9 +940,10 @@ final class AudioSyncManagerTests: XCTestCase {
         speechAuthStatus: SFSpeechRecognizerAuthorizationStatus = .authorized,
         requestSpeechAuth: @escaping (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void = { _ in },
         makeSpeechRecognizer: @escaping (Locale?) -> SpeechRecognizing? = { _ in nil },
-        locateWhisperCLI: @escaping () -> String? = { nil },
+        locateWhisperServer: @escaping () -> String? = { nil },
         resolveWhisperModelPath: @escaping @Sendable (String) -> String? = { _ in nil },
         runWhisperChunk: @escaping @Sendable (AudioSyncManager.WhisperChunkRequest) -> [RecognizedAudioWord] = { _ in [] },
+        launchWhisper: (@Sendable (String, String) async -> WhisperTranscribing?)? = nil,
         whisperChunkDurationSeconds: Double = 12.0
     ) -> AudioSyncManager.Dependencies {
         AudioSyncManager.Dependencies(
@@ -818,9 +953,9 @@ final class AudioSyncManagerTests: XCTestCase {
             speechAuthorizationStatus: { speechAuthStatus },
             requestSpeechAuthorization: requestSpeechAuth,
             makeSpeechRecognizer: makeSpeechRecognizer,
-            locateWhisperCLI: locateWhisperCLI,
+            locateWhisperServer: locateWhisperServer,
             resolveWhisperModelPath: resolveWhisperModelPath,
-            runWhisperChunk: runWhisperChunk,
+            launchWhisper: launchWhisper ?? { _, _ in FakeWhisperEngine(transcribe: runWhisperChunk) },
             whisperChunkDurationSeconds: whisperChunkDurationSeconds
         )
     }
@@ -877,6 +1012,26 @@ private final class FakeSpeechRecognizer: SpeechRecognizing {
         let task = FakeSpeechTask()
         createdTasks.append(task)
         return task
+    }
+}
+
+private final class FakeWhisperEngine: WhisperTranscribing, @unchecked Sendable {
+    private let handler: @Sendable (AudioSyncManager.WhisperChunkRequest) throws -> [RecognizedAudioWord]
+    private let shutdowns = LockedBox<Int>(0)
+
+    var shutdownCount: Int { shutdowns.withLock { $0 } }
+
+    init(transcribe handler: @escaping @Sendable (AudioSyncManager.WhisperChunkRequest) throws -> [RecognizedAudioWord]) {
+        self.handler = handler
+    }
+
+    // swiftlint:disable:next async_without_await
+    func transcribe(_ request: AudioSyncManager.WhisperChunkRequest) async throws -> [RecognizedAudioWord] {
+        try handler(request)
+    }
+
+    func shutdown() {
+        shutdowns.withLock { $0 += 1 }
     }
 }
 

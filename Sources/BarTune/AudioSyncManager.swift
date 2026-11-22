@@ -265,7 +265,7 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCapturePr
 }
 
 enum WAVEncoder {
-    /// Encodes 16-bit mono PCM WAV data for whisper-cli input.
+    /// Encodes 16-bit mono PCM WAV data for whisper-server input.
     static func encodeMono16BitPCM(samples: [Float], sampleRate: Int = 16000) -> Data {
         let dataSize = samples.count * 2
         var data = Data(capacity: 44 + dataSize)
@@ -312,9 +312,9 @@ final class AudioSyncManager {
         var speechAuthorizationStatus: () -> SFSpeechRecognizerAuthorizationStatus
         var requestSpeechAuthorization: (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void
         var makeSpeechRecognizer: (Locale?) -> SpeechRecognizing?
-        var locateWhisperCLI: () -> String?
+        var locateWhisperServer: () -> String?
         var resolveWhisperModelPath: @Sendable (String) -> String?
-        var runWhisperChunk: @Sendable (WhisperChunkRequest) -> [RecognizedAudioWord]
+        var launchWhisper: @Sendable (_ serverPath: String, _ modelPath: String) async -> WhisperTranscribing?
         var whisperChunkDurationSeconds: Double
 
         static func live() -> Dependencies {
@@ -332,7 +332,7 @@ final class AudioSyncManager {
                     }
                     return SFSpeechRecognizer()
                 },
-                locateWhisperCLI: { WhisperModelLocator.locateWhisperCLI() },
+                locateWhisperServer: { WhisperModelLocator.locateWhisperServer() },
                 resolveWhisperModelPath: { selected in
                     let trimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
                     if !trimmed.isEmpty, FileManager.default.fileExists(atPath: trimmed) {
@@ -340,8 +340,8 @@ final class AudioSyncManager {
                     }
                     return WhisperModelLocator.discoverModels(customPath: trimmed).first?.path
                 },
-                runWhisperChunk: { request in
-                    AudioSyncManager.runWhisperChunk(request)
+                launchWhisper: { serverPath, modelPath in
+                    await WhisperServer.launch(serverPath: serverPath, modelPath: modelPath)
                 },
                 whisperChunkDurationSeconds: 12.0
             )
@@ -375,6 +375,7 @@ final class AudioSyncManager {
     private var whisperChunkStartPos: Double?
     private var whisperStartupTask: Task<Void, Never>?
     private var whisperProcessingTask: Task<Void, Never>?
+    private var whisperEngine: WhisperTranscribing?
     private var whisperSampleRate: Double = 16000.0
     private var whisperChunkDurationSeconds: Double { dependencies.whisperChunkDurationSeconds }
 
@@ -406,6 +407,8 @@ final class AudioSyncManager {
         whisperStartupTask = nil
         whisperProcessingTask?.cancel()
         whisperProcessingTask = nil
+        whisperEngine?.shutdown()
+        whisperEngine = nil
         whisperSampleBuffer.removeAll(keepingCapacity: false)
         whisperChunkStartPos = nil
     }
@@ -699,14 +702,15 @@ final class AudioSyncManager {
     }
 
     private func startWhisperSync(track: TrackInfo, lines: [LyricLine]) {
-        guard let cliPath = dependencies.locateWhisperCLI() else {
-            state.audioSyncStatus = .unavailable("whisper-cli not found (install via: brew install whisper-cpp)")
+        guard let serverPath = dependencies.locateWhisperServer() else {
+            state.audioSyncStatus = .unavailable("whisper-server not found (install via: brew install whisper-cpp)")
             return
         }
 
         let generation = syncGeneration
         let selectedModelPath = state.whisperModelPath
         let resolveModelPath = dependencies.resolveWhisperModelPath
+        let launchWhisper = dependencies.launchWhisper
         whisperSampleBuffer.removeAll(keepingCapacity: true)
         whisperChunkStartPos = nil
         state.audioSyncStatus = .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count)
@@ -721,26 +725,31 @@ final class AudioSyncManager {
                   self.activeTrackId == track.id,
                   self.state.audioSyncEngine == .whisper
             else { return }
-            self.whisperStartupTask = nil
             guard let modelPath = resolvedModelPath else {
+                self.whisperStartupTask = nil
                 self.state.audioSyncStatus = .unavailable("No Whisper GGML model found — pick or download one in Settings")
                 return
             }
-            self.beginWhisperCapture(
-                track: track,
-                cliPath: cliPath,
-                modelPath: modelPath,
-                generation: generation
-            )
+            let engine = await launchWhisper(serverPath, modelPath)
+            guard !Task.isCancelled,
+                  self.syncGeneration == generation,
+                  self.activeTrackId == track.id,
+                  self.state.audioSyncEngine == .whisper
+            else {
+                engine?.shutdown()
+                return
+            }
+            self.whisperStartupTask = nil
+            guard let engine else {
+                self.state.audioSyncStatus = .unavailable("whisper-server could not load the Whisper model")
+                return
+            }
+            self.whisperEngine = engine
+            self.beginWhisperCapture(track: track, generation: generation)
         }
     }
 
-    private func beginWhisperCapture(
-        track: TrackInfo,
-        cliPath: String,
-        modelPath: String,
-        generation: UInt64
-    ) {
+    private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
         capture.onAudioSamples = { [weak self] samples, sampleRate in
             Task { @MainActor in
                 guard let self,
@@ -765,12 +774,7 @@ final class AudioSyncManager {
                     }
                 }
 
-                self.dispatchWhisperChunkIfReady(
-                    trackId: track.id,
-                    cliPath: cliPath,
-                    modelPath: modelPath,
-                    generation: generation
-                )
+                self.dispatchWhisperChunkIfReady(trackId: track.id, generation: generation)
             }
         }
 
@@ -794,17 +798,13 @@ final class AudioSyncManager {
     }
 
     /// Dispatches one `targetFrames` chunk when the worker is idle; called on sample delivery and worker completion.
-    private func dispatchWhisperChunkIfReady(
-        trackId: String,
-        cliPath: String,
-        modelPath: String,
-        generation: UInt64
-    ) {
+    private func dispatchWhisperChunkIfReady(trackId: String, generation: UInt64) {
         guard syncGeneration == generation,
               isLiveSyncActive,
               activeTrackId == trackId,
               state.audioSyncEngine == .whisper,
-              whisperProcessingTask == nil
+              whisperProcessingTask == nil,
+              let engine = whisperEngine
         else { return }
         let sampleRate = whisperSampleRate
         let targetFrames = max(1, Int(sampleRate * whisperChunkDurationSeconds))
@@ -820,18 +820,23 @@ final class AudioSyncManager {
         }
 
         let request = WhisperChunkRequest(
-            cliPath: cliPath,
-            modelPath: modelPath,
             samples: chunk,
             sampleRate: Int(sampleRate),
             chunkStartTime: chunkStart,
             prompt: promptSnippet(around: chunkStart)
         )
-        let runWhisperChunk = dependencies.runWhisperChunk
         whisperProcessingTask = Task { [weak self] in
-            let words = await Task.detached(priority: .utility) {
-                runWhisperChunk(request)
-            }.value
+            let words: [RecognizedAudioWord]
+            do {
+                words = try await engine.transcribe(request)
+            } catch {
+                guard let self, self.syncGeneration == generation else { return }
+                self.whisperProcessingTask = nil
+                self.persistCurrentAlignmentIfReady()
+                self.stop()
+                self.state.audioSyncStatus = .unavailable("whisper-server stopped unexpectedly; it restarts with the next track")
+                return
+            }
             guard let self, self.syncGeneration == generation else { return }
             self.whisperProcessingTask = nil
             guard self.activeTrackId == trackId,
@@ -842,12 +847,7 @@ final class AudioSyncManager {
                 self.recognizedWords.append(contentsOf: words)
                 self.applyAlignment(engine: .whisper)
             }
-            self.dispatchWhisperChunkIfReady(
-                trackId: trackId,
-                cliPath: cliPath,
-                modelPath: modelPath,
-                generation: generation
-            )
+            self.dispatchWhisperChunkIfReady(trackId: trackId, generation: generation)
         }
     }
 
@@ -925,59 +925,10 @@ final class AudioSyncManager {
     }
 
     struct WhisperChunkRequest: Sendable {
-        let cliPath: String
-        let modelPath: String
         let samples: [Float]
         let sampleRate: Int
         let chunkStartTime: Double
         let prompt: String
-    }
-
-    nonisolated static func runWhisperChunk(_ request: WhisperChunkRequest) -> [RecognizedAudioWord] {
-        let tempDir = FileManager.default.temporaryDirectory
-        let token = UUID().uuidString
-        let wavURL = tempDir.appendingPathComponent("bartune-sync-\(token).wav")
-        let outPrefix = tempDir.appendingPathComponent("bartune-sync-\(token)-out")
-        let jsonURL = outPrefix.appendingPathExtension("json")
-
-        defer {
-            try? FileManager.default.removeItem(at: wavURL)
-            try? FileManager.default.removeItem(at: jsonURL)
-        }
-
-        let wavData = WAVEncoder.encodeMono16BitPCM(samples: request.samples, sampleRate: request.sampleRate)
-        guard (try? wavData.write(to: wavURL)) != nil else { return [] }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: request.cliPath)
-        var args = [
-            "-m", request.modelPath,
-            "-f", wavURL.path,
-            "-ojf",
-            "-of", outPrefix.path,
-            "-l", "auto",
-            "-np",
-            "-t", "4",
-        ]
-        if !request.prompt.isEmpty {
-            args.append(contentsOf: ["--prompt", request.prompt])
-        }
-        process.arguments = args
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return []
-        }
-
-        guard process.terminationStatus == 0,
-              let data = try? Data(contentsOf: jsonURL)
-        else { return [] }
-
-        return WhisperJSONParser.parse(data: data, chunkStartTime: request.chunkStartTime)
     }
 
     /// Downloads a GGML Whisper model preset into `~/.cache/whisper/` so other tools on the Mac can reuse it.
