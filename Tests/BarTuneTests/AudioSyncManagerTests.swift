@@ -1369,6 +1369,107 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(manager.recognizedWords.map(\.text), ["hello", "world", "from", "test", "second", "line", "of", "lyrics"])
     }
 
+    private static let tenLineWords = [
+        ["amber", "river", "glows"], ["silver", "moon", "rises"], ["quiet", "forest", "sleeps"],
+        ["golden", "field", "sways"], ["distant", "thunder", "rolls"], ["crimson", "petals", "fall"],
+        ["frozen", "lake", "shines"], ["wandering", "clouds", "drift"], ["hidden", "valley", "waits"],
+        ["burning", "candle", "fades"],
+    ]
+
+    private func tenLines() -> [LyricLine] {
+        Self.tenLineWords.enumerated().map { index, words in
+            LyricLine(id: index, timestamp: 10.0 + Double(index) * 3.0, text: words.joined(separator: " "))
+        }
+    }
+
+    /// Apple Speech segments for the first `count` lines, timed from a capture that starts at track time 10.
+    private func heardSegments(lines count: Int) -> [SpeechRecognizedSegment] {
+        Self.tenLineWords.prefix(count).enumerated().flatMap { index, words in
+            words.enumerated().map { segment($0.element, Double(index) * 3.0 + 0.1 + Double($0.offset) * 0.4) }
+        }
+    }
+
+    @MainActor
+    private func startTenLineSync(cache: AudioSyncedLyricsCache) -> (AudioSyncManager, FakeSpeechRecognizer, FakeAudioCapture, LyricsState) {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        state.setTrack(sampleTrack(), lyrics: tenLines())
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: tenLines())
+        return (manager, recognizer, fakeCapture, state)
+    }
+
+    @MainActor
+    func testLiveSyncKeepsListeningUntilMostLinesAreHeard() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        recognizer.resultHandlers.first?(heardSegments(lines: 3), false, nil)
+        let threeMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 3 }
+        XCTAssertTrue(threeMatched)
+        XCTAssertTrue(manager.isLiveSyncActive, "3 of 10 lines must not end the sync")
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .appleSpeech, alignedLines: 3, totalLines: 10))
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 3, "partial progress is saved")
+
+        recognizer.resultHandlers.first?(heardSegments(lines: 6), false, nil)
+        let finished = await waitUntil { state.audioSyncStatus == .cached(.appleSpeech) }
+        XCTAssertTrue(finished, "6 of 10 lines completes the sync; status \(state.audioSyncStatus)")
+        XCTAssertFalse(manager.isLiveSyncActive)
+    }
+
+    @MainActor
+    func testPartialCacheIsShownAndRefinedButNeverDowngraded() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        var cachedLines = tenLines()
+        for index in 0..<3 {
+            cachedLines[index] = LyricLine(
+                id: index, timestamp: cachedLines[index].timestamp + 0.5, text: cachedLines[index].text
+            )
+        }
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.5,
+            alignedLineCount: 3, sourceLineCount: 10, lines: cachedLines
+        ))
+
+        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started, "a partial record keeps listening")
+        state.updatePlayback(isPlaying: true, position: 10.2)
+        XCTAssertNil(state.activeLine, "the partial record's timings are shown while listening")
+
+        recognizer.resultHandlers.first?(heardSegments(lines: 1), false, nil)
+        let oneMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 1 }
+        XCTAssertTrue(oneMatched)
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 3, "a weaker result must not replace the cache")
+
+        recognizer.resultHandlers.first?(heardSegments(lines: 4), false, nil)
+        let improved = await waitUntil { cache.load(trackId: sampleTrack().id)?.alignedLineCount == 4 }
+        XCTAssertTrue(improved)
+    }
+
+    @MainActor
+    func testCompleteCacheSkipsListening() {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.2,
+            alignedLineCount: 6, sourceLineCount: 10, lines: tenLines()
+        ))
+
+        let (manager, _, capture, state) = startTenLineSync(cache: cache)
+
+        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertEqual(capture.startCount, 0)
+    }
+
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
     @MainActor
