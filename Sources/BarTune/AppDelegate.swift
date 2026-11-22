@@ -42,7 +42,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
         }
-        spotifyMonitor.start(lowCPUMode: state.lowCPUMode, browserMusicEnabled: state.browserMusicEnabled)
+        spotifyMonitor.start(
+            lowCPUMode: state.lowCPUMode,
+            browserMusicEnabled: state.browserMusicEnabled,
+            browserYouTubeVideosEnabled: state.browserYouTubeVideosEnabled
+        )
 
         state.$lowCPUMode
             .receive(on: RunLoop.main)
@@ -55,6 +59,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] enabled in
                 self?.spotifyMonitor.setBrowserMusicEnabled(enabled)
+            }
+            .store(in: &cancellables)
+
+        state.$browserYouTubeVideosEnabled
+            .receive(on: RunLoop.main)
+            .sink { [weak self] enabled in
+                self?.spotifyMonitor.setBrowserYouTubeVideosEnabled(enabled)
             }
             .store(in: &cancellables)
 

@@ -55,4 +55,42 @@ final class SpotifyMonitorTests: XCTestCase {
             "tell application \"Spotify\" to playpause"
         )
     }
+
+    func testAcceptedBrowserSnapshotFiltersStandardYouTubeIndependentlyOfYouTubeMusic() {
+        let ytTrack = TrackInfo(
+            id: "browser:www.youtube.com:Video Title|Channel|v:abc",
+            title: "Video Title",
+            artist: "Channel",
+            album: "",
+            duration: 300,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let ytSnap = PlaybackSnapshot(isRunning: true, isPlaying: true, track: ytTrack, position: 12)
+
+        let ytMusicTrack = TrackInfo(
+            id: "browser:music.youtube.com:Night Dancer|imase|v:xyz",
+            title: "Night Dancer",
+            artist: "imase",
+            album: "Bonsai",
+            duration: 210,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let ytMusicSnap = PlaybackSnapshot(isRunning: true, isPlaying: true, track: ytMusicTrack, position: 15)
+
+        XCTAssertNil(
+            SpotifyMonitor.acceptedBrowserSnapshot(ytSnap, browserMusicEnabled: true, includeYouTubeVideos: false)
+        )
+        XCTAssertNotNil(
+            SpotifyMonitor.acceptedBrowserSnapshot(ytSnap, browserMusicEnabled: true, includeYouTubeVideos: true)
+        )
+        XCTAssertEqual(
+            SpotifyMonitor.acceptedBrowserSnapshot(ytMusicSnap, browserMusicEnabled: true, includeYouTubeVideos: false)?.track?.id,
+            ytMusicTrack.id
+        )
+        XCTAssertNil(
+            SpotifyMonitor.acceptedBrowserSnapshot(ytMusicSnap, browserMusicEnabled: false, includeYouTubeVideos: true)
+        )
+    }
 }

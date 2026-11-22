@@ -23,15 +23,25 @@ enum BrowserMediaParser {
     static let minChapterVideoDuration: Double = 600.0
     static let maxPlaybackRate: Double = 4.0
 
-    static func isSupportedMusicHost(_ host: String) -> Bool {
+    static func isStandardYouTubeHost(_ host: String) -> Bool {
+        let normalized = host.lowercased()
+        return normalized == "youtube.com" || normalized == "www.youtube.com"
+    }
+
+    static func isStandardYouTubeTrackId(_ trackId: String) -> Bool {
+        trackId.hasPrefix("browser:www.youtube.com:") || trackId.hasPrefix("browser:youtube.com:")
+    }
+
+    static func isSupportedMusicHost(_ host: String, includeYouTubeVideos: Bool = true) -> Bool {
         let normalized = host.lowercased()
         if supportedHosts.contains(where: { normalized == $0 || normalized.hasSuffix("." + $0) }) {
             return true
         }
-        return normalized == "youtube.com" || normalized == "www.youtube.com"
+        guard includeYouTubeVideos else { return false }
+        return isStandardYouTubeHost(normalized)
     }
 
-    static func isSupportedMusicURL(_ urlString: String) -> Bool {
+    static func isSupportedMusicURL(_ urlString: String, includeYouTubeVideos: Bool = true) -> Bool {
         guard let url = URL(string: urlString),
               let scheme = url.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
@@ -42,7 +52,8 @@ enum BrowserMediaParser {
         if supportedHosts.contains(where: { host == $0 || host.hasSuffix("." + $0) }) {
             return true
         }
-        if (host == "youtube.com" || host == "www.youtube.com") &&
+        guard includeYouTubeVideos else { return false }
+        if isStandardYouTubeHost(host) &&
             (url.path == "/watch" || url.path.hasPrefix("/watch/")) {
             return true
         }
@@ -250,7 +261,11 @@ enum BrowserMediaParser {
         return "\(baseId)|d:\(seconds)"
     }
 
-    static func parsePayload(_ raw: String, sourceBundleId: String? = nil) -> PlaybackSnapshot? {
+    static func parsePayload(
+        _ raw: String,
+        sourceBundleId: String? = nil,
+        includeYouTubeVideos: Bool = true
+    ) -> PlaybackSnapshot? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "IDLE" else { return nil }
 
@@ -265,7 +280,7 @@ enum BrowserMediaParser {
         let afterPrefix = trackId.dropFirst("browser:".count)
         guard let hostSeparator = afterPrefix.firstIndex(of: ":") else { return nil }
         let payloadHost = String(afterPrefix[..<hostSeparator])
-        guard isSupportedMusicHost(payloadHost) else { return nil }
+        guard isSupportedMusicHost(payloadHost, includeYouTubeVideos: includeYouTubeVideos) else { return nil }
 
         var title = cleanTitle(parts[3])
         guard !title.isEmpty else { return nil }
@@ -277,8 +292,7 @@ enum BrowserMediaParser {
         let artworkURL = parts.count >= 9 && !parts[8].isEmpty ? parts[8] : nil
         let playbackRate = parts.count >= 11 ? parsePlaybackRate(parts[10]) : 1.0
 
-        let isStandardYouTube = trackId.hasPrefix("browser:www.youtube.com:")
-            || trackId.hasPrefix("browser:youtube.com:")
+        let isStandardYouTube = isStandardYouTubeTrackId(trackId)
         let mediaId = parts.count >= 12 ? parts[11] : ""
         trackId = recordingTrackId(baseId: trackId, mediaId: mediaId, duration: durationSec)
 
@@ -343,17 +357,33 @@ final class BrowserMediaMonitor: @unchecked Sendable {
     // Compact JS evaluated in matched music tabs using the standard Web Media Session API
     // plus active <video>/<audio> currentTime and duration, and YouTube chapter markers for long videos.
     // Re-validates location protocol/hostname/pathname inside the document to prevent TOCTOU navigation races.
-    static let jsProbe: String = """
-    (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})||((h==='youtube.com'||h==='www.youtube.com')&&(location.pathname==='/watch'||location.pathname.indexOf('/watch/')===0));if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}var id='browser:'+h+':'+t+'|'+a;var rid=new URLSearchParams(location.search).get('v')||'';var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate),rid].join(s);}catch(e){return 'IDLE';}})()
-    """
+    static func jsProbeSource(includeYouTubeVideos: Bool) -> String {
+        let youtubeOriginClause = includeYouTubeVideos
+            ? "||((h==='youtube.com'||h==='www.youtube.com')&&(location.pathname==='/watch'||location.pathname.indexOf('/watch/')===0))"
+            : ""
+        let youtubeChaptersBlock = includeYouTubeVideos
+            ? "if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}"
+            : ""
+        return """
+        (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})\(youtubeOriginClause);if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';\(youtubeChaptersBlock)var id='browser:'+h+':'+t+'|'+a;var rid=new URLSearchParams(location.search).get('v')||'';var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate),rid].join(s);}catch(e){return 'IDLE';}})()
+        """
+    }
 
-    private static let escapedJS: String = jsProbe
-        .replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"")
+    static var jsProbe: String {
+        jsProbeSource(includeYouTubeVideos: true)
+    }
+
+    private static func escapeForAppleScript(_ js: String) -> String {
+        js.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
+    private static let escapedJSWithYouTube: String = escapeForAppleScript(jsProbeSource(includeYouTubeVideos: true))
+    private static let escapedJSWithoutYouTube: String = escapeForAppleScript(jsProbeSource(includeYouTubeVideos: false))
 
     // Compiled AppleScripts cached per browser bundle ID (accessed serially on SpotifyMonitor's scriptQueue).
     private var compiledListScripts: [String: NSAppleScript] = [:]
-    private var compiledProbeScripts: [String: (windowIndex: Int, tabIndex: Int, script: NSAppleScript)] = [:]
+    private var compiledProbeScripts: [String: (windowIndex: Int, tabIndex: Int, includeYouTubeVideos: Bool, script: NSAppleScript)] = [:]
 
     private let listTabsHandler: ((BrowserTarget) -> [BrowserTabDescriptor])?
     private let probeTabHandler: ((BrowserTarget, BrowserTabDescriptor) -> String?)?
@@ -366,20 +396,24 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         probeTabHandler = probeTab
     }
 
-    func poll(runningBundleIds: Set<String>) -> PlaybackSnapshot? {
+    func poll(runningBundleIds: Set<String>, includeYouTubeVideos: Bool = false) -> PlaybackSnapshot? {
         for browser in Self.browsers where runningBundleIds.contains(browser.bundleId) {
-            if let snapshot = pollBrowser(browser) {
+            if let snapshot = pollBrowser(browser, includeYouTubeVideos: includeYouTubeVideos) {
                 return snapshot
             }
         }
         return nil
     }
 
-    func pollBrowser(_ browser: BrowserTarget) -> PlaybackSnapshot? {
+    func pollBrowser(_ browser: BrowserTarget, includeYouTubeVideos: Bool = false) -> PlaybackSnapshot? {
         let tabs = listTabs(for: browser)
-        for tab in tabs where BrowserMediaParser.isSupportedMusicURL(tab.url) {
-            if let raw = probeTab(tab, in: browser),
-               let snapshot = BrowserMediaParser.parsePayload(raw, sourceBundleId: browser.bundleId) {
+        for tab in tabs where BrowserMediaParser.isSupportedMusicURL(tab.url, includeYouTubeVideos: includeYouTubeVideos) {
+            if let raw = probeTab(tab, in: browser, includeYouTubeVideos: includeYouTubeVideos),
+               let snapshot = BrowserMediaParser.parsePayload(
+                   raw,
+                   sourceBundleId: browser.bundleId,
+                   includeYouTubeVideos: includeYouTubeVideos
+               ) {
                 return snapshot
             }
         }
@@ -412,8 +446,12 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         """
     }
 
-    static func probeScriptSource(for browser: BrowserTarget, tab: BrowserTabDescriptor) -> String {
-        let escapedJS = Self.escapedJS
+    static func probeScriptSource(
+        for browser: BrowserTarget,
+        tab: BrowserTabDescriptor,
+        includeYouTubeVideos: Bool = true
+    ) -> String {
+        let escapedJS = includeYouTubeVideos ? Self.escapedJSWithYouTube : Self.escapedJSWithoutYouTube
         if browser.isSafari {
             return """
             tell application "Safari"
@@ -445,14 +483,20 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         return compiled
     }
 
-    private func probeScript(for browser: BrowserTarget, tab: BrowserTabDescriptor) -> NSAppleScript? {
+    private func probeScript(
+        for browser: BrowserTarget,
+        tab: BrowserTabDescriptor,
+        includeYouTubeVideos: Bool
+    ) -> NSAppleScript? {
         if let cached = compiledProbeScripts[browser.bundleId],
            cached.windowIndex == tab.windowIndex,
-           cached.tabIndex == tab.tabIndex {
+           cached.tabIndex == tab.tabIndex,
+           cached.includeYouTubeVideos == includeYouTubeVideos {
             return cached.script
         }
-        guard let compiled = NSAppleScript(source: Self.probeScriptSource(for: browser, tab: tab)) else { return nil }
-        compiledProbeScripts[browser.bundleId] = (tab.windowIndex, tab.tabIndex, compiled)
+        let source = Self.probeScriptSource(for: browser, tab: tab, includeYouTubeVideos: includeYouTubeVideos)
+        guard let compiled = NSAppleScript(source: source) else { return nil }
+        compiledProbeScripts[browser.bundleId] = (tab.windowIndex, tab.tabIndex, includeYouTubeVideos, compiled)
         return compiled
     }
 
@@ -467,11 +511,15 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         return BrowserMediaParser.parseTabList(raw)
     }
 
-    private func probeTab(_ tab: BrowserTabDescriptor, in browser: BrowserTarget) -> String? {
+    private func probeTab(
+        _ tab: BrowserTabDescriptor,
+        in browser: BrowserTarget,
+        includeYouTubeVideos: Bool
+    ) -> String? {
         if let probeTabHandler {
             return probeTabHandler(browser, tab)
         }
-        guard let script = probeScript(for: browser, tab: tab) else { return nil }
+        guard let script = probeScript(for: browser, tab: tab, includeYouTubeVideos: includeYouTubeVideos) else { return nil }
         var error: NSDictionary?
         let result = script.executeAndReturnError(&error)
         guard error == nil else { return nil }
