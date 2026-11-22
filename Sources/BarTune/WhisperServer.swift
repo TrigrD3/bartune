@@ -91,7 +91,11 @@ final class WhisperServer: WhisperTranscribing, @unchecked Sendable {
             if !process.isRunning { throw WhisperServerError.exited }
             return []
         }
-        return WhisperJSONParser.parse(data: data, chunkStartTime: request.chunkStartTime)
+        return WhisperJSONParser.parse(
+            data: data,
+            chunkStartTime: request.chunkStartTime,
+            playbackRate: request.playbackRate
+        )
     }
 
     func shutdown() {

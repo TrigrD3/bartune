@@ -438,8 +438,8 @@ final class AudioSyncManager {
     private var speechRecognizer: SpeechRecognizing?
     private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
     private var speechTask: SpeechRecognitionTaskHandling?
-    /// Track position at each stream time where playback (re)started; a same-track seek appends one.
-    private var speechTimelineAnchors: [(streamTime: Double, trackPosition: Double)] = []
+    /// Track position and playback rate at each stream time where playback (re)started; a same-track seek or rate change appends one.
+    private var speechTimelineAnchors: [(streamTime: Double, trackPosition: Double, playbackRate: Double)] = []
     private var speechStreamDuration: Double = 0
     private static let seekTolerance: Double = 2.0
     private var speechAudioFormat: AVAudioFormat?
@@ -447,6 +447,12 @@ final class AudioSyncManager {
     // Whisper chunk state
     private var whisperSampleBuffer: [Float] = []
     private var whisperChunkStartPos: Double?
+    private var whisperChunkPlaybackRate: Double = 1.0
+    private var whisperPendingSeekPos: Double?
+    /// Uptime of the last detected seek; deliveries captured before it hold pre-seek audio.
+    private var whisperSeekBoundary: TimeInterval = 0
+    /// Last playback state this manager saw; seeks are detected against it because `LyricsState` is updated first.
+    private var whisperLastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
     private var whisperStartupTask: Task<Void, Never>?
     private var whisperProcessingTask: Task<Void, Never>?
     private var whisperEngine: WhisperTranscribing?
@@ -477,6 +483,8 @@ final class AudioSyncManager {
         speechRequest = nil
         speechTask = nil
         speechRecognizer = nil
+        speechTimelineAnchors.removeAll(keepingCapacity: false)
+        speechStreamDuration = 0
         whisperStartupTask?.cancel()
         whisperStartupTask = nil
         whisperProcessingTask?.cancel()
@@ -485,6 +493,9 @@ final class AudioSyncManager {
         whisperEngine = nil
         whisperSampleBuffer.removeAll(keepingCapacity: false)
         whisperChunkStartPos = nil
+        whisperChunkPlaybackRate = 1.0
+        whisperPendingSeekPos = nil
+        whisperLastPlayback = nil
     }
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
@@ -569,26 +580,82 @@ final class AudioSyncManager {
         return []
     }
 
-    func handlePlaybackStateChanged(isPlaying: Bool, position: Double) {
+    func handlePlaybackStateChanged(isPlaying: Bool, position: Double, playbackRate: Double? = nil) {
+        let resolvedRate = Self.sanitizedPlaybackRate(playbackRate ?? state.playbackRate)
         if isPlaying {
-            reanchorSpeechTimelineIfSeeked(to: position)
+            reanchorSpeechTimelineIfNeeded(to: position, playbackRate: resolvedRate)
         }
+        discardWhisperChunkIfSeeked(to: position, playbackRate: resolvedRate, isPlaying: isPlaying)
         guard !isPlaying, isLiveSyncActive else { return }
         // Persist whatever alignment we gathered before pausing/stopping.
         persistCurrentAlignmentIfReady()
     }
 
-    private func reanchorSpeechTimelineIfSeeked(to position: Double) {
+    private static func sanitizedPlaybackRate(_ rate: Double) -> Double {
+        (rate.isFinite && rate > 0) ? rate : 1.0
+    }
+
+    private func reanchorSpeechTimelineIfNeeded(to position: Double, playbackRate: Double) {
         guard isLiveSyncActive, speechRequest != nil, let anchor = speechTimelineAnchors.last else { return }
-        let expected = anchor.trackPosition + (speechStreamDuration - anchor.streamTime)
-        guard abs(position - expected) > Self.seekTolerance else { return }
-        speechTimelineAnchors.append((streamTime: speechStreamDuration, trackPosition: position))
+        let expected = anchor.trackPosition + (speechStreamDuration - anchor.streamTime) * anchor.playbackRate
+        let seeked = abs(position - expected) > Self.seekTolerance
+        let rateChanged = abs(playbackRate - anchor.playbackRate) > 0.001
+        guard seeked || rateChanged else { return }
+        if anchor.streamTime == speechStreamDuration {
+            speechTimelineAnchors[speechTimelineAnchors.count - 1] = (
+                streamTime: speechStreamDuration,
+                trackPosition: position,
+                playbackRate: playbackRate
+            )
+        } else {
+            speechTimelineAnchors.append((
+                streamTime: speechStreamDuration,
+                trackPosition: position,
+                playbackRate: playbackRate
+            ))
+        }
+    }
+
+    private func discardWhisperChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
+        guard isLiveSyncActive, state.audioSyncEngine == .whisper else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let last = whisperLastPlayback
+        whisperLastPlayback = (position, now, playbackRate, isPlaying)
+        if let chunkStart = whisperChunkStartPos {
+            let bufferedDuration = whisperSampleRate > 0 ? Double(whisperSampleBuffer.count) / whisperSampleRate : 0
+            let expected = chunkStart + bufferedDuration * whisperChunkPlaybackRate
+            let seeked = abs(position - expected) > Self.seekTolerance
+            let rateChanged = abs(playbackRate - whisperChunkPlaybackRate) > 0.01
+            if seeked || rateChanged {
+                whisperSampleBuffer.removeAll(keepingCapacity: true)
+                whisperChunkStartPos = nil
+                whisperChunkPlaybackRate = playbackRate
+                whisperPendingSeekPos = position
+                whisperSeekBoundary = ProcessInfo.processInfo.systemUptime
+            }
+        } else if let last {
+            let expected = last.position + (last.isPlaying ? (now - last.uptime) * last.rate : 0)
+            let seeked = abs(position - expected) > Self.seekTolerance
+            let rateChanged = abs(playbackRate - last.rate) > 0.01
+            if seeked || rateChanged {
+                whisperPendingSeekPos = position
+                whisperChunkPlaybackRate = playbackRate
+                whisperSeekBoundary = now
+            }
+        }
+    }
+
+    private func speechAnchor(forStreamTime streamTime: Double) -> (streamTime: Double, trackPosition: Double, playbackRate: Double)? {
+        speechTimelineAnchors.last(where: { $0.streamTime <= streamTime }) ?? speechTimelineAnchors.first
+    }
+
+    private func speechPlaybackRate(forStreamTime streamTime: Double) -> Double {
+        speechAnchor(forStreamTime: streamTime)?.playbackRate ?? 1.0
     }
 
     private func trackPosition(forSpeechStreamTime streamTime: Double) -> Double {
-        guard let anchor = speechTimelineAnchors.last(where: { $0.streamTime <= streamTime }) ?? speechTimelineAnchors.first
-        else { return streamTime }
-        return anchor.trackPosition + (streamTime - anchor.streamTime)
+        guard let anchor = speechAnchor(forStreamTime: streamTime) else { return streamTime }
+        return anchor.trackPosition + (streamTime - anchor.streamTime) * anchor.playbackRate
     }
 
     func resyncCurrentTrack() {
@@ -695,9 +762,10 @@ final class AudioSyncManager {
         request.contextualStrings = Array(lines.prefix(40).map(\.text))
 
         let anchorPos = currentPlaybackPosition()
+        let initialRate = Self.sanitizedPlaybackRate(state.playbackRate)
         speechRecognizer = recognizer
         speechRequest = request
-        speechTimelineAnchors = [(streamTime: 0, trackPosition: anchorPos)]
+        speechTimelineAnchors = [(streamTime: 0, trackPosition: anchorPos, playbackRate: initialRate)]
         speechStreamDuration = 0
         speechAudioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
 
@@ -712,10 +780,11 @@ final class AudioSyncManager {
                 else { return }
                 if let segments {
                     let words: [RecognizedAudioWord] = segments.map { seg in
-                        RecognizedAudioWord(
+                        let rate = self.speechPlaybackRate(forStreamTime: seg.timestamp)
+                        return RecognizedAudioWord(
                             text: seg.substring,
                             startTime: self.trackPosition(forSpeechStreamTime: seg.timestamp),
-                            duration: max(0.05, seg.duration),
+                            duration: max(0.05, seg.duration * rate),
                             confidence: Double(seg.confidence)
                         )
                     }
@@ -804,6 +873,8 @@ final class AudioSyncManager {
         let launchWhisper = dependencies.launchWhisper
         whisperSampleBuffer.removeAll(keepingCapacity: true)
         whisperChunkStartPos = nil
+        whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
+        whisperPendingSeekPos = nil
         state.audioSyncStatus = .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count)
 
         whisperStartupTask = Task { [weak self] in
@@ -842,16 +913,25 @@ final class AudioSyncManager {
 
     private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
         capture.onAudioSamples = { [weak self] samples, sampleRate in
+            let capturedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self,
                       self.syncGeneration == generation,
                       self.isLiveSyncActive,
                       self.activeTrackId == track.id,
-                      self.state.audioSyncEngine == .whisper
+                      self.state.audioSyncEngine == .whisper,
+                      capturedAt > self.whisperSeekBoundary
                 else { return }
                 self.whisperSampleRate = sampleRate
                 if self.whisperChunkStartPos == nil {
-                    self.whisperChunkStartPos = self.currentPlaybackPosition()
+                    let livePos = self.currentPlaybackPosition()
+                    if let pending = self.whisperPendingSeekPos {
+                        self.whisperPendingSeekPos = nil
+                        self.whisperChunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
+                    } else {
+                        self.whisperChunkStartPos = livePos
+                    }
+                    self.whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
                 }
                 self.whisperSampleBuffer.append(contentsOf: samples)
 
@@ -861,7 +941,7 @@ final class AudioSyncManager {
                     let overflow = self.whisperSampleBuffer.count - maxFrames
                     self.whisperSampleBuffer.removeFirst(overflow)
                     if let startPos = self.whisperChunkStartPos, sampleRate > 0 {
-                        self.whisperChunkStartPos = startPos + Double(overflow) / sampleRate
+                        self.whisperChunkStartPos = startPos + (Double(overflow) / sampleRate) * self.whisperChunkPlaybackRate
                     }
                 }
 
@@ -870,6 +950,12 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
+        whisperLastPlayback = (
+            currentPlaybackPosition(),
+            ProcessInfo.processInfo.systemUptime,
+            Self.sanitizedPlaybackRate(state.playbackRate),
+            state.isPlaying
+        )
         let targetBundles = Self.targetBundleIdentifiers(for: track)
         Task { [weak self] in
             guard let self,
@@ -905,13 +991,14 @@ final class AudioSyncManager {
         if whisperSampleBuffer.isEmpty {
             whisperChunkStartPos = nil
         } else if sampleRate > 0 {
-            whisperChunkStartPos = chunkStart + Double(targetFrames) / sampleRate
+            whisperChunkStartPos = chunkStart + (Double(targetFrames) / sampleRate) * whisperChunkPlaybackRate
         }
 
         let request = WhisperChunkRequest(
             samples: chunk,
             sampleRate: Int(sampleRate),
             chunkStartTime: chunkStart,
+            playbackRate: whisperChunkPlaybackRate,
             prompt: promptSnippet(around: chunkStart)
         )
         whisperProcessingTask = Task { [weak self] in
@@ -1017,6 +1104,8 @@ final class AudioSyncManager {
         let samples: [Float]
         let sampleRate: Int
         let chunkStartTime: Double
+        /// Media seconds per recorded second, used to map in-chunk word offsets to track time.
+        let playbackRate: Double
         let prompt: String
     }
 

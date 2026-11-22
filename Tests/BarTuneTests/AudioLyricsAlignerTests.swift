@@ -107,6 +107,33 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(words[1].duration, 0.6, accuracy: 0.001)
     }
 
+    func testWhisperJSONParserScalesInChunkOffsetsByPlaybackRate() throws {
+        let json = """
+        {
+          "segments": [
+            {
+              "start": 0.0,
+              "end": 2.0,
+              "text": " Hello",
+              "words": [
+                { "word": " Hello", "start": 1.0, "end": 1.5, "probability": 0.9 }
+              ]
+            },
+            { "start": 3.0, "end": 4.0, "text": " plain words" }
+          ]
+        }
+        """
+        let data = try XCTUnwrap(json.data(using: .utf8))
+        let words = WhisperJSONParser.parse(data: data, chunkStartTime: 20.0, playbackRate: 2.0)
+        XCTAssertEqual(words.map(\.text), ["Hello", "plain", "words"])
+        guard words.count == 3 else { return }
+        XCTAssertEqual(words[0].startTime, 22.0, accuracy: 0.001)
+        XCTAssertEqual(words[0].duration, 1.0, accuracy: 0.001)
+        XCTAssertEqual(words[1].startTime, 26.0, accuracy: 0.001)
+        XCTAssertEqual(words[1].duration, 1.0, accuracy: 0.001)
+        XCTAssertEqual(words[2].startTime, 27.0, accuracy: 0.001)
+    }
+
     func testAudioSyncedLyricsCacheRoundTripAndClear() {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let lines = [
