@@ -25,6 +25,7 @@ Casks/
   bartune.rb               # Homebrew Cask template synced to TrigrD3/homebrew-tap on v* tags
 scripts/
   lint.sh                  # Runs SwiftFormat (--lint) and SwiftLint (--strict)
+  export-coverage.sh       # CI LCOV export; fails when the test binary, profdata, or report is missing
   hooks/commit-msg         # Local Conventional Commits git hook
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
 .github/
@@ -38,6 +39,7 @@ build.sh                   # Release .app packager (--install for /Applications,
   workflows/dependabot-auto-merge.yml # Enables auto-merge for Dependabot patch/minor PRs
   workflows/issue-severity-labeler.yml # Auto-labels issue severity from template dropdown or keyword fallback
   scripts/classify-issue-severity.mjs # Pure issue severity classifier (tested with node --test)
+  scripts/ci-workflows.test.mjs # Workflow permission & coverage-export checks (node --test, not run in CI)
 .codecov.yml               # Soft-gated Codecov coverage reporting config
 ```
 
