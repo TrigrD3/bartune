@@ -2,6 +2,8 @@ name: Build & Release DMG
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   pull_request:
@@ -15,9 +17,10 @@ on:
         default: false
         type: boolean
 
+# Only PR runs are canceled: a canceled publish could leave a release without its Homebrew update.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -39,21 +42,66 @@ jobs:
           predicate-quantifier: every
           filters: .github/filters.yml
 
+  # Builds untrusted PR code too, so it never gets write access; publishing happens in the jobs below.
   build:
     needs: changes
     if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: macos-26
     timeout-minutes: 25
-    permissions:
-      contents: write
+    outputs:
+      channel: ${{ steps.channel.outputs.channel }}
+      tag: ${{ steps.channel.outputs.tag }}
+      version: ${{ steps.built.outputs.version }}
+      sha256: ${{ steps.built.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v7
         with:
+          # Full history: build.sh stamps the commit count as the build number.
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Pick release channel
+        id: channel
+        env:
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          BASE="$(tr -d '[:space:]' < VERSION)"
+          if [[ ! "$BASE" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::VERSION must be X.Y.Z, got '$BASE'"
+            exit 1
+          fi
+          CHANNEL="none"
+          TAG=""
+          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
+            TAG="$GITHUB_REF_NAME"
+            if [[ "$TAG" != "v$BASE" ]]; then
+              echo "::error::Tag $TAG does not match VERSION $BASE."
+              exit 1
+            fi
+            CHANNEL="stable"
+          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$PUBLISH_INPUT" == "true" ]]; then
+            TAG="v$BASE"
+            if git rev-parse -q --verify "refs/tags/$TAG" >/dev/null; then
+              TAG_COMMIT="$(git rev-list -n 1 "refs/tags/$TAG")"
+              if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
+                echo "::error::Tag $TAG already exists at $TAG_COMMIT (current commit is $GITHUB_SHA). Bump VERSION before publishing."
+                exit 1
+              fi
+            fi
+            CHANNEL="stable"
+          elif [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == "refs/heads/main" ]]; then
+            CHANNEL="main"
+          fi
+          # Builds from main own the PATCH numbers (v0.4.0 + 15 commits = 0.4.15).
+          if [[ "$CHANNEL" == "stable" && "${BASE##*.}" != "0" ]]; then
+            echo "::error::Stable releases bump MINOR or MAJOR (X.Y.0), got $BASE."
+            exit 1
+          fi
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
       - name: Cache SwiftPM build
-        if: ${{ !(github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) && !(github.event_name == 'workflow_dispatch' && inputs.publish == true) }}
+        if: steps.channel.outputs.channel != 'stable'
         uses: actions/cache@v6
         with:
           path: .build
@@ -61,75 +109,66 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-spm-release-
 
-      - name: Get version
-        id: version
-        env:
-          PUBLISH_INPUT: ${{ inputs.publish }}
-        run: |
-          if [[ "$GITHUB_EVENT_NAME" == "push" && "$GITHUB_REF" == refs/tags/v* ]]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          elif [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" && "$PUBLISH_INPUT" == "true" ]]; then
-            VER="$(tr -d '[:space:]' < VERSION)"
-            TAG="v${VER}"
-            if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-              TAG_COMMIT="$(git rev-list -n 1 "refs/tags/${TAG}")"
-              if [[ "$TAG_COMMIT" != "$GITHUB_SHA" ]]; then
-                echo "::error::Tag ${TAG} already exists at ${TAG_COMMIT} (current commit is ${GITHUB_SHA}). Bump VERSION before publishing."
-                exit 1
-              fi
-            fi
-            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-            echo "version=${VER}" >> "$GITHUB_OUTPUT"
-            echo "is_release=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
-            echo "is_release=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build .app and DMG
         env:
-          BARTUNE_RELEASE: ${{ steps.version.outputs.is_release == 'true' && '1' || '' }}
+          BARTUNE_RELEASE: ${{ steps.channel.outputs.channel == 'stable' && '1' || '' }}
         run: |
           chmod +x build.sh
           ./build.sh --dmg
 
       - name: Read built version and DMG SHA256
-        id: sha
+        id: built
         run: |
           BUILT="$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' BarTune.app/Contents/Info.plist)"
+          if [[ ! "$BUILT" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::Unexpected built version '$BUILT'"
+            exit 1
+          fi
           echo "version=$BUILT" >> "$GITHUB_OUTPUT"
-          SHA="$(awk '{print $1}' "dist/BarTune-${BUILT}.dmg.sha256")"
-          echo "sha256=$SHA" >> "$GITHUB_OUTPUT"
+          echo "sha256=$(awk '{print $1}' "dist/BarTune-$BUILT.dmg.sha256")" >> "$GITHUB_OUTPUT"
 
       - name: Upload DMG artifact
         uses: actions/upload-artifact@v7
         with:
-          name: BarTune-${{ steps.sha.outputs.version }}.dmg
+          name: BarTune-${{ steps.built.outputs.version }}.dmg
           path: |
-            dist/BarTune-${{ steps.sha.outputs.version }}.dmg
-            dist/BarTune-${{ steps.sha.outputs.version }}.dmg.sha256
+            dist/BarTune-${{ steps.built.outputs.version }}.dmg
+            dist/BarTune-${{ steps.built.outputs.version }}.dmg.sha256
+
+  publish-stable:
+    needs: build
+    if: needs.build.outputs.channel == 'stable'
+    runs-on: macos-26
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: BarTune-${{ needs.build.outputs.version }}.dmg
+          path: dist
 
       - name: Create GitHub Release
-        if: steps.version.outputs.is_release == 'true'
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
+          tag_name: ${{ needs.build.outputs.tag }}
           target_commitish: ${{ github.sha }}
-          name: BarTune ${{ steps.version.outputs.tag }}
+          name: BarTune ${{ needs.build.outputs.tag }}
           generate_release_notes: true
           files: |
-            dist/BarTune-${{ steps.version.outputs.version }}.dmg
-            dist/BarTune-${{ steps.version.outputs.version }}.dmg.sha256
+            dist/BarTune-${{ needs.build.outputs.version }}.dmg
+            dist/BarTune-${{ needs.build.outputs.version }}.dmg.sha256
 
       - name: Update Homebrew tap (TrigrD3/homebrew-tap)
-        if: steps.version.outputs.is_release == 'true' && env.TAP_TOKEN != ''
+        if: env.TAP_TOKEN != ''
         env:
           TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-          SHA256: ${{ steps.sha.outputs.sha256 }}
+          VERSION: ${{ needs.build.outputs.version }}
+          SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
           git clone "https://x-access-token:${TAP_TOKEN}@github.com/TrigrD3/homebrew-tap.git" /tmp/homebrew-tap
           mkdir -p /tmp/homebrew-tap/Casks
@@ -144,3 +183,63 @@ jobs:
             git commit -m "chore(cask): update bartune to ${VERSION}"
             git push origin main
           fi
+
+  # Rolling "Latest (main)" pre-release for the updater's Latest from main channel; never touches Homebrew.
+  publish-main:
+    needs: build
+    if: needs.build.outputs.channel == 'main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: BarTune-${{ needs.build.outputs.version }}.dmg
+          path: dist
+
+      - name: Update the Latest (main) pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          DMG="BarTune-$VERSION.dmg"
+          NOTES="Built from main at $GITHUB_SHA ($VERSION). Not a stable release: choose **Latest from main** in Settings → About to receive these builds."
+
+          # A rerun of an older run must not replace a newer build.
+          CURRENT="$(gh api "repos/$REPO/git/refs/tags/dev" --jq .object.sha 2>/dev/null || true)"
+          if [[ -n "$CURRENT" && "$CURRENT" != "$GITHUB_SHA" ]]; then
+            STATUS="$(gh api "repos/$REPO/compare/$CURRENT...$GITHUB_SHA" --jq .status)"
+            if [[ "$STATUS" != "ahead" ]]; then
+              echo "::notice::dev is at $CURRENT and this run ($GITHUB_SHA) is $STATUS of it; not publishing."
+              exit 0
+            fi
+          fi
+
+          if [[ -n "$CURRENT" ]]; then
+            gh api -X PATCH "repos/$REPO/git/refs/tags/dev" -f sha="$GITHUB_SHA" -F force=true >/dev/null
+          else
+            gh api -X POST "repos/$REPO/git/refs" -f ref=refs/tags/dev -f sha="$GITHUB_SHA" >/dev/null
+          fi
+
+          if gh release view dev --repo "$REPO" >/dev/null 2>&1; then
+            gh release edit dev --repo "$REPO" --title "Latest (main)" --notes "$NOTES" --prerelease --latest=false
+          else
+            gh release create dev --repo "$REPO" --verify-tag --title "Latest (main)" --notes "$NOTES" --prerelease --latest=false
+          fi
+
+          # Upload first so the release always carries a DMG, then drop older builds. A rerun of the
+          # current build keeps its assets: --clobber would delete them before the replacement uploads.
+          ASSETS="$(gh release view dev --repo "$REPO" --json assets --jq '.assets[].name')"
+          if [[ "$CURRENT" == "$GITHUB_SHA" ]] && grep -qxF "$DMG" <<< "$ASSETS" && grep -qxF "$DMG.sha256" <<< "$ASSETS"; then
+            echo "::notice::$DMG is already published for $GITHUB_SHA."
+          else
+            gh release upload dev --repo "$REPO" --clobber "dist/$DMG" "dist/$DMG.sha256"
+          fi
+          gh release view dev --repo "$REPO" --json assets --jq '.assets[].name' | while read -r NAME; do
+            if [[ "$NAME" != "$DMG" && "$NAME" != "$DMG.sha256" ]]; then
+              gh release delete-asset dev "$NAME" --repo "$REPO" --yes
+            fi
+          done
