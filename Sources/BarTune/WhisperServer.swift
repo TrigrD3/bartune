@@ -77,6 +77,9 @@ final class WhisperServer: WhisperTranscribing, @unchecked Sendable {
         if !request.prompt.isEmpty {
             fields["prompt"] = request.prompt
         }
+        if let language = request.language, !language.isEmpty {
+            fields["language"] = language
+        }
         let boundary = "BarTune-\(UUID().uuidString)"
         var urlRequest = URLRequest(url: baseURL.appendingPathComponent("inference"))
         urlRequest.httpMethod = "POST"

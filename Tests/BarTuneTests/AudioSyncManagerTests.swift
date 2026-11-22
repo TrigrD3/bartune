@@ -621,6 +621,42 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testWhisperChunksCarryTheLyricLanguage() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let languages = LockedBox<[String?]>([])
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            runWhisperChunk: { request in
+                languages.withLock { $0.append(request.language) }
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "君の名前を呼んでいる"),
+            LyricLine(id: 1, timestamp: 14, text: "夜が明けるまで歌おう"),
+        ]
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: lines)
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let sent = await waitUntil { !languages.withLock { $0 }.isEmpty }
+
+        XCTAssertTrue(sent)
+        XCTAssertEqual(languages.withLock { $0 }.first, "ja")
+        XCTAssertEqual(manager.diagnostics.snapshot?.localeIdentifier, "ja")
+    }
+
+    @MainActor
     func testWhisperSampleBufferIsBoundedAndDispatchesCappedChunks() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .whisper
