@@ -664,7 +664,10 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                Picker("Cache Limit", selection: $state.lyricsCacheLimit) {
+                Picker("Cache Limit", selection: Binding(
+                    get: { state.lyricsCacheLimit },
+                    set: { limit in Task { await state.requestCacheLimit(limit) } }
+                )) {
                     ForEach(LyricsCacheLimit.allCases) { option in
                         Text(option.title).tag(option)
                     }
@@ -796,6 +799,29 @@ struct SettingsView: View {
                 "This will permanently delete \(cachedSongCount) cached "
                     + "\(cachedSongCount == 1 ? "song" : "songs") and \(syncedSongCount) audio-synced "
                     + "\(syncedSongCount == 1 ? "track" : "tracks") from disk."
+            )
+        }
+        .alert(
+            "Lower Cache Limit?",
+            isPresented: Binding(
+                get: { state.pendingCacheLimit != nil },
+                set: { if !$0 { state.cancelCacheLimitChange() } }
+            ),
+            presenting: state.pendingCacheLimit
+        ) { change in
+            Button("Remove \(change.removalCount) \(change.removalCount == 1 ? "Song" : "Songs")", role: .destructive) {
+                Task {
+                    await state.confirmCacheLimitChange(change)
+                    refreshCacheStats()
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                state.cancelCacheLimitChange()
+            }
+        } message: { change in
+            Text(
+                "Lowering the limit to \(change.limit.title) will permanently delete the \(change.removalCount) "
+                    + "oldest cached \(change.removalCount == 1 ? "song" : "songs") from disk."
             )
         }
         .alert(

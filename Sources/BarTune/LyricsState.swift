@@ -254,6 +254,12 @@ enum LyricsCacheLimit: Int, CaseIterable, Identifiable {
     }
 }
 
+/// A lower cache limit waiting for the user to confirm the songs it would delete.
+struct CacheLimitChange: Equatable {
+    let limit: LyricsCacheLimit
+    let removalCount: Int
+}
+
 @MainActor
 final class LyricsState: ObservableObject {
     private enum Keys {
@@ -467,12 +473,47 @@ final class LyricsState: ObservableObject {
     }
 
     @Published var lyricsCacheLimit: LyricsCacheLimit {
-        didSet {
-            userDefaults.set(lyricsCacheLimit.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
-            if lyricsCacheLimit.rawValue > 0 {
-                LyricsDiskCache.default.prune(to: lyricsCacheLimit.rawValue)
+        didSet { userDefaults.set(lyricsCacheLimit.rawValue, forKey: LyricsDiskCache.limitDefaultsKey) }
+    }
+
+    @Published private(set) var pendingCacheLimit: CacheLimitChange?
+    private var cacheLimitRequestID = 0
+
+    /// Applies a limit that deletes nothing; a limit below the cached song count waits in `pendingCacheLimit`.
+    func requestCacheLimit(_ limit: LyricsCacheLimit, cache: LyricsDiskCache = .default) async {
+        // The latest selection wins over an earlier one still scanning the cache.
+        cacheLimitRequestID += 1
+        let requestID = cacheLimitRequestID
+        pendingCacheLimit = nil
+        guard limit != lyricsCacheLimit else { return }
+        if limit != .unlimited {
+            let count = await Task.detached(priority: .utility) { cache.stats().count }.value
+            guard requestID == cacheLimitRequestID else { return }
+            if count > limit.rawValue {
+                pendingCacheLimit = CacheLimitChange(limit: limit, removalCount: count - limit.rawValue)
+                return
             }
         }
+        lyricsCacheLimit = limit
+    }
+
+    func cancelCacheLimitChange() {
+        pendingCacheLimit = nil
+    }
+
+    func confirmCacheLimitChange(_ change: CacheLimitChange, cache: LyricsDiskCache = .default) async {
+        pendingCacheLimit = nil
+        let requestID = cacheLimitRequestID
+        // A song saved while the alert was open changes how many the prune removes, so ask again.
+        let count = await Task.detached(priority: .utility) { cache.stats().count }.value
+        guard requestID == cacheLimitRequestID else { return }
+        let removalCount = count - change.limit.rawValue
+        if removalCount > 0, removalCount != change.removalCount {
+            pendingCacheLimit = CacheLimitChange(limit: change.limit, removalCount: removalCount)
+            return
+        }
+        lyricsCacheLimit = change.limit
+        await Task.detached(priority: .utility) { cache.prune(to: change.limit.rawValue) }.value
     }
 
     @Published var launchAtLogin: Bool = false {
