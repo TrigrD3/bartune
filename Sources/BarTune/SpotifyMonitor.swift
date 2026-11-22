@@ -91,6 +91,7 @@ final class SpotifyMonitor {
     private var needsFollowUpPoll: Bool = false
     private var lastNativeTrackId: String?
     private var lastTrackWasBrowser: Bool = false
+    private var lastBrowserTrackId: String?
     private var consecutiveIdlePolls: Int = 0
     private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
 
@@ -193,10 +194,21 @@ final class SpotifyMonitor {
         }
     }
 
-    func sendCommand(_ command: PlaybackCommand) {
+    func sendCommand(_ command: PlaybackCommand, expectedTrackId: String? = nil) {
         let runningBundleIds = dependencies.runningBundleIds()
         let activeTrackId = lastSnapshot?.track?.id ?? ""
-        let routeToBrowser = activeTrackId.hasPrefix("browser:") || (activeTrackId.isEmpty && lastTrackWasBrowser)
+        let routeToBrowser: Bool
+        if let expectedTrackId {
+            if expectedTrackId.hasPrefix("browser:") {
+                let matchesBrowser = activeTrackId == expectedTrackId
+                    || (activeTrackId.isEmpty && lastBrowserTrackId == expectedTrackId)
+                routeToBrowser = matchesBrowser
+            } else {
+                routeToBrowser = false
+            }
+        } else {
+            routeToBrowser = activeTrackId.hasPrefix("browser:") || (activeTrackId.isEmpty && lastTrackWasBrowser)
+        }
 
         let scriptSource = routeToBrowser
             ? nil
@@ -204,7 +216,8 @@ final class SpotifyMonitor {
                 for: command,
                 activeTrackId: activeTrackId,
                 lastNativeTrackId: lastNativeTrackId,
-                runningBundleIds: runningBundleIds
+                runningBundleIds: runningBundleIds,
+                expectedTrackId: expectedTrackId
             )
         let executeTransportScript = dependencies.executeTransportScript
         let executeBrowserCommand = dependencies.executeBrowserCommand
@@ -222,14 +235,18 @@ final class SpotifyMonitor {
         }
     }
 
+    private nonisolated static func escapeAppleScriptString(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
+
     nonisolated static func transportScriptSource(
         for command: PlaybackCommand,
         activeTrackId: String,
         lastNativeTrackId: String? = nil,
-        runningBundleIds: Set<String>
+        runningBundleIds: Set<String>,
+        expectedTrackId: String? = nil
     ) -> String? {
-        // Browser tabs can't be controlled yet; never fall back to a native player that isn't displayed.
-        guard !activeTrackId.hasPrefix("browser:") else { return nil }
         let verb: String
         switch command {
         case .playPause: verb = "playpause"
@@ -240,6 +257,35 @@ final class SpotifyMonitor {
             let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), clamped)
             verb = "set player position to \(formatted)"
         }
+
+        if let expectedTrackId {
+            guard !expectedTrackId.hasPrefix("browser:") else { return nil }
+            if !activeTrackId.isEmpty, activeTrackId != expectedTrackId {
+                return nil
+            }
+            if expectedTrackId.hasPrefix("music:") {
+                guard runningBundleIds.contains("com.apple.Music") else { return nil }
+                let persistentId = escapeAppleScriptString(String(expectedTrackId.dropFirst("music:".count)))
+                return """
+                tell application "Music"
+                    if (persistent ID of current track as string) is "\(persistentId)" then \(verb)
+                end tell
+                """
+            }
+            if expectedTrackId.hasPrefix("spotify:") {
+                guard runningBundleIds.contains("com.spotify.client") else { return nil }
+                let spotifyId = escapeAppleScriptString(expectedTrackId)
+                return """
+                tell application "Spotify"
+                    if (id of current track as string) is "\(spotifyId)" then \(verb)
+                end tell
+                """
+            }
+            return nil
+        }
+
+        // Browser tabs can't be controlled via native players; never fall back to a native player that isn't displayed.
+        guard !activeTrackId.hasPrefix("browser:") else { return nil }
         if activeTrackId.hasPrefix("music:"), runningBundleIds.contains("com.apple.Music") {
             return "tell application \"Music\" to \(verb)"
         }
@@ -451,6 +497,7 @@ final class SpotifyMonitor {
                 : nil
             if let validBrowserSnap {
                 lastTrackWasBrowser = true
+                lastBrowserTrackId = validBrowserSnap.track?.id
                 lastSnapshot = validBrowserSnap
                 lastPollDate = browserNow
                 if isStarted {
