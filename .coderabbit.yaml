@@ -12,7 +12,8 @@ reviews:
   auto_review:
     enabled: true
     drafts: false
-    auto_pause_after_reviewed_commits: 2
+    # 0 disables the pause threshold; drafts are still skipped (drafts: false).
+    auto_pause_after_reviewed_commits: 0
     base_branches:
       - main
   path_instructions:
