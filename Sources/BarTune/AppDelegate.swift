@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let lyricsFetcher = LyricsFetcher()
     private let lyricsTranslator = LyricsTranslator()
     private let colorExtractor = AlbumArtColorExtractor()
+    private let appUpdater = AppUpdaterModel()
     private lazy var audioSyncManager = AudioSyncManager(state: state)
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
@@ -34,7 +35,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayController = OverlayWindowController(state: state)
         settingsController = SettingsWindowController(
             state: state,
-            cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator)
+            cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator),
+            appUpdater: appUpdater
         )
 
         spotifyMonitor.onUpdate = { [weak self] snapshot in

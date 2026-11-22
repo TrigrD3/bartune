@@ -13,6 +13,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case visualizer
     case lyricsSync
     case cache
+    case about
 
     var id: String { rawValue }
 
@@ -23,6 +24,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
         case .visualizer: return "Visualizer"
         case .lyricsSync: return "Lyrics & Sync"
         case .cache: return "Offline Cache"
+        case .about: return "About"
         }
     }
 
@@ -33,6 +35,7 @@ private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
         case .visualizer: return "waveform"
         case .lyricsSync: return "music.note.list"
         case .cache: return "internaldrive"
+        case .about: return "info.circle"
         }
     }
 }
@@ -87,6 +90,7 @@ final class OfflineCacheStatsModel: ObservableObject {
 struct SettingsView: View {
     @ObservedObject var state: LyricsState
     let cacheRemover: OfflineCacheRemover
+    @ObservedObject var updater: AppUpdaterModel
     @State private var selectedTab: SettingsTab = .general
     @StateObject private var cacheStats = OfflineCacheStatsModel()
     @State private var cacheSearchQuery: String = ""
@@ -104,11 +108,37 @@ struct SettingsView: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            List(SettingsTab.allCases, selection: $selectedTab) { tab in
-                Label(tab.title, systemImage: tab.systemImage)
-                    .tag(tab)
+            VStack(spacing: 0) {
+                List(SettingsTab.allCases, selection: $selectedTab) { tab in
+                    Label(tab.title, systemImage: tab.systemImage)
+                        .tag(tab)
+                }
+                .listStyle(.sidebar)
+
+                Divider()
+
+                Button {
+                    selectedTab = .about
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(updater.currentVersion.sidebarLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        if updater.hasAvailableUpdate {
+                            Circle()
+                                .fill(Color.accentColor)
+                                .frame(width: 7, height: 7)
+                                .help("Update available")
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
             }
-            .listStyle(.sidebar)
             .frame(width: 168)
 
             Divider()
@@ -125,6 +155,8 @@ struct SettingsView: View {
                     lyricsSyncTab
                 case .cache:
                     cacheTab
+                case .about:
+                    aboutTab
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -777,6 +809,175 @@ struct SettingsView: View {
         }
     }
 
+    private var aboutTab: some View {
+        Form {
+            Section {
+                HStack(spacing: 12) {
+                    if let icon = NSApp?.applicationIconImage {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 44, height: 44)
+                    } else {
+                        Image(systemName: "music.note")
+                            .font(.title)
+                            .frame(width: 44, height: 44)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("BarTune")
+                            .font(.headline)
+                        Text(updater.currentVersion.displayVersion)
+                            .font(.subheadline.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                        Text("Real-time karaoke lyrics in your macOS menu bar.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+
+            Section("Software Update") {
+                HStack {
+                    Text("Installed Version")
+                    Spacer()
+                    Text(updater.currentVersion.displayVersion)
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+
+                if let release = updater.latestRelease {
+                    let sizeLabel = release.dmgAsset.map {
+                        " (\(ByteCountFormatter.string(fromByteCount: $0.sizeBytes, countStyle: .file)))"
+                    } ?? ""
+                    HStack {
+                        Text("Latest Release")
+                        Spacer()
+                        Text("\(release.version.tagFormatted)\(sizeLabel)")
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                updateStatusView
+
+                HStack(spacing: 8) {
+                    Button("Check for Updates") {
+                        updater.checkForUpdates()
+                    }
+                    .disabled(updater.isBusy)
+
+                    Spacer()
+
+                    updateActionButtons
+                }
+            }
+
+            Section("Links") {
+                HStack {
+                    Text("GitHub")
+                    Spacer()
+                    Button("Repository") {
+                        if let url = URL(string: AppUpdateService.repositoryURLString) {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                    Button("Releases Page") {
+                        let url = updater.latestRelease?.htmlURL ?? URL(string: AppUpdateService.releasesPageURLString)
+                        if let url {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    @ViewBuilder
+    private var updateStatusView: some View {
+        switch updater.state {
+        case .idle:
+            Text("Check GitHub Releases for the latest BarTune version.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .checking:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Checking for updates…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case let .upToDate(release):
+            Label("You're up to date (\(release.version.tagFormatted)).", systemImage: "checkmark.circle.fill")
+                .font(.caption)
+                .foregroundStyle(.green)
+        case let .updateAvailable(release, isDevBuild):
+            Label(
+                isDevBuild
+                    ? "Latest release \(release.version.tagFormatted) is available to download."
+                    : "Update available: \(release.version.tagFormatted)",
+                systemImage: "arrow.down.circle.fill"
+            )
+            .font(.caption.weight(.medium))
+            .foregroundStyle(Color.accentColor)
+        case let .downloading(release):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Downloading \(release.dmgAsset?.name ?? release.version.tagFormatted)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        case let .downloaded(_, fileURL):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Downloaded & verified: \(fileURL.lastPathComponent)", systemImage: "checkmark.circle.fill")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.green)
+
+                Text(
+                    "Saved to \(fileURL.deletingLastPathComponent().lastPathComponent). "
+                        + "Open the disk image and drag BarTune to Applications."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+        case let .failed(message, _):
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder
+    private var updateActionButtons: some View {
+        switch updater.state {
+        case let .updateAvailable(release, _), let .failed(_, release?):
+            if release.dmgAsset != nil {
+                Button("Download Update") {
+                    updater.downloadLatestUpdate()
+                }
+            } else {
+                Button("Open Release") {
+                    NSWorkspace.shared.open(release.htmlURL)
+                }
+            }
+        case let .downloaded(_, fileURL):
+            Button("Reveal in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+            }
+            Button("Open DMG") {
+                NSWorkspace.shared.open(fileURL)
+            }
+        case .idle, .checking, .upToDate, .downloading, .failed(_, nil):
+            EmptyView()
+        }
+    }
+
     private var cachedSongCount: Int { cacheStats.snapshot.cachedSongCount }
     private var cachedBytes: Int64 { cacheStats.snapshot.cachedBytes }
     private var syncedSongCount: Int { cacheStats.snapshot.syncedSongCount }
@@ -1260,11 +1461,13 @@ private struct VisualizerPreviewStrip: View {
 final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let state: LyricsState
     private let cacheRemover: OfflineCacheRemover
+    private let appUpdater: AppUpdaterModel
     private var window: NSWindow?
 
-    init(state: LyricsState, cacheRemover: OfflineCacheRemover) {
+    init(state: LyricsState, cacheRemover: OfflineCacheRemover, appUpdater: AppUpdaterModel) {
         self.state = state
         self.cacheRemover = cacheRemover
+        self.appUpdater = appUpdater
         super.init()
     }
 
@@ -1275,7 +1478,9 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             return
         }
 
-        let hosting = NSHostingController(rootView: SettingsView(state: state, cacheRemover: cacheRemover))
+        let hosting = NSHostingController(
+            rootView: SettingsView(state: state, cacheRemover: cacheRemover, updater: appUpdater)
+        )
         let win = NSWindow(contentViewController: hosting)
         win.title = "BarTune Settings"
         win.styleMask = [.titled, .closable]
