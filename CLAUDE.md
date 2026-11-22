@@ -15,6 +15,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   BrowserMediaMonitor.swift # Browser tab music monitor (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web)
   LyricsFetcher.swift      # NetEase YRC & LRCLIB lyrics fetching and caching
   WhisperServer.swift      # One local whisper-server per Whisper sync session (model loaded once)
+  LyricsForcedAligner.swift # Lyrics Alignment engine: CTC Viterbi of romanized lyrics over a Core ML acoustic model (Neural Engine)
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
   AlbumArtColorExtractor.swift # Dominant/accent color extraction from album artwork
@@ -27,6 +28,7 @@ Casks/
   bartune.rb               # Homebrew Cask template synced to TrigrD3/homebrew-tap on v* tags
 scripts/
   lint.sh                  # Runs SwiftFormat (--lint) and SwiftLint (--strict)
+  convert-lyrics-aligner.py # Builds LyricsAligner.mlpackage (MMS forced-aligner → Core ML, 8-bit) for the Lyrics Alignment engine
   export-coverage.sh       # CI LCOV export; fails when the test binary, profdata, or report is missing
   hooks/commit-msg         # Local Conventional Commits git hook
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
