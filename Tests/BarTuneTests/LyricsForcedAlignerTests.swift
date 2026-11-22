@@ -131,6 +131,36 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(words.last?.startTime ?? 0, 20.08, accuracy: 0.01)
     }
 
+    func testEngineAlignsOnlyMissingLinesInsideTheGapTheirAlignedNeighboursLeave() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [12.0, 14.0, 16.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
+        // Lines 0 and 2 were aligned on an earlier play: sung 12.16-12.8 s and 16.24-17.0 s.
+        let aligner = LyricsForcedAligner(
+            lines: lines, model: model, anchors: [0: 12.16...12.8, 2: 16.24...17.0], lineWindow: 3.0, holdBack: 2.0
+        )
+        // Frame f is track -2 + 0.24 f. Line 0's own "ka" at 12.4 s (frame 60) is the strongest match for
+        // line 1's window; line 1 is really sung at 14.8 s (frames 70-71), heard more weakly.
+        model.peaksForCall = [[60: 14, 61: 4, 70: 14, 71: 4]]
+        model.weakFrames = [70, 71]
+
+        let words = try await aligner.transcribe(chunk(start: 10.0))
+
+        XCTAssertEqual(words.count, 1, "the aligned lines are not aligned again")
+        XCTAssertEqual(words.first?.startTime ?? 0, 14.8, accuracy: 0.01)
+    }
+
+    func testEngineReportsTheLinesItHadTheAudioForButNotItsAnchors() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [5.0, 12.0, 14.0, 40.0].enumerated().map { LyricLine(id: $0 + 10, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [12: 14.2...14.6], lineWindow: 3.0, holdBack: 2.0)
+        model.peaksForCall = [[:]] // nothing heard: line 11 is listened for, but not aligned
+
+        _ = try await aligner.transcribe(chunk(start: 10.0))
+
+        // Line 10 began before the audio; line 13's window is still ahead; line 12 is an anchor.
+        XCTAssertEqual(aligner.attemptedLineIDs, [11])
+    }
+
     func testEngineStartsOverAfterASeek() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
         let aligner = LyricsForcedAligner(
@@ -198,6 +228,8 @@ private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
     let vocabSize = 31
     /// Peak frames (frame -> token) per call, in call order; later calls get all-blank output.
     var peaksForCall: [[Int: Int]] = []
+    /// Peak frames heard only weakly (log-prob -2 instead of -0.01).
+    var weakFrames: Set<Int> = []
     private(set) var windows: [[Float]] = []
 
     init(windowSampleCount: Int, frameCount: Int) {
@@ -210,7 +242,7 @@ private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
         let peaks = peaksForCall.isEmpty ? [:] : peaksForCall.removeFirst()
         var values = [Float](repeating: -10, count: frameCount * vocabSize)
         for frame in 0..<frameCount {
-            values[frame * vocabSize + (peaks[frame] ?? CTCForcedAlignment.blank)] = -0.01
+            values[frame * vocabSize + (peaks[frame] ?? CTCForcedAlignment.blank)] = weakFrames.contains(frame) ? -2 : -0.01
         }
         return values
     }

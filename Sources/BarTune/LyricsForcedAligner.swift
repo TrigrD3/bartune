@@ -128,11 +128,20 @@ protocol CTCAcousticModel: AnyObject, Sendable {
 
 /// Aligns the known lyrics to captured audio instead of transcribing it. Each chunk is scored in a window
 /// that ends with it; a line is aligned once audio covering its LRC time ± `lineWindow` has been scored.
-final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
+/// An engine that knows which lyric lines it has had the audio for, aligned or not.
+protocol LineAttemptReporting: AnyObject {
+    var attemptedLineIDs: Set<Int> { get }
+}
+
+final class LyricsForcedAligner: WhisperTranscribing, LineAttemptReporting, @unchecked Sendable {
     private struct PreparedLine {
+        let id: Int
         let start: Double
         let end: Double
         let words: [ForcedAlignmentText.Word]
+        /// Track-time limits from the nearest lines already aligned before and after this one.
+        var lowerBound = -Double.infinity
+        var upperBound = Double.infinity
     }
 
     private let model: CTCAcousticModel
@@ -141,6 +150,7 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
     private let holdBackSamples: Int
     private let lock = NSLock()
     private var done = Set<Int>()
+    private let anchoredIndices: Set<Int>
 
     // The current run of contiguous audio; a seek or rate change starts a new one.
     private var runStartTime = 0.0
@@ -159,18 +169,60 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
 
     static let sampleRate = 16000
 
-    init(lines: [LyricLine], model: CTCAcousticModel, lineWindow: Double = 3.0, holdBack: Double = 2.0) {
+    /// `anchors` are lines aligned on an earlier play (line ID -> sung span in track time): they are not
+    /// aligned again, and bound the lines between them.
+    init(
+        lines: [LyricLine],
+        model: CTCAcousticModel,
+        anchors: [Int: ClosedRange<Double>] = [:],
+        lineWindow: Double = 3.0,
+        holdBack: Double = 2.0
+    ) {
         self.model = model
         self.lineWindow = lineWindow
         holdBackSamples = Int(holdBack * Double(Self.sampleRate))
         let script = ForcedAlignmentText.Script.detect(in: lines)
         let timed = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        self.lines = timed.enumerated().compactMap { index, line in
+        var prepared: [PreparedLine] = []
+        var spans: [ClosedRange<Double>?] = []
+        for (index, line) in timed.enumerated() {
             let words = ForcedAlignmentText.words(for: line.text, script: script)
-            guard !words.isEmpty else { return nil }
+            guard !words.isEmpty else { continue }
             let end = index + 1 < timed.count ? timed[index + 1].timestamp : line.timestamp + 5
-            return PreparedLine(start: line.timestamp, end: end, words: words)
+            prepared.append(PreparedLine(id: line.id, start: line.timestamp, end: end, words: words))
+            spans.append(anchors[line.id])
         }
+        var anchored = Set<Int>()
+        var offsets: [Double] = []
+        var lowerBound = -Double.infinity
+        for index in prepared.indices {
+            if let span = spans[index] {
+                anchored.insert(index)
+                offsets.append(span.lowerBound - prepared[index].start)
+                lowerBound = span.upperBound
+            } else {
+                prepared[index].lowerBound = lowerBound
+            }
+        }
+        var upperBound = Double.infinity
+        for index in prepared.indices.reversed() {
+            if let span = spans[index] {
+                upperBound = span.lowerBound
+            } else {
+                prepared[index].upperBound = upperBound
+            }
+        }
+        self.lines = prepared
+        anchoredIndices = anchored
+        done = anchored
+        lineOffsets = offsets
+    }
+
+    /// Lines this engine has had the full audio window for, whether they aligned or not; not the anchors.
+    var attemptedLineIDs: Set<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(done.subtracting(anchoredIndices).map { lines[$0].id })
     }
 
     // swiftlint:disable:next async_without_await
@@ -253,8 +305,9 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
             guard line.end + lineWindow <= coveredEnd else { break }
             batch.append(index)
         }
-        // The newest ready line is only context, so the line before it can't stretch into its audio.
-        let keep = batch.last == lines.count - 1 ? batch.count : batch.count - 1
+        // The newest ready line is only context, so the line before it can't stretch into its audio;
+        // a line right before an aligned one is already bounded by it.
+        let keep = batch.last.map { $0 == lines.count - 1 || done.contains($0 + 1) } == true ? batch.count : batch.count - 1
         guard keep > 0 else { return [] }
         done.formUnion(batch.prefix(keep))
         if let words = align(batch, keeping: keep) { return words }
@@ -266,8 +319,8 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
     /// Aligns `batch` together and returns the words of its first `keep` lines.
     private func align(_ batch: [Int], keeping keep: Int) -> [RecognizedAudioWord]? {
         guard let firstLine = batch.first.map({ lines[$0] }), let lastLine = batch.last.map({ lines[$0] }) else { return nil }
-        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: firstLine.start - lineWindow))
-        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: lastLine.end + lineWindow))
+        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: windowStart(of: firstLine)))
+        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: windowEnd(of: lastLine)))
         guard highFrame > lowFrame else { return nil }
 
         var tokens: [Int] = []
@@ -275,8 +328,8 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
         var owners: [(line: Int, word: Int)] = []
         for index in batch {
             let line = lines[index]
-            let low = max(lowFrame, runFrame(atTrackTime: line.start - lineWindow)) - lowFrame
-            let high = min(highFrame, runFrame(atTrackTime: line.end + lineWindow)) - lowFrame
+            let low = max(lowFrame, runFrame(atTrackTime: windowStart(of: line))) - lowFrame
+            let high = min(highFrame, runFrame(atTrackTime: windowEnd(of: line))) - lowFrame
             guard high >= low else { return nil }
             for (wordIndex, word) in line.words.enumerated() {
                 for token in word.tokenIDs {
@@ -319,6 +372,14 @@ final class LyricsForcedAligner: WhisperTranscribing, @unchecked Sendable {
         }
         if let keptUntilFrame { alignedUntilFrame = keptUntilFrame }
         return dropUnreliableLines(words, lineOf: wordLines)
+    }
+
+    private func windowStart(of line: PreparedLine) -> Double {
+        max(line.start - lineWindow, line.lowerBound)
+    }
+
+    private func windowEnd(of line: PreparedLine) -> Double {
+        min(line.end + lineWindow, line.upperBound)
     }
 
     /// Words the model barely hears (a shout under backing vocals, say) can land seconds off; such a
@@ -478,7 +539,11 @@ enum LyricsAlignerModel {
 
     /// Returns an aligner for `lines`, compiling an installed `.mlpackage` once; nil when the model is
     /// missing, fails to load, or the Mac has no Neural Engine (the model's CPU path returns NaN).
-    static func launch(lines: [LyricLine], directory: URL = directory) async -> WhisperTranscribing? {
+    static func launch(
+        lines: [LyricLine],
+        anchors: [Int: ClosedRange<Double>] = [:],
+        directory: URL = directory
+    ) async -> WhisperTranscribing? {
         #if arch(arm64)
             let compiled = directory.appendingPathComponent(compiledName)
             let package = directory.appendingPathComponent(packageName)
@@ -489,7 +554,7 @@ enum LyricsAlignerModel {
                 guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
             }
             return await Task.detached(priority: .utility) {
-                CoreMLAcousticModel(compiledModelURL: compiled).map { LyricsForcedAligner(lines: lines, model: $0) }
+                CoreMLAcousticModel(compiledModelURL: compiled).map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
             }.value
         #else
             return nil
