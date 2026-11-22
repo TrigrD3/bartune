@@ -106,6 +106,8 @@ struct KaraokeLineView: View {
     let text: String
     let state: LyricsState
     let font: Font
+    /// Same font as `font`, for measuring word boundaries; nil keeps the character-share edge.
+    var measureFont: NSFont?
     let unsungColor: Color
     let sungColor: Color
     let karaokeEnabled: Bool
@@ -128,9 +130,10 @@ struct KaraokeLineView: View {
     static func scrollProgress(
         state: LyricsState,
         at date: Date,
-        karaokeEnabled _: Bool
+        karaokeEnabled _: Bool,
+        measureFont: NSFont? = nil
     ) -> Double {
-        state.liveProgress(at: date)
+        state.liveProgress(at: date, font: measureFont)
     }
 
     static func scrollOffset(
@@ -158,7 +161,8 @@ struct KaraokeLineView: View {
                 let progress = Self.scrollProgress(
                     state: state,
                     at: timeline.date,
-                    karaokeEnabled: karaokeEnabled
+                    karaokeEnabled: karaokeEnabled,
+                    measureFont: measureFont
                 )
                 let scrollOffset = Self.scrollOffset(
                     progress: progress,
@@ -357,6 +361,7 @@ struct LyricsOverlayView: View {
                     text: state.currentText,
                     state: state,
                     font: state.fontOption.font(size: state.fontSize, weight: state.fontWeight),
+                    measureFont: state.fontOption.nsFont(size: state.fontSize, weight: state.fontWeight),
                     unsungColor: activeUnsungColor,
                     sungColor: activeSungColor,
                     karaokeEnabled: state.karaokeAnimationEnabled,
