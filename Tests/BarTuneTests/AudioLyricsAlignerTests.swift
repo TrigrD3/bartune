@@ -1166,4 +1166,20 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.matchedLineCount, 0)
         XCTAssertTrue(result.lines.isEmpty)
     }
+
+    func testLyricTokenWordsAreMatchedAsTheyAreWithoutJoiningAdjacentLines() {
+        // Lyrics Alignment returns each lyric token at its own time; joined into one katakana run,
+        // "モラリティ" and "ダーリン" would no longer match either line.
+        let lines = [
+            LyricLine(id: 0, timestamp: 24.0, text: "モラリティ"),
+            LyricLine(id: 1, timestamp: 25.5, text: "ダーリンベイビーダーリン"),
+        ]
+        let words = [(24.59, "モラ"), (24.91, "リ"), (25.23, "ティ"), (26.25, "ダーリン"), (26.71, "ベイビー"), (27.13, "ダーリン")]
+            .map { RecognizedAudioWord(text: $0.1, startTime: $0.0, duration: 0.3, confidence: 0.1) }
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: words, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines.last?.timestamp ?? 0, 26.25, accuracy: 0.01)
+    }
 }

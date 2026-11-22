@@ -902,7 +902,8 @@ final class AudioSyncManager {
         let result = LyricsAudioAligner.align(
             lines: baseLines,
             recognizedWords: allHeardWords,
-            replaceTextWithTranscription: state.replaceLyricsWithTranscription
+            replaceTextWithTranscription: state.replaceLyricsWithTranscription,
+            regroupsCJKWords: chunkEngine != .lyricsAlignment
         )
         let lines = baseLines
         diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
@@ -941,7 +942,8 @@ final class AudioSyncManager {
         let result = LyricsAudioAligner.align(
             lines: baseLines,
             recognizedWords: allHeardWords,
-            replaceTextWithTranscription: state.replaceLyricsWithTranscription
+            replaceTextWithTranscription: state.replaceLyricsWithTranscription,
+            regroupsCJKWords: chunkEngine != .lyricsAlignment
         )
         guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
         persistAlignment(result, engine: engine)
