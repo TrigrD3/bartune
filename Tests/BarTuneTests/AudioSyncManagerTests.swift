@@ -276,7 +276,7 @@ final class AudioSyncManagerTests: XCTestCase {
                     self.end_headers()
                     return
                 with open(log_path, "a") as log:
-                    log.write("inference verbose_json=%s prompt=%s wav=%s\n" % (b"verbose_json" in body, b"Hello world" in body, b"RIFF" in body))
+                    log.write("inference verbose_json=%s prompt=%s wav=%s\n" % (b"verbose_json" in body, b'name="prompt"' in body, b"RIFF" in body))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(RESPONSE)))
@@ -297,8 +297,7 @@ final class AudioSyncManagerTests: XCTestCase {
             samples: [Float](repeating: 0.1, count: 160),
             sampleRate: 16000,
             chunkStartTime: 10.0,
-            playbackRate: 1.0,
-            prompt: "Hello world"
+            playbackRate: 1.0
         )
 
         let first = try await server.transcribe(request)
@@ -310,8 +309,8 @@ final class AudioSyncManagerTests: XCTestCase {
         let log = try String(contentsOf: logURL, encoding: .utf8).split(separator: "\n").map(String.init)
         XCTAssertEqual(log, [
             "load /models/ggml-base.bin dtw base",
-            "inference verbose_json=True prompt=True wav=True",
-            "inference verbose_json=True prompt=True wav=True",
+            "inference verbose_json=True prompt=False wav=True",
+            "inference verbose_json=True prompt=False wav=True",
         ])
 
         server.shutdown()
