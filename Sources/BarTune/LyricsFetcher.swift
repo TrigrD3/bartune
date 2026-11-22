@@ -598,6 +598,11 @@ actor LyricsFetcher {
     }
 
     func fetchLyrics(for track: TrackInfo) async -> [LyricLine] {
+        await lookupLyrics(for: track) ?? []
+    }
+
+    /// `nil` means a provider failed in a way worth retrying; an empty array means no provider has lyrics.
+    func lookupLyrics(for track: TrackInfo) async -> [LyricLine]? {
         if let cached = cache[track.id] {
             return cached
         }
@@ -617,10 +622,11 @@ actor LyricsFetcher {
             return diskEntry.lines
         }
 
+        var transientFailure = false
         do {
             // 1. Try NetEase YRC first for true millisecond word-by-word karaoke sync
             try Task.checkCancellation()
-            let netEase = try await fetchNetEase(track: track)
+            let netEase = try await fetchNetEase(track: track, transientFailure: &transientFailure)
             if let yrc = netEase.yrc, !yrc.isEmpty {
                 cache[track.id] = yrc
                 diskCache.save(
@@ -635,7 +641,7 @@ actor LyricsFetcher {
 
             // 2. Fall back to LRCLIB exact match
             try Task.checkCancellation()
-            if let exact = try await fetchLRCLibExact(track: track), !exact.isEmpty {
+            if let exact = try await fetchLRCLibExact(track: track, transientFailure: &transientFailure), !exact.isEmpty {
                 cache[track.id] = exact
                 diskCache.save(
                     trackId: track.id,
@@ -649,7 +655,7 @@ actor LyricsFetcher {
 
             // 3. Fall back to LRCLIB search
             try Task.checkCancellation()
-            if let searched = try await fetchLRCLibSearch(track: track), !searched.isEmpty {
+            if let searched = try await fetchLRCLibSearch(track: track, transientFailure: &transientFailure), !searched.isEmpty {
                 cache[track.id] = searched
                 diskCache.save(
                     trackId: track.id,
@@ -675,7 +681,7 @@ actor LyricsFetcher {
                 return lrc
             }
 
-            return []
+            return transientFailure ? nil : []
         } catch is CancellationError {
             return []
         } catch {
@@ -689,7 +695,29 @@ actor LyricsFetcher {
             || Task.isCancelled
     }
 
-    private func fetchNetEase(track: TrackInfo) async throws -> (yrc: [LyricLine]?, lrc: [LyricLine]?) {
+    /// Returns the body of a 200 response; flags network errors and retryable statuses in `transientFailure`.
+    private func send(_ request: URLRequest, transientFailure: inout Bool) async throws -> Data? {
+        do {
+            let (data, response) = try await dataLoader(request)
+            try Task.checkCancellation()
+            guard let http = response as? HTTPURLResponse else { return nil }
+            if http.statusCode == 408 || http.statusCode == 429 || (500...599).contains(http.statusCode) {
+                transientFailure = true
+            }
+            return http.statusCode == 200 ? data : nil
+        } catch {
+            if Self.isCancellationError(error) {
+                throw CancellationError()
+            }
+            transientFailure = true
+            return nil
+        }
+    }
+
+    private func fetchNetEase(
+        track: TrackInfo,
+        transientFailure: inout Bool
+    ) async throws -> (yrc: [LyricLine]?, lrc: [LyricLine]?) {
         try Task.checkCancellation()
         guard var searchComp = URLComponents(string: "https://music.163.com/api/search/get") else {
             return (nil, nil)
@@ -706,9 +734,7 @@ actor LyricsFetcher {
         searchReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (searchData, searchResp) = try await dataLoader(searchReq)
-            try Task.checkCancellation()
-            guard let http = searchResp as? HTTPURLResponse, http.statusCode == 200 else {
+            guard let searchData = try await send(searchReq, transientFailure: &transientFailure) else {
                 return (nil, nil)
             }
             let decoded = try JSONDecoder().decode(NetEaseSearchResponse.self, from: searchData)
@@ -733,9 +759,7 @@ actor LyricsFetcher {
             lyricReq.timeoutInterval = 5
             lyricReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
-            let (lyricData, lyricResp) = try await dataLoader(lyricReq)
-            try Task.checkCancellation()
-            guard let lHttp = lyricResp as? HTTPURLResponse, lHttp.statusCode == 200 else {
+            guard let lyricData = try await send(lyricReq, transientFailure: &transientFailure) else {
                 return (nil, nil)
             }
             let lyricObj = try JSONDecoder().decode(NetEaseLyricResponse.self, from: lyricData)
@@ -757,7 +781,7 @@ actor LyricsFetcher {
         }
     }
 
-    private func fetchLRCLibExact(track: TrackInfo) async throws -> [LyricLine]? {
+    private func fetchLRCLibExact(track: TrackInfo, transientFailure: inout Bool) async throws -> [LyricLine]? {
         try Task.checkCancellation()
         guard track.duration.isFinite,
               track.duration > 0,
@@ -777,9 +801,7 @@ actor LyricsFetcher {
         request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await dataLoader(request)
-            try Task.checkCancellation()
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            guard let data = try await send(request, transientFailure: &transientFailure) else {
                 return nil
             }
             let record = try JSONDecoder().decode(LRCLibRecord.self, from: data)
@@ -793,7 +815,7 @@ actor LyricsFetcher {
         }
     }
 
-    private func fetchLRCLibSearch(track: TrackInfo) async throws -> [LyricLine]? {
+    private func fetchLRCLibSearch(track: TrackInfo, transientFailure: inout Bool) async throws -> [LyricLine]? {
         try Task.checkCancellation()
         guard var components = URLComponents(string: "https://lrclib.net/api/search") else { return nil }
         components.queryItems = [
@@ -807,9 +829,7 @@ actor LyricsFetcher {
         request.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
-            let (data, response) = try await dataLoader(request)
-            try Task.checkCancellation()
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            guard let data = try await send(request, transientFailure: &transientFailure) else {
                 return nil
             }
             let records = try JSONDecoder().decode([LRCLibRecord].self, from: data)

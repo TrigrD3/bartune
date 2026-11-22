@@ -341,6 +341,106 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertEqual(retriedCancelled, expected)
     }
 
+    @MainActor
+    func testPlaybackRetriesLyricsAfterTransientFailureButNotAfterConfirmedMiss() async throws {
+        final class Network: @unchecked Sendable {
+            private let lock = NSLock()
+            private var attempts = 0
+            let firstAttemptError: URLError?
+
+            init(firstAttemptError: URLError?) {
+                self.firstAttemptError = firstAttemptError
+            }
+
+            var attemptCount: Int {
+                lock.lock()
+                defer { lock.unlock() }
+                return attempts
+            }
+
+            func respond(to request: URLRequest) throws -> (Data, URLResponse) {
+                let url = try XCTUnwrap(request.url)
+                lock.lock()
+                if url.host == "music.163.com", url.path == "/api/search/get" { attempts += 1 }
+                let attempt = attempts
+                lock.unlock()
+                // The first lookup fails (offline or confirmed miss); every later one finds lyrics.
+                if attempt == 1, let firstAttemptError { throw firstAttemptError }
+                let found = attempt > 1 && url.path == "/api/get"
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: found ? 200 : 404, httpVersion: nil, headerFields: nil))
+                let json = #"{"syncedLyrics":"[00:01.00]Back online"}"#
+                return (found ? Data(json.utf8) : Data(), response)
+            }
+        }
+
+        func play(_ network: Network, trackId: String) async throws -> [LyricLine] {
+            let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+            let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+            defer { defaults.removePersistentDomain(forName: suiteName) }
+            let state = LyricsState(userDefaults: defaults)
+            let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) {
+                try network.respond(to: $0)
+            }
+            let app = AppDelegate(
+                state: state,
+                lyricsFetcher: fetcher,
+                lyricsRetryDelays: [.zero],
+                audioSyncCache: AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("audio-sync", isDirectory: true))
+            )
+            let track = TrackInfo(id: trackId, title: "Dawn", artist: "Iris", album: "", duration: 200, artworkURL: nil)
+            app.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: track, position: 30))
+            await app.fetchTask?.value
+            return state.rawLyricLines
+        }
+
+        let offline = Network(firstAttemptError: URLError(.notConnectedToInternet))
+        let recovered = try await play(offline, trackId: "spotify:track:offline-then-online")
+        XCTAssertEqual(recovered.map(\.text), ["Back online"], "Lyrics must load once the network recovers mid-song")
+        XCTAssertEqual(offline.attemptCount, 2)
+
+        let missing = Network(firstAttemptError: nil)
+        let confirmedMiss = try await play(missing, trackId: "spotify:track:no-lyrics")
+        XCTAssertTrue(confirmedMiss.isEmpty, "A confirmed miss must not be retried")
+        XCTAssertEqual(missing.attemptCount, 1)
+    }
+
+    @MainActor
+    func testTransientLyricsFailureStillShowsCachedAudioSyncRecord() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
+        let track = TrackInfo(id: "spotify:track:cached-sync-offline", title: "Dusk", artist: "Iris", album: "", duration: 200, artworkURL: nil)
+        let cachedLines = [LyricLine(id: 0, timestamp: 1, text: "Cached line")]
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: track.id,
+                engine: .appleSpeech,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: cachedLines
+            )
+        )
+        let fetcher = LyricsFetcher(
+            diskCache: LyricsDiskCache(directory: tempDir.appendingPathComponent("lyrics", isDirectory: true), maxEntries: 10)
+        ) { _ in throw URLError(.notConnectedToInternet) }
+        let app = AppDelegate(state: state, lyricsFetcher: fetcher, lyricsRetryDelays: [.seconds(3600)], audioSyncCache: syncCache)
+
+        app.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: track, position: 2))
+        for _ in 0..<200 where state.rawLyricLines.isEmpty {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        app.fetchTask?.cancel()
+        await app.fetchTask?.value
+
+        XCTAssertEqual(state.rawLyricLines.map(\.text), ["Cached line"], "A cached audio sync record must show while lookups fail")
+        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+    }
+
     func testCancelledLookupStopsEarlyAndRetriesWhenOnline() async {
         final class StubState: @unchecked Sendable {
             private let lock = NSLock()

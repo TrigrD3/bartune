@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let state: LyricsState
     private let spotifyMonitor: SpotifyMonitor
     private let lyricsFetcher: LyricsFetcher
+    private let lyricsRetryDelays: [Duration]
     private let lyricsTranslator: LyricsTranslator
     private let colorExtractor: AlbumArtColorExtractor
     private let appUpdater = AppUpdaterModel()
@@ -22,26 +23,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hoverModeItems: [HoverMode: NSMenuItem] = [:]
 
     private var lastFetchedTrackId: String?
-    private var fetchTask: Task<Void, Never>?
+    private(set) var fetchTask: Task<Void, Never>?
     private var translateTask: Task<Void, Never>?
     private var colorTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    /// The last lyrics retry delay repeats until lyrics load or the track changes.
     init(
         state: LyricsState? = nil,
         spotifyMonitor: SpotifyMonitor? = nil,
         lyricsFetcher: LyricsFetcher = LyricsFetcher(),
         lyricsTranslator: LyricsTranslator = LyricsTranslator(),
         colorExtractor: AlbumArtColorExtractor = AlbumArtColorExtractor(),
-        audioSyncManager: AudioSyncManager? = nil
+        audioSyncManager: AudioSyncManager? = nil,
+        lyricsRetryDelays: [Duration] = [.seconds(5), .seconds(15), .seconds(30)],
+        audioSyncCache: AudioSyncedLyricsCache = .default
     ) {
         let resolvedState = state ?? LyricsState()
         self.state = resolvedState
         self.spotifyMonitor = spotifyMonitor ?? SpotifyMonitor()
         self.lyricsFetcher = lyricsFetcher
+        self.lyricsRetryDelays = lyricsRetryDelays
         self.lyricsTranslator = lyricsTranslator
         self.colorExtractor = colorExtractor
-        self.audioSyncManager = audioSyncManager ?? AudioSyncManager(state: resolvedState)
+        self.audioSyncManager = audioSyncManager ?? AudioSyncManager(state: resolvedState, cache: audioSyncCache)
         super.init()
     }
 
@@ -306,18 +311,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.setTrack(track, lyrics: [])
 
             fetchTask = Task { [weak self] in
-                guard let self else { return }
-                let lyrics = await self.lyricsFetcher.fetchLyrics(for: track)
-                guard !Task.isCancelled,
-                      self.lastFetchedTrackId == track.id,
-                      !(track.id.hasPrefix("browser:") && !self.state.browserMusicEnabled)
-                else { return }
-                let resolvedTrack = self.lastLoadedTrack ?? track
-                self.state.setTrack(resolvedTrack, lyrics: lyrics)
-                self.audioSyncManager.handleTrackLoaded(track: resolvedTrack, rawLines: lyrics)
-                if self.state.translateLyrics, !lyrics.isEmpty {
-                    self.translateCurrentTrack()
-                }
+                await self?.loadLyrics(for: track)
             }
 
             colorTask = Task { [weak self] in
@@ -339,6 +333,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             playbackRate: snapshot.playbackRate
         )
         audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying, position: snapshot.position)
+    }
+
+    private func loadLyrics(for track: TrackInfo) async {
+        var retries = 0
+        while true {
+            let lookup = await lyricsFetcher.lookupLyrics(for: track)
+            guard !Task.isCancelled,
+                  lastFetchedTrackId == track.id,
+                  !(track.id.hasPrefix("browser:") && !state.browserMusicEnabled)
+            else { return }
+            guard let lyrics = lookup else {
+                // A provider failed transiently (e.g. offline), so retry while this track stays current.
+                if retries == 0 {
+                    // Meanwhile show a cached audio sync record, as a confirmed miss would.
+                    audioSyncManager.handleTrackLoaded(track: track, rawLines: [])
+                }
+                let delay = lyricsRetryDelays[min(retries, lyricsRetryDelays.count - 1)]
+                retries += 1
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    return
+                }
+                guard lastFetchedTrackId == track.id else { return }
+                continue
+            }
+            let resolvedTrack = lastLoadedTrack ?? track
+            state.setTrack(resolvedTrack, lyrics: lyrics)
+            audioSyncManager.handleTrackLoaded(track: resolvedTrack, rawLines: lyrics)
+            if state.translateLyrics, !lyrics.isEmpty {
+                translateCurrentTrack()
+            }
+            return
+        }
     }
 
     private func restartAudioSyncForCurrentTrack() {

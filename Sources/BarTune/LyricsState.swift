@@ -845,6 +845,8 @@ final class LyricsState: ObservableObject {
                 return source
             }
             retainedTranslation = true
+            // A line the translator left unchanged (e.g. its batch failed) keeps the source line and word timing.
+            guard entry.translatedText != source.text else { return source }
             return LyricLine(
                 id: source.id,
                 timestamp: source.timestamp,
