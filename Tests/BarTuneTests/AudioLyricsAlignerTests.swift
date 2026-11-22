@@ -691,6 +691,45 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertGreaterThan(result.lines[2].timestamp, result.lines[1].timestamp + 1.0)
     }
 
+    func testHeldLastWordDoesNotHideTheNextLinesFirstWord() {
+        // "you" is held up to the moment "now" is sung: its end touches the next line's first word.
+        let lines = [
+            LyricLine(id: 0, timestamp: 86.0, text: "love you"),
+            LyricLine(id: 1, timestamp: 92.0, text: "now your out all night"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "love", startTime: 86.17, duration: 0.40, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 86.57, duration: 5.37, confidence: 0.9),
+            RecognizedAudioWord(text: "now", startTime: 91.94, duration: 0.14, confidence: 0.9),
+            RecognizedAudioWord(text: "your", startTime: 92.12, duration: 0.16, confidence: 0.9),
+            RecognizedAudioWord(text: "out", startTime: 92.32, duration: 0.12, confidence: 0.9),
+            RecognizedAudioWord(text: "all", startTime: 92.60, duration: 0.08, confidence: 0.9),
+            RecognizedAudioWord(text: "night", startTime: 92.70, duration: 0.44, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[1].timestamp, 91.94, accuracy: 0.001)
+    }
+
+    func testWordBeforeThePreviousLinesEndDoesNotHideALaterEligibleOne() {
+        // "now" is heard at 11.9 s, inside the held "you", and again at 12.2 s; only the second may start line 1.
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "love you"),
+            LyricLine(id: 1, timestamp: 12.0, text: "now"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "love", startTime: 10.0, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 10.5, duration: 1.5, confidence: 0.9),
+            RecognizedAudioWord(text: "now", startTime: 11.9, duration: 0.2, confidence: 0.9),
+            RecognizedAudioWord(text: "now", startTime: 12.2, duration: 0.2, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[1].timestamp, 12.2, accuracy: 0.001)
+    }
+
     func testAlignEnforcesMonotonicOrderAcrossFallbackLinesAndConsumedWordBoundaries() {
         // Line 0 matches at 11.2s, while unmatched line 1 has raw timestamp 11.0s.
         let fallbackLines = [
