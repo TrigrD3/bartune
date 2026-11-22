@@ -357,6 +357,23 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: enLines).identifier, "en-US")
     }
 
+    func testSpeechLocaleFollowsTheMajorityLanguageOfMixedLyrics() {
+        let mostlyEnglish = [
+            "\"Do you believe a world of happy endings?\"",
+            "Even when the road seems long",
+            "Every breath you take will lead you closer to",
+            "君の夢が叶うまで",
+        ].enumerated().map { LyricLine(id: $0.offset, timestamp: Double($0.offset) * 4, text: $0.element) }
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: mostlyEnglish).identifier, "en-US")
+
+        let mostlyJapanese = [
+            "Hello, my friend",
+            "見つけ出してくれた 救い出してくれた",
+            "忘れることない 君の笑顔",
+        ].enumerated().map { LyricLine(id: $0.offset, timestamp: Double($0.offset) * 4, text: $0.element) }
+        XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: mostlyJapanese).identifier, "ja-JP")
+    }
+
     func testTokenizesAndAlignsJapaneseLyricsWithoutSpaces() {
         let text = "闇夜を駆け抜けて"
         let tokens = LyricsAudioAligner.tokenizeLine(text)

@@ -497,17 +497,25 @@ enum LyricsLanguageDetector {
     /// doesn't default to English on Japanese, Korean, Chinese, or other non-English songs.
     static func detectSpeechLocale(for lines: [LyricLine]) -> Locale {
         guard !lines.isEmpty else { return .current }
-        if JapaneseRomanizer.isJapaneseTrack(lines) {
-            return Locale(identifier: "ja-JP")
+        let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let isCJK: (LyricLine) -> Bool = {
+            JapaneseRomanizer.containsKana($0.text)
+                || KoreanRomanizer.containsHangul($0.text)
+                || ChineseRomanizer.containsHan($0.text)
         }
-        if KoreanRomanizer.isKoreanTrack(lines) {
-            return Locale(identifier: "ko-KR")
-        }
-        if ChineseRomanizer.isChineseTrack(lines) {
+        let cjkLines = nonEmpty.filter(isCJK)
+        // A few CJK lines in a mostly Latin song must not pick a CJK recognizer.
+        if !cjkLines.isEmpty, cjkLines.count * 2 >= nonEmpty.count {
+            if JapaneseRomanizer.isJapaneseTrack(cjkLines) {
+                return Locale(identifier: "ja-JP")
+            }
+            if KoreanRomanizer.isKoreanTrack(cjkLines) {
+                return Locale(identifier: "ko-KR")
+            }
             return Locale(identifier: "zh-CN")
         }
 
-        let sample = lines.prefix(12).map(\.text).joined(separator: " ")
+        let sample = nonEmpty.filter { !isCJK($0) }.prefix(12).map(\.text).joined(separator: " ")
         let recognizer = NLLanguageRecognizer()
         recognizer.processString(sample)
         if let dominant = recognizer.dominantLanguage, dominant != .undetermined {
