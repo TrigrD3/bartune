@@ -30,14 +30,14 @@ protocol SpeechRecognizing: AnyObject {
     var supportsOnDeviceRecognition: Bool { get }
     func startRecognitionTask(
         with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Error?) -> Void
+        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
     ) -> SpeechRecognitionTaskHandling
 }
 
 extension SFSpeechRecognizer: SpeechRecognizing {
     func startRecognitionTask(
         with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Error?) -> Void
+        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
     ) -> SpeechRecognitionTaskHandling {
         recognitionTask(with: request) { result, error in
             let segments = result?.bestTranscription.segments.map {
@@ -48,7 +48,7 @@ extension SFSpeechRecognizer: SpeechRecognizing {
                     confidence: $0.confidence
                 )
             }
-            resultHandler(segments, error)
+            resultHandler(segments, result?.isFinal ?? false, error)
         }
     }
 }
@@ -384,6 +384,7 @@ final class AudioSyncManager {
         var speechAuthorizationStatus: () -> SFSpeechRecognizerAuthorizationStatus
         var requestSpeechAuthorization: (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void
         var makeSpeechRecognizer: (Locale?) -> SpeechRecognizing?
+        var makeSpeechRequest: () -> SFSpeechAudioBufferRecognitionRequest
         var locateWhisperServer: () -> String?
         var resolveWhisperModelPath: @Sendable (String) -> String?
         var launchWhisper: @Sendable (_ serverPath: String, _ modelPath: String) async -> WhisperTranscribing?
@@ -404,6 +405,7 @@ final class AudioSyncManager {
                     }
                     return SFSpeechRecognizer()
                 },
+                makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
                 locateWhisperServer: { WhisperModelLocator.locateWhisperServer() },
                 resolveWhisperModelPath: { selected in
                     let trimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -687,7 +689,7 @@ final class AudioSyncManager {
             return
         }
 
-        let request = SFSpeechAudioBufferRecognitionRequest()
+        let request = dependencies.makeSpeechRequest()
         request.shouldReportPartialResults = true
         request.requiresOnDeviceRecognition = true
         request.contextualStrings = Array(lines.prefix(40).map(\.text))
@@ -701,7 +703,7 @@ final class AudioSyncManager {
 
         state.audioSyncStatus = .syncing(engine: .appleSpeech, alignedLines: 0, totalLines: lines.count)
 
-        speechTask = recognizer.startRecognitionTask(with: request) { [weak self] segments, error in
+        speechTask = recognizer.startRecognitionTask(with: request) { [weak self] segments, isFinal, error in
             Task { @MainActor in
                 guard let self,
                       self.syncGeneration == generation,
@@ -720,10 +722,15 @@ final class AudioSyncManager {
                     self.recognizedWords = words
                     self.applyAlignment(engine: .appleSpeech)
                 }
-                if let error, self.isLiveSyncActive {
-                    self.persistCurrentAlignmentIfReady()
+                if error != nil || isFinal, self.isLiveSyncActive {
+                    // applyAlignment above already saved this callback's words.
+                    if segments == nil {
+                        self.persistCurrentAlignmentIfReady()
+                    }
                     self.stop()
-                    self.state.audioSyncStatus = .unavailable("Apple Speech recognition stopped: \(error.localizedDescription)")
+                    let message = error.map { "Apple Speech recognition stopped: \($0.localizedDescription)" }
+                        ?? "Apple Speech recognition finished before syncing completed"
+                    self.state.audioSyncStatus = .unavailable(message)
                 }
             }
         }
