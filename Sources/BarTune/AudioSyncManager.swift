@@ -5,8 +5,19 @@ import CoreMedia
 import Foundation
 import ScreenCaptureKit
 
+/// One delivery of captured player audio.
+struct CapturedAudio: Sendable {
+    /// Mono mix of all channels.
+    let samples: [Float]
+    /// Half the left-minus-right difference per frame; empty for mono audio.
+    var side: [Float] = []
+    let sampleRate: Double
+    /// Seconds the first sample was captured before this delivery, from the buffer's presentation timestamp.
+    var captureDelay: Double?
+}
+
 protocol AudioCaptureProviding: AnyObject {
-    var onAudioSamples: (([Float], Double) -> Void)? { get set }
+    var onAudioSamples: ((CapturedAudio) -> Void)? { get set }
     @MainActor func start(targetBundleIds: Set<String>) async throws
     @MainActor func stop()
 }
@@ -23,6 +34,87 @@ enum AudioLevel {
 }
 
 enum AudioSampleExtractor {
+    /// Mono mix and side signal of one or more equal-length channels.
+    static func midSide(channels: [[Float]]) -> (mid: [Float], side: [Float]) {
+        guard let first = channels.first else { return ([], []) }
+        let count = channels.map(\.count).min() ?? 0
+        guard channels.count > 1 else { return (Array(first.prefix(count)), []) }
+        let scale = 1 / Float(channels.count)
+        var mid = [Float](repeating: 0, count: count)
+        var side = [Float](repeating: 0, count: count)
+        for index in 0..<count {
+            var sum: Float = 0
+            for channel in channels {
+                sum += channel[index]
+            }
+            mid[index] = sum * scale
+            side[index] = (channels[0][index] - channels[1][index]) / 2
+        }
+        return (mid, side)
+    }
+
+    /// Splits `channelCount`-way interleaved samples into one array per channel.
+    static func deinterleave(_ samples: [Float], channelCount: Int) -> [[Float]] {
+        guard channelCount > 1 else { return [samples] }
+        let frames = samples.count / channelCount
+        return (0..<channelCount).map { channel in
+            (0..<frames).map { samples[$0 * channelCount + channel] }
+        }
+    }
+
+    /// Every channel of a captured audio buffer, as Float samples; empty for unsupported formats.
+    static func extractChannels(from sampleBuffer: CMSampleBuffer, asbd: AudioStreamBasicDescription) -> [[Float]] {
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        guard (isFloat && asbd.mBitsPerChannel == 32) || (!isFloat && asbd.mBitsPerChannel == 16) else { return [] }
+        var sizeNeeded = 0
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: &sizeNeeded,
+            bufferListOut: nil,
+            bufferListSize: 0,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: nil
+        ) == noErr, sizeNeeded > 0 else { return [] }
+        let raw = UnsafeMutableRawPointer.allocate(byteCount: sizeNeeded, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { raw.deallocate() }
+        let list = raw.bindMemory(to: AudioBufferList.self, capacity: 1)
+        var retained: CMBlockBuffer?
+        guard CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer,
+            bufferListSizeNeededOut: nil,
+            bufferListOut: list,
+            bufferListSize: sizeNeeded,
+            blockBufferAllocator: nil,
+            blockBufferMemoryAllocator: nil,
+            flags: 0,
+            blockBufferOut: &retained
+        ) == noErr else { return [] }
+
+        var channels: [[Float]] = []
+        for buffer in UnsafeMutableAudioBufferListPointer(list) {
+            guard let data = buffer.mData else { continue }
+            let samples: [Float]
+            if isFloat {
+                let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
+                samples = Array(UnsafeBufferPointer(start: data.assumingMemoryBound(to: Float.self), count: count))
+            } else {
+                let count = Int(buffer.mDataByteSize) / MemoryLayout<Int16>.size
+                samples = UnsafeBufferPointer(start: data.assumingMemoryBound(to: Int16.self), count: count).map { Float($0) / 32768.0 }
+            }
+            channels.append(contentsOf: deinterleave(samples, channelCount: max(1, Int(buffer.mNumberChannels))))
+        }
+        return channels
+    }
+
+    /// Seconds a buffer stamped `presentation` (host clock) is older than `hostNow`; nil when the stamp
+    /// isn't plausible for live capture.
+    static func captureDelay(presentation: Double, hostNow: Double) -> Double? {
+        let delay = hostNow - presentation
+        return (0...1).contains(delay) ? delay : nil
+    }
+
     static func extractMonoSamples(
         from blockBuffer: CMBlockBuffer,
         asbd: AudioStreamBasicDescription
@@ -192,7 +284,8 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 16000
-        config.channelCount = 1
+        // Stereo lets the vocal envelope weigh the centre of the mix; recognition gets the mono mix.
+        config.channelCount = 2
         // Minimal video footprint since we only consume audio buffers.
         config.width = 2
         config.height = 2
@@ -207,8 +300,8 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
 
 final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding, @unchecked Sendable {
     private let callbackLock = NSLock()
-    private var _onAudioSamples: (([Float], Double) -> Void)?
-    var onAudioSamples: (([Float], Double) -> Void)? {
+    private var _onAudioSamples: ((CapturedAudio) -> Void)?
+    var onAudioSamples: ((CapturedAudio) -> Void)? {
         get {
             callbackLock.lock()
             defer { callbackLock.unlock() }
@@ -297,11 +390,21 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
 
         let asbd = asbdPtr.pointee
         let sampleRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : 16000.0
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let hostNow = CMClockGetTime(CMClockGetHostTimeClock()).seconds
+        let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let delay = presentation.isNumeric
+            ? AudioSampleExtractor.captureDelay(presentation: presentation.seconds, hostNow: hostNow)
+            : nil
 
-        let monoSamples = AudioSampleExtractor.extractMonoSamples(from: blockBuffer, asbd: asbd)
-        guard !monoSamples.isEmpty else { return }
-        onAudioSamples?(monoSamples, sampleRate)
+        var (mid, side) = AudioSampleExtractor.midSide(
+            channels: AudioSampleExtractor.extractChannels(from: sampleBuffer, asbd: asbd)
+        )
+        if mid.isEmpty, let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) {
+            mid = AudioSampleExtractor.extractMonoSamples(from: blockBuffer, asbd: asbd)
+            side = []
+        }
+        guard !mid.isEmpty else { return }
+        onAudioSamples?(CapturedAudio(samples: mid, side: side, sampleRate: sampleRate, captureDelay: delay))
     }
 }
 
@@ -401,6 +504,8 @@ final class AudioSyncManager {
     private var checkedLineIDs: Set<Int> = []
     private var activeTrackDuration: Double = 0
     private(set) var recognizedWords: [RecognizedAudioWord] = []
+    /// Voice-band loudness of this play's captured audio, used to refine heard word timings.
+    private(set) var vocalEnvelope = VocalEnvelope()
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
     private var captureTargetGeneration: UInt64 = 0
@@ -475,6 +580,7 @@ final class AudioSyncManager {
         anchoredLines = [:]
         checkedLineIDs = []
         activeTrackDuration = track.duration
+        vocalEnvelope = VocalEnvelope()
 
         let engine = state.audioSyncEngine
         guard engine != .off else {
@@ -797,8 +903,9 @@ final class AudioSyncManager {
     }
 
     private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
-        capture.onAudioSamples = { [weak self] samples, sampleRate in
-            let capturedAt = ProcessInfo.processInfo.systemUptime
+        capture.onAudioSamples = { [weak self] audio in
+            // When the first sample was captured: the buffer's own timestamp, else its delivery.
+            let capturedAt = ProcessInfo.processInfo.systemUptime - (audio.captureDelay ?? 0)
             Task { @MainActor in
                 guard let self,
                       self.syncGeneration == generation,
@@ -807,13 +914,23 @@ final class AudioSyncManager {
                       self.state.audioSyncEngine == self.chunkEngine,
                       capturedAt > self.whisperSeekBoundary
                 else { return }
+                let samples = audio.samples
+                let sampleRate = audio.sampleRate
                 self.whisperSampleRate = sampleRate
                 if sampleRate > 0 {
                     self.whisperCapturedSeconds += Double(samples.count) / sampleRate
                     self.diagnostics.recordAudio(totalSeconds: self.whisperCapturedSeconds)
                 }
+                if let delay = audio.captureDelay {
+                    self.diagnostics.recordCaptureDelay(delay)
+                }
                 if self.whisperChunkStartPos == nil {
-                    let livePos = self.currentPlaybackPosition()
+                    let livePos = Self.playbackPosition(
+                        self.currentPlaybackPosition(),
+                        capturedAt: capturedAt,
+                        now: ProcessInfo.processInfo.systemUptime,
+                        rate: self.state.isPlaying ? self.state.playbackRate : 0
+                    )
                     if let pending = self.whisperPendingSeekPos {
                         self.whisperPendingSeekPos = nil
                         self.whisperChunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
@@ -821,6 +938,17 @@ final class AudioSyncManager {
                         self.whisperChunkStartPos = livePos
                     }
                     self.whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
+                }
+                if let chunkStart = self.whisperChunkStartPos, sampleRate > 0 {
+                    let deliveryStart = chunkStart
+                        + Double(self.whisperSampleBuffer.count) / sampleRate * self.whisperChunkPlaybackRate
+                    self.vocalEnvelope.append(
+                        mid: samples,
+                        side: audio.side,
+                        sampleRate: sampleRate,
+                        startTime: deliveryStart,
+                        rate: self.whisperChunkPlaybackRate
+                    )
                 }
                 self.whisperSampleBuffer.append(contentsOf: samples)
 
@@ -910,6 +1038,11 @@ final class AudioSyncManager {
         }
     }
 
+    /// Track position at `capturedAt`, given the position `now` and the rate the track is playing at (0 when paused).
+    nonisolated static func playbackPosition(_ position: Double, capturedAt: Double, now: Double, rate: Double) -> Double {
+        position - max(0, now - capturedAt) * rate
+    }
+
     private func currentPlaybackPosition() -> Double {
         let elapsed = max(0.0, Date().timeIntervalSince(state.playbackAnchorDate))
         return state.playbackAnchorPosition + (state.isPlaying ? elapsed * state.playbackRate : 0.0)
@@ -935,11 +1068,27 @@ final class AudioSyncManager {
         return Self.mergeHeardWords(prior: priorHeardWords, current: recognizedWords)
     }
 
+    /// Every word heard, with timings refined against this play's vocal envelope.
+    private func refinedHeardWords() -> [RecognizedAudioWord] {
+        let (words, stats) = WaveformTimingRefiner.refine(
+            allHeardWords,
+            envelope: vocalEnvelope,
+            onsetWindow: Self.onsetWindow(for: chunkEngine)
+        )
+        diagnostics.update { $0.waveformRefinement = stats }
+        return words
+    }
+
+    /// How far a word start may move onto an onset: about the engine's own start-time error.
+    nonisolated static func onsetWindow(for engine: AudioSyncEngine) -> Double {
+        engine == .lyricsAlignment ? 0.06 : 0.15
+    }
+
     /// Aligns the lyrics to every word heard, keeping lines anchored from an earlier play exactly as saved.
     private func currentAlignment() -> AudioAlignmentResult {
         let result = LyricsAudioAligner.align(
             lines: baseLines,
-            recognizedWords: allHeardWords,
+            recognizedWords: refinedHeardWords(),
             replaceTextWithTranscription: state.replaceLyricsWithTranscription,
             regroupsCJKWords: chunkEngine != .lyricsAlignment
         )
@@ -1083,7 +1232,7 @@ final class AudioSyncManager {
             alignedLineCount: result.matchedLineCount,
             sourceLineCount: sourceCount,
             lines: result.lines,
-            heardWords: allHeardWords,
+            heardWords: refinedHeardWords(),
             checkedLineIDs: engine == .lyricsAlignment ? checkedLineIDs.subtracting(result.matchedLineIDs).sorted() : nil
         )
         cache.save(record)

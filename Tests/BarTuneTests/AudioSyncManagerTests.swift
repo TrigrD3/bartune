@@ -1748,6 +1748,93 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testChunkStartIsBackdatedByTheBufferCaptureDelay() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 50.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = true
+        let fakeCapture = FakeAudioCapture()
+        let deps = whisperDependencies(capture: fakeCapture, feed: LockedBox([]))
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 30), sampleRate: 100, captureDelay: 0.4)
+        let buffered = await waitUntil { manager.bufferedWhisperSampleCount == 30 }
+        XCTAssertTrue(buffered)
+        // Audio captured 0.4 s before delivery was played 0.4 s earlier in the track.
+        XCTAssertEqual(manager.currentWhisperChunkStartPos ?? -1, 49.6, accuracy: 0.1)
+        XCTAssertEqual(manager.vocalEnvelope.segments.first?.start ?? -1, 49.6, accuracy: 0.1)
+    }
+
+    @MainActor
+    func testAlignedWordsFollowTheCapturedVocalWaveform() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let words = ["Hello", "world", "from", "test"].enumerated().map {
+            RecognizedAudioWord(text: $0.element, startTime: 10.0 + Double($0.offset) * 0.3, duration: 0.2, confidence: 0.9)
+        } + ["Second", "line", "of", "lyrics"].enumerated().map {
+            RecognizedAudioWord(text: $0.element, startTime: 15.0 + Double($0.offset) * 0.3, duration: 0.2, confidence: 0.9)
+        }
+        let feed = LockedBox<[[RecognizedAudioWord]]>([words])
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            runWhisperChunk: { _ in feed.withLock { $0.isEmpty ? [] : $0.removeFirst() } },
+            whisperChunkDurationSeconds: 6.0
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // One 6 s chunk: a note sung from 10 s to 12 s, then 4 s of silence.
+        let rate = 16000
+        let note = (0..<(2 * rate)).map { 0.5 * sin(2 * Float.pi * 440 * Float($0) / Float(rate)) }
+        let audio = note + [Float](repeating: 0, count: 4 * rate)
+        for second in 0..<6 {
+            fakeCapture.emit(samples: Array(audio[(second * rate)..<((second + 1) * rate)]), sampleRate: Double(rate))
+        }
+        let saved = await waitUntil(timeout: 5) { cache.load(trackId: self.sampleTrack().id) != nil }
+        XCTAssertTrue(saved)
+
+        let record = try XCTUnwrap(cache.load(trackId: sampleTrack().id))
+        let last = try XCTUnwrap(record.lines.first?.words.last)
+        XCTAssertEqual(last.timestamp + (last.duration ?? 0), 12.0, accuracy: 0.05, "the last word holds the note to its end")
+        XCTAssertEqual(record.alignedLineCount, 1, "the line heard in silence is not aligned")
+    }
+
+    func testPlaybackPositionAtCaptureTimeFollowsRate() {
+        XCTAssertEqual(AudioSyncManager.playbackPosition(20, capturedAt: 9.5, now: 10, rate: 2), 19, accuracy: 1e-9)
+        XCTAssertEqual(AudioSyncManager.playbackPosition(20, capturedAt: 9.5, now: 10, rate: 0), 20, accuracy: 1e-9)
+    }
+
+    func testCaptureDelayRejectsImplausibleTimestamps() {
+        XCTAssertEqual(AudioSampleExtractor.captureDelay(presentation: 99.88, hostNow: 100) ?? -1, 0.12, accuracy: 1e-9)
+        XCTAssertNil(AudioSampleExtractor.captureDelay(presentation: 101, hostNow: 100))
+        XCTAssertNil(AudioSampleExtractor.captureDelay(presentation: 3, hostNow: 100))
+    }
+
+    func testMidSideSplitsStereoAndPassesMonoThrough() {
+        let stereo = AudioSampleExtractor.midSide(channels: [[1, 0.5], [0, 0.5]])
+        XCTAssertEqual(stereo.mid, [0.5, 0.5])
+        XCTAssertEqual(stereo.side, [0.5, 0])
+        let mono = AudioSampleExtractor.midSide(channels: [[0.3, 0.2]])
+        XCTAssertEqual(mono.mid, [0.3, 0.2])
+        XCTAssertEqual(mono.side, [])
+        XCTAssertEqual(AudioSampleExtractor.deinterleave([1, 2, 3, 4, 5, 6], channelCount: 2), [[1, 3, 5], [2, 4, 6]])
+    }
+
+    @MainActor
     func testFailedRetargetCaptureTearsDownRecognitionSession() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .whisper
@@ -1842,7 +1929,7 @@ final class AudioSyncManagerTests: XCTestCase {
 }
 
 private final class FakeAudioCapture: AudioCaptureProviding {
-    var onAudioSamples: (([Float], Double) -> Void)?
+    var onAudioSamples: ((CapturedAudio) -> Void)?
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []
@@ -1865,8 +1952,8 @@ private final class FakeAudioCapture: AudioCaptureProviding {
         calls.append("stop")
     }
 
-    func emit(samples: [Float], sampleRate: Double) {
-        onAudioSamples?(samples, sampleRate)
+    func emit(samples: [Float], sampleRate: Double, side: [Float] = [], captureDelay: Double? = nil) {
+        onAudioSamples?(CapturedAudio(samples: samples, side: side, sampleRate: sampleRate, captureDelay: captureDelay))
     }
 }
 
