@@ -98,7 +98,29 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
+# macOS ties permission grants to the signing certificate (or, ad hoc, to the
+# exact binary), so keep the certificate the installed app already carries.
+installed_cert_sha1() {
+    local dir hash=""
+    dir="$(mktemp -d)"
+    ( cd "$dir" && codesign -d --extract-certificates "/Applications/$APP_NAME.app" >/dev/null 2>&1 ) || true
+    if [[ -f "$dir/codesign0" ]]; then
+        hash="$(openssl x509 -inform DER -in "$dir/codesign0" -noout -fingerprint -sha1 2>/dev/null \
+            | sed 's/^.*=//' | tr -d ':' | tr '[:lower:]' '[:upper:]' || true)"
+    fi
+    rm -rf "$dir"
+    printf '%s' "$hash"
+}
+
 SIGN_IDENTITY="${BARTUNE_SIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+    CARRIED_SHA1="$(installed_cert_sha1)"
+    if [[ -n "$CARRIED_SHA1" ]] && security find-identity -v -p codesigning 2>/dev/null \
+        | awk '{ print toupper($2) }' | grep -qx "$CARRIED_SHA1"; then
+        SIGN_IDENTITY="$CARRIED_SHA1"
+        echo "==> Keeping the certificate /Applications/$APP_NAME.app is signed with"
+    fi
+fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
     SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
         | sed -n 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' | head -n 1 || true)"
@@ -109,6 +131,7 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
 fi
 if [[ -z "$SIGN_IDENTITY" ]]; then
     SIGN_IDENTITY="-"
+    echo "==> WARNING: no codesigning certificate found; ad-hoc signing. macOS will ask for permissions again after every rebuild."
 fi
 
 echo "==> Signing $APP_BUNDLE with identity: $SIGN_IDENTITY"
