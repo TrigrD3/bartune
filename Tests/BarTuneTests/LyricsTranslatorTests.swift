@@ -169,6 +169,107 @@ final class LyricsTranslatorTests: XCTestCase {
         XCTAssertEqual(diskCache.load(trackId: cacheKey)?.count, 26)
     }
 
+    @MainActor
+    func testFailedBatchLinesKeepWordTimingOnScreen() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BarTuneTranslatorWordTimingTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // The first batch (25 lines) translates; the second batch (1 line) fails.
+        let translator = LyricsTranslator(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first { $0.name == "q" }?.value ?? ""
+            let inputLines = query.components(separatedBy: "\n")
+            guard inputLines.count > 1 else {
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil))
+                return (Data(), response)
+            }
+            let escaped = inputLines.map { "EN:\($0)" }.joined(separator: "\\n")
+            let json = #"[[["\#(escaped)","src",null,null,10]],null,"es"]"#
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+            return (Data(json.utf8), response)
+        }
+        let source = (0..<26).map { index in
+            LyricLine(
+                id: index,
+                timestamp: Double(index),
+                duration: 1.0,
+                text: "linea \(index)",
+                words: [
+                    WordTimestamp(timestamp: Double(index), duration: 0.5, text: "linea "),
+                    WordTimestamp(timestamp: Double(index) + 0.5, duration: 0.5, text: "\(index)"),
+                ]
+            )
+        }
+        let track = TrackInfo(id: "spotify:track:word-timing", title: "Song", artist: "Artist", album: "", duration: 26, artworkURL: nil)
+        let state = LyricsState(userDefaults: defaults)
+        state.setTrack(track, lyrics: source)
+        state.translateLyrics = true
+
+        let translated = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        XCTAssertTrue(state.setTranslatedLines(translated, sourceLines: source))
+
+        state.updatePlayback(isPlaying: true, position: 0.2)
+        XCTAssertEqual(state.activeLine?.text, "EN:linea 0")
+        state.updatePlayback(isPlaying: true, position: 25.2)
+        XCTAssertEqual(state.activeLine?.text, "linea 25")
+        XCTAssertEqual(state.activeLine?.words, source.last?.words, "A line shown untranslated must keep its word cues")
+    }
+
+    @MainActor
+    func testFailedTranslationOfJapaneseSongShowsSourceLinesNotRomaji() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BarTuneTranslatorJapaneseFallbackTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        // Every batch fails, so the translator hands back the source lines unchanged.
+        let translator = LyricsTranslator(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+        let source = [
+            LyricLine(
+                id: 0,
+                timestamp: 0,
+                duration: 2,
+                text: "こんにちは世界",
+                words: [
+                    WordTimestamp(timestamp: 0, duration: 1, text: "こんにちは"),
+                    WordTimestamp(timestamp: 1, duration: 1, text: "世界"),
+                ]
+            ),
+            LyricLine(id: 1, timestamp: 2, duration: 2, text: "ありがとう"),
+        ]
+        let track = TrackInfo(id: "spotify:track:japanese-fallback", title: "Song", artist: "Artist", album: "", duration: 4, artworkURL: nil)
+        let state = LyricsState(userDefaults: defaults)
+        state.romanizeJapanese = true
+        state.setTrack(track, lyrics: source)
+        state.translateLyrics = true
+
+        let translated = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        XCTAssertEqual(translated, source)
+        XCTAssertTrue(state.setTranslatedLines(translated, sourceLines: source))
+
+        state.updatePlayback(isPlaying: true, position: 0.5)
+        XCTAssertEqual(state.activeLine?.text, "こんにちは世界", "A failed translation must fall back to the source lines")
+        XCTAssertEqual(state.activeLine?.words, source[0].words)
+
+        // Audio sync shifts the source timing; the fallback must survive it.
+        state.applyAudioSyncedLines(source.map {
+            LyricLine(id: $0.id, timestamp: $0.timestamp + 0.5, duration: $0.duration, text: $0.text, words: $0.words)
+        })
+        state.updatePlayback(isPlaying: true, position: 2.7)
+        XCTAssertEqual(state.activeLine?.text, "ありがとう")
+    }
+
     func testCacheReusesTranslationOnlyForMatchingSourceText() async {
         final class StubState: @unchecked Sendable {
             private let lock = NSLock()
