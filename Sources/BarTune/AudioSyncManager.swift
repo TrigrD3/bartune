@@ -127,7 +127,116 @@ enum AudioSampleExtractor {
     }
 }
 
-private final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding, @unchecked Sendable {
+enum SystemAudioCaptureError: LocalizedError, Equatable {
+    case noDisplayAvailable
+    case unresolvedPlayer
+
+    var errorDescription: String? {
+        switch self {
+        case .noDisplayAvailable:
+            return "No display available for system audio capture."
+        case .unresolvedPlayer:
+            return "Could not find the active media player for isolated audio capture."
+        }
+    }
+}
+
+struct CaptureApplication: @unchecked Sendable {
+    let bundleIdentifier: String
+    fileprivate let scApplication: SCRunningApplication?
+
+    init(bundleIdentifier: String, scApplication: SCRunningApplication? = nil) {
+        self.bundleIdentifier = bundleIdentifier
+        self.scApplication = scApplication
+    }
+}
+
+struct CaptureDisplay: @unchecked Sendable {
+    fileprivate let scDisplay: SCDisplay?
+
+    init(scDisplay: SCDisplay? = nil) {
+        self.scDisplay = scDisplay
+    }
+}
+
+struct CaptureShareableSnapshot: Sendable {
+    let displays: [CaptureDisplay]
+    let applications: [CaptureApplication]
+}
+
+protocol SystemAudioStreamControlling: AnyObject, Sendable {
+    func stopCapture() async
+}
+
+protocol SystemAudioCaptureBackend: Sendable {
+    func fetchShareableContent() async throws -> CaptureShareableSnapshot
+    @MainActor
+    func startStream(
+        display: CaptureDisplay,
+        includedApplications: [CaptureApplication],
+        output: SCStreamOutput,
+        audioQueue: DispatchQueue
+    ) async throws -> SystemAudioStreamControlling
+}
+
+private final class LiveSCStreamHandle: SystemAudioStreamControlling, @unchecked Sendable {
+    private let stream: SCStream
+
+    init(stream: SCStream) {
+        self.stream = stream
+    }
+
+    func stopCapture() async {
+        try? await stream.stopCapture()
+    }
+}
+
+private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
+    func fetchShareableContent() async throws -> CaptureShareableSnapshot {
+        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
+        return CaptureShareableSnapshot(
+            displays: content.displays.map { CaptureDisplay(scDisplay: $0) },
+            applications: content.applications.map {
+                CaptureApplication(bundleIdentifier: $0.bundleIdentifier, scApplication: $0)
+            }
+        )
+    }
+
+    @MainActor
+    func startStream(
+        display: CaptureDisplay,
+        includedApplications: [CaptureApplication],
+        output: SCStreamOutput,
+        audioQueue: DispatchQueue
+    ) async throws -> SystemAudioStreamControlling {
+        guard let scDisplay = display.scDisplay else {
+            throw SystemAudioCaptureError.noDisplayAvailable
+        }
+        let scApps = includedApplications.compactMap(\.scApplication)
+        guard !scApps.isEmpty else {
+            throw SystemAudioCaptureError.unresolvedPlayer
+        }
+
+        let scFilter = SCContentFilter(display: scDisplay, including: scApps, exceptingWindows: [])
+
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 16000
+        config.channelCount = 1
+        // Minimal video footprint since we only consume audio buffers.
+        config.width = 2
+        config.height = 2
+        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+        let newStream = SCStream(filter: scFilter, configuration: config, delegate: nil)
+        try newStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: audioQueue)
+        try await newStream.startCapture()
+        return LiveSCStreamHandle(stream: newStream)
+    }
+}
+
+final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding, @unchecked Sendable {
     private let callbackLock = NSLock()
     private var _onAudioSamples: (([Float], Double) -> Void)?
     var onAudioSamples: (([Float], Double) -> Void)? {
@@ -143,22 +252,22 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCapturePr
         }
     }
 
-    @MainActor private var stream: SCStream?
-    @MainActor private var activeTargetBundleIds: Set<String> = []
-    @MainActor private var launchObserver: NSObjectProtocol?
+    private let backend: SystemAudioCaptureBackend
+    @MainActor private var stream: SystemAudioStreamControlling?
     @MainActor private var sessionID: UInt64 = 0
     private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
 
-    private static func makeContentFilter(
-        content: SCShareableContent,
-        display: SCDisplay,
+    init(backend: SystemAudioCaptureBackend = LiveSystemAudioCaptureBackend()) {
+        self.backend = backend
+        super.init()
+    }
+
+    static func resolveTargetApplications(
+        in snapshot: CaptureShareableSnapshot,
         targetBundleIds: Set<String>
-    ) -> SCContentFilter {
-        if !targetBundleIds.isEmpty {
-            let excludedApps = content.applications.filter { !targetBundleIds.contains($0.bundleIdentifier) }
-            return SCContentFilter(display: display, excludingApplications: excludedApps, exceptingWindows: [])
-        }
-        return SCContentFilter(display: display, excludingWindows: [])
+    ) -> [CaptureApplication] {
+        guard !targetBundleIds.isEmpty else { return [] }
+        return snapshot.applications.filter { targetBundleIds.contains($0.bundleIdentifier) }
     }
 
     @MainActor
@@ -167,80 +276,43 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCapturePr
         sessionID &+= 1
         let currentSession = sessionID
 
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard sessionID == currentSession else { return }
-        guard let display = content.displays.first else {
-            throw NSError(domain: "BarTune.AudioCapture", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "No display available for system audio capture.",
-            ])
+        guard !targetBundleIds.isEmpty else {
+            throw SystemAudioCaptureError.unresolvedPlayer
         }
 
-        let filter = Self.makeContentFilter(content: content, display: display, targetBundleIds: targetBundleIds)
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 16000
-        config.channelCount = 1
-        // Minimal video footprint since we only consume audio buffers.
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        let content = try await backend.fetchShareableContent()
+        guard sessionID == currentSession else { return }
+        guard let display = content.displays.first else {
+            throw SystemAudioCaptureError.noDisplayAvailable
+        }
 
-        let newStream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try newStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: audioQueue)
-        try await newStream.startCapture()
+        let includedApps = Self.resolveTargetApplications(in: content, targetBundleIds: targetBundleIds)
+        guard !includedApps.isEmpty else {
+            throw SystemAudioCaptureError.unresolvedPlayer
+        }
+
+        let newStream = try await backend.startStream(
+            display: display,
+            includedApplications: includedApps,
+            output: self,
+            audioQueue: audioQueue
+        )
 
         guard sessionID == currentSession else {
-            try? await newStream.stopCapture()
+            await newStream.stopCapture()
             return
         }
 
         stream = newStream
-        activeTargetBundleIds = targetBundleIds
-
-        if !targetBundleIds.isEmpty {
-            launchObserver = NSWorkspace.shared.notificationCenter.addObserver(
-                forName: NSWorkspace.didLaunchApplicationNotification,
-                object: nil,
-                queue: .main
-            ) { [weak self] notification in
-                let launchedBundleId = (notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?
-                    .bundleIdentifier
-                Task { @MainActor [weak self] in
-                    guard let self, self.sessionID == currentSession, let activeStream = self.stream else { return }
-                    if let bundleId = launchedBundleId, self.activeTargetBundleIds.contains(bundleId) {
-                        return
-                    }
-                    let targets = self.activeTargetBundleIds
-                    guard let updated = try? await SCShareableContent.excludingDesktopWindows(
-                        false,
-                        onScreenWindowsOnly: false
-                    ), self.sessionID == currentSession, self.stream === activeStream,
-                        let updatedDisplay = updated.displays.first
-                    else { return }
-                    let updatedFilter = Self.makeContentFilter(
-                        content: updated,
-                        display: updatedDisplay,
-                        targetBundleIds: targets
-                    )
-                    try? await activeStream.updateContentFilter(updatedFilter)
-                }
-            }
-        }
     }
 
     @MainActor
     func stop() {
         sessionID &+= 1
-        if let observer = launchObserver {
-            NSWorkspace.shared.notificationCenter.removeObserver(observer)
-            launchObserver = nil
-        }
-        activeTargetBundleIds = []
         guard let activeStream = stream else { return }
         stream = nil
         Task {
-            try? await activeStream.stopCapture()
+            await activeStream.stopCapture()
         }
     }
 
@@ -532,6 +604,10 @@ final class AudioSyncManager {
     }
 
     private func startLiveSync(for track: TrackInfo, lines: [LyricLine], engine: AudioSyncEngine) {
+        guard !Self.targetBundleIdentifiers(for: track).isEmpty else {
+            state.audioSyncStatus = .unavailable("Could not identify media player for audio capture")
+            return
+        }
         guard dependencies.hasScreenCaptureAccess() else {
             dependencies.requestScreenCaptureAccess()
             state.audioSyncStatus = .permissionRequired("Screen & System Audio Recording permission required")
@@ -545,6 +621,16 @@ final class AudioSyncManager {
             startAppleSpeechSync(track: track, lines: lines)
         case .whisper:
             startWhisperSync(track: track, lines: lines)
+        }
+    }
+
+    private func handleCaptureStartFailure(_ error: Error, generation: UInt64) {
+        guard syncGeneration == generation else { return }
+        stop()
+        if let captureError = error as? SystemAudioCaptureError, captureError == .unresolvedPlayer {
+            state.audioSyncStatus = .unavailable(captureError.localizedDescription)
+        } else {
+            state.audioSyncStatus = .permissionRequired("Audio capture failed: \(error.localizedDescription)")
         }
     }
 
@@ -694,9 +780,7 @@ final class AudioSyncManager {
             do {
                 try await self.capture.start(targetBundleIds: targetBundles)
             } catch {
-                guard self.syncGeneration == generation else { return }
-                self.isLiveSyncActive = false
-                self.state.audioSyncStatus = .permissionRequired("Audio capture failed: \(error.localizedDescription)")
+                self.handleCaptureStartFailure(error, generation: generation)
             }
         }
     }
@@ -790,9 +874,7 @@ final class AudioSyncManager {
             do {
                 try await self.capture.start(targetBundleIds: targetBundles)
             } catch {
-                guard self.syncGeneration == generation else { return }
-                self.isLiveSyncActive = false
-                self.state.audioSyncStatus = .permissionRequired("Audio capture failed: \(error.localizedDescription)")
+                self.handleCaptureStartFailure(error, generation: generation)
             }
         }
     }

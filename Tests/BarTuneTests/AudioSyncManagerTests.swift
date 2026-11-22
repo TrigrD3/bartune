@@ -2,6 +2,7 @@ import AVFoundation
 @testable import BarTune
 import CoreMedia
 import Foundation
+import ScreenCaptureKit
 import Speech
 import XCTest
 
@@ -947,6 +948,92 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertNil(cache.load(trackId: track.id))
     }
 
+    // MARK: - #112: Include-only audio capture isolation & unresolved player handling
+
+    @MainActor
+    func testSystemAudioCaptureExcludesNonPlayerLaunchedDuringStartup() async throws {
+        let backend = FakeSystemAudioCaptureBackend(initialApps: ["com.spotify.client", "com.apple.Finder"])
+        backend.onStartStream = {
+            // Simulate a non-player app launching mid-startup while capture starts.
+            backend.launchApp(bundleId: "us.zoom.xos")
+        }
+
+        let capture = SystemAudioCapture(backend: backend)
+        try await capture.start(targetBundleIds: ["com.spotify.client"])
+
+        XCTAssertEqual(backend.startedStreams.count, 1)
+        let activeStream = try XCTUnwrap(backend.startedStreams.last)
+        XCTAssertEqual(activeStream.capturedBundleIds, ["com.spotify.client"])
+        XCTAssertFalse(activeStream.capturedBundleIds.contains("us.zoom.xos"))
+    }
+
+    @MainActor
+    func testSystemAudioCaptureLeavesCaptureStoppedWhenPlayerUnresolved() async {
+        let backend = FakeSystemAudioCaptureBackend(initialApps: ["com.apple.Finder", "com.apple.Safari"])
+        let capture = SystemAudioCapture(backend: backend)
+
+        // Player absent from shareable content: must leave capture stopped and throw.
+        do {
+            try await capture.start(targetBundleIds: ["com.spotify.client"])
+            XCTFail("Expected unresolvedPlayer error when target app is not running")
+        } catch let error as SystemAudioCaptureError {
+            XCTAssertEqual(error, .unresolvedPlayer)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertTrue(backend.startedStreams.isEmpty)
+
+        // Empty target bundle IDs: must leave capture stopped without falling back to all-display capture.
+        do {
+            try await capture.start(targetBundleIds: [])
+            XCTFail("Expected unresolvedPlayer error for empty targetBundleIds")
+        } catch let error as SystemAudioCaptureError {
+            XCTAssertEqual(error, .unresolvedPlayer)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertTrue(backend.startedStreams.isEmpty)
+
+        // AudioSyncManager with an unresolved track prefix must not start capture or recognition.
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: capture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let unknownTrack = TrackInfo(
+            id: "unknown:track:1",
+            title: "Unknown",
+            artist: "Artist",
+            album: "",
+            duration: 180,
+            artworkURL: nil
+        )
+        manager.handleTrackLoaded(track: unknownTrack, rawLines: sampleLines())
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertTrue(backend.startedStreams.isEmpty)
+        XCTAssertTrue(recognizer.startedRequests.isEmpty)
+        if case .unavailable = state.audioSyncStatus {
+            // Expected
+        } else {
+            XCTFail("Expected .unavailable status for unresolved player, got \(state.audioSyncStatus)")
+        }
+
+        // AudioSyncManager with Spotify track when Spotify isn't running must tear down live sync and stop capture.
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let settled = await waitUntil {
+            if case .unavailable = state.audioSyncStatus { return !manager.isLiveSyncActive }
+            return false
+        }
+        XCTAssertTrue(settled)
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertTrue(backend.startedStreams.isEmpty)
+        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
+    }
+
     // MARK: - Helpers
 
     @MainActor
@@ -1073,6 +1160,59 @@ private final class FakeWhisperEngine: WhisperTranscribing, @unchecked Sendable 
 
     func shutdown() {
         shutdowns.withLock { $0 += 1 }
+    }
+}
+
+private final class FakeSystemAudioStream: SystemAudioStreamControlling, @unchecked Sendable {
+    let capturedBundleIds: Set<String>
+    private let stopCounter = LockedBox<Int>(0)
+
+    var stopCount: Int { stopCounter.withLock { $0 } }
+
+    init(includedApplications: [CaptureApplication]) {
+        capturedBundleIds = Set(includedApplications.map(\.bundleIdentifier))
+    }
+
+    func stopCapture() async {
+        await Task.yield()
+        stopCounter.withLock { $0 += 1 }
+    }
+}
+
+private final class FakeSystemAudioCaptureBackend: SystemAudioCaptureBackend, @unchecked Sendable {
+    private let stateBox: LockedBox<(runningApps: Set<String>, streams: [FakeSystemAudioStream])>
+    var onStartStream: (() -> Void)?
+
+    var startedStreams: [FakeSystemAudioStream] {
+        stateBox.withLock { $0.streams }
+    }
+
+    init(initialApps: [String]) {
+        stateBox = LockedBox((Set(initialApps), []))
+    }
+
+    func launchApp(bundleId: String) {
+        stateBox.withLock { _ = $0.runningApps.insert(bundleId) }
+    }
+
+    func fetchShareableContent() async -> CaptureShareableSnapshot {
+        await Task.yield()
+        let apps = stateBox.withLock { $0.runningApps.sorted().map { CaptureApplication(bundleIdentifier: $0) } }
+        return CaptureShareableSnapshot(displays: [CaptureDisplay()], applications: apps)
+    }
+
+    @MainActor
+    func startStream(
+        display: CaptureDisplay,
+        includedApplications: [CaptureApplication],
+        output: SCStreamOutput,
+        audioQueue: DispatchQueue
+    ) async -> SystemAudioStreamControlling {
+        await Task.yield()
+        onStartStream?()
+        let stream = FakeSystemAudioStream(includedApplications: includedApplications)
+        stateBox.withLock { $0.streams.append(stream) }
+        return stream
     }
 }
 
