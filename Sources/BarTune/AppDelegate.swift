@@ -3,13 +3,13 @@ import Combine
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let state = LyricsState()
-    private let spotifyMonitor = SpotifyMonitor()
-    private let lyricsFetcher = LyricsFetcher()
-    private let lyricsTranslator = LyricsTranslator()
-    private let colorExtractor = AlbumArtColorExtractor()
+    private let state: LyricsState
+    private let spotifyMonitor: SpotifyMonitor
+    private let lyricsFetcher: LyricsFetcher
+    private let lyricsTranslator: LyricsTranslator
+    private let colorExtractor: AlbumArtColorExtractor
     private let appUpdater = AppUpdaterModel()
-    private lazy var audioSyncManager = AudioSyncManager(state: state)
+    private let audioSyncManager: AudioSyncManager
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
     private var lastLoadedTrack: TrackInfo?
@@ -27,6 +27,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var colorTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
 
+    init(
+        state: LyricsState? = nil,
+        spotifyMonitor: SpotifyMonitor? = nil,
+        lyricsFetcher: LyricsFetcher = LyricsFetcher(),
+        lyricsTranslator: LyricsTranslator = LyricsTranslator(),
+        colorExtractor: AlbumArtColorExtractor = AlbumArtColorExtractor(),
+        audioSyncManager: AudioSyncManager? = nil
+    ) {
+        let resolvedState = state ?? LyricsState()
+        self.state = resolvedState
+        self.spotifyMonitor = spotifyMonitor ?? SpotifyMonitor()
+        self.lyricsFetcher = lyricsFetcher
+        self.lyricsTranslator = lyricsTranslator
+        self.colorExtractor = colorExtractor
+        self.audioSyncManager = audioSyncManager ?? AudioSyncManager(state: resolvedState)
+        super.init()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         URLCache.shared = URLCache(memoryCapacity: 2 * 1024 * 1024, diskCapacity: 10 * 1024 * 1024)
         NSApp.setActivationPolicy(.accessory)
@@ -39,6 +57,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             appUpdater: appUpdater
         )
 
+        startPlaybackMonitoring()
+    }
+
+    func startPlaybackMonitoring() {
+        cancellables.removeAll()
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
         }
@@ -58,7 +81,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.$browserMusicEnabled
             .receive(on: RunLoop.main)
             .sink { [weak self] enabled in
-                self?.spotifyMonitor.setBrowserMusicEnabled(enabled)
+                guard let self else { return }
+                self.spotifyMonitor.setBrowserMusicEnabled(enabled)
+                if !enabled, self.lastFetchedTrackId?.hasPrefix("browser:") == true {
+                    self.clearActivePlayback()
+                }
             }
             .store(in: &cancellables)
 
@@ -142,6 +169,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopPlaybackMonitoring()
+    }
+
+    func stopPlaybackMonitoring() {
+        cancellables.removeAll()
         audioSyncManager.stop()
         spotifyMonitor.stop()
         fetchTask?.cancel()
@@ -236,19 +268,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func handlePlaybackUpdate(_ snapshot: PlaybackSnapshot) {
-        guard snapshot.isRunning, let track = snapshot.track else {
-            if lastFetchedTrackId != nil {
-                lastFetchedTrackId = nil
-                lastLoadedTrack = nil
-                fetchTask?.cancel()
-                translateTask?.cancel()
-                colorTask?.cancel()
-                audioSyncManager.stop()
-                state.audioSyncStatus = .idle
-                state.setTrack(nil, lyrics: [])
-            }
-            state.updatePlayback(isPlaying: false, position: 0)
+    func waitForPendingFetch() async {
+        await fetchTask?.value
+    }
+
+    private func clearActivePlayback() {
+        if lastFetchedTrackId != nil {
+            lastFetchedTrackId = nil
+            lastLoadedTrack = nil
+            fetchTask?.cancel()
+            translateTask?.cancel()
+            colorTask?.cancel()
+            audioSyncManager.stop()
+            state.audioSyncStatus = .idle
+            state.setTrack(nil, lyrics: [])
+        }
+        state.updatePlayback(isPlaying: false, position: 0)
+    }
+
+    func handlePlaybackUpdate(_ snapshot: PlaybackSnapshot) {
+        let activeTrack = snapshot.track.flatMap { track in
+            (track.id.hasPrefix("browser:") && !state.browserMusicEnabled) ? nil : track
+        }
+        guard snapshot.isRunning, let track = activeTrack else {
+            clearActivePlayback()
             return
         }
 
@@ -265,7 +308,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fetchTask = Task { [weak self] in
                 guard let self else { return }
                 let lyrics = await self.lyricsFetcher.fetchLyrics(for: track)
-                guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
+                guard !Task.isCancelled,
+                      self.lastFetchedTrackId == track.id,
+                      !(track.id.hasPrefix("browser:") && !self.state.browserMusicEnabled)
+                else { return }
                 self.state.setTrack(track, lyrics: lyrics)
                 self.audioSyncManager.handleTrackLoaded(track: track, rawLines: lyrics)
                 if self.state.translateLyrics, !lyrics.isEmpty {
@@ -276,7 +322,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             colorTask = Task { [weak self] in
                 guard let self else { return }
                 let colors = await self.colorExtractor.extractColors(from: track.artworkURL)
-                guard !Task.isCancelled, self.lastFetchedTrackId == track.id else { return }
+                guard !Task.isCancelled,
+                      self.lastFetchedTrackId == track.id
+                else { return }
                 self.state.albumColors = colors
             }
         }
@@ -314,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             guard !Task.isCancelled,
                   self.lastFetchedTrackId == trackId,
-                  self.state.translationLanguage == targetLang
+                  self.state.translationLanguage == targetLang,
+                  !(trackId.hasPrefix("browser:") && !self.state.browserMusicEnabled)
             else { return }
             guard self.state.setTranslatedLines(translated, sourceLines: lines) else {
                 self.translateCurrentTrack()

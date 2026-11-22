@@ -40,8 +40,38 @@ struct PlaybackSnapshot {
 
 @MainActor
 final class SpotifyMonitor {
+    struct Dependencies: Sendable {
+        var runningBundleIds: @Sendable () -> Set<String>
+        var executeNativeScript: @Sendable () -> String?
+        var pollBrowser: @Sendable (Set<String>, Bool) -> PlaybackSnapshot?
+        var executeTransportScript: @Sendable (String) -> Void
+
+        static func live() -> Dependencies {
+            let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
+            let browserMonitor = BrowserMediaMonitor()
+            return Dependencies(
+                runningBundleIds: {
+                    Set(NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier))
+                },
+                executeNativeScript: {
+                    spotifyScript.execute()
+                },
+                pollBrowser: { runningBundleIds, includeYouTubeVideos in
+                    browserMonitor.poll(runningBundleIds: runningBundleIds, includeYouTubeVideos: includeYouTubeVideos)
+                },
+                executeTransportScript: { source in
+                    if let script = NSAppleScript(source: source) {
+                        var error: NSDictionary?
+                        script.executeAndReturnError(&error)
+                    }
+                }
+            )
+        }
+    }
+
     var onUpdate: ((PlaybackSnapshot) -> Void)?
 
+    private let dependencies: Dependencies
     private var pollTimer: Timer?
     private var interpolationTimer: Timer?
     private var lastSnapshot: PlaybackSnapshot?
@@ -50,15 +80,19 @@ final class SpotifyMonitor {
     private var browserMusicEnabled: Bool = true
     private var browserYouTubeVideosEnabled: Bool = false
     private var isStarted: Bool = false
-    private var isPolling: Bool = false
+    private var browserPollGeneration: UInt64 = 0
+    private var pollSequence: UInt64 = 0
+    private var activePollToken: UInt64?
+    private var needsFollowUpPoll: Bool = false
     private var consecutiveIdlePolls: Int = 0
-    private let browserMonitor = BrowserMediaMonitor()
     private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
+
+    var isPolling: Bool { activePollToken != nil }
 
     private var spotifyObserver: NSObjectProtocol?
     private var musicObserver: NSObjectProtocol?
 
-    private static let spotifyBlock = """
+    private nonisolated static let spotifyBlock = """
     if application "Spotify" is running then
         tell application "Spotify"
             set pState to player state as string
@@ -79,7 +113,7 @@ final class SpotifyMonitor {
     end if
     """
 
-    private static let musicBlock = """
+    private nonisolated static let musicBlock = """
     if application "Music" is running then
         tell application "Music"
             set pState to player state as string
@@ -102,11 +136,11 @@ final class SpotifyMonitor {
         return (["set sep to character id 31"] + blocks + ["return \"IDLE\""]).joined(separator: "\n")
     }
 
-    private static let scriptSource = nativePlayerScriptSource(playerBlocks: [spotifyBlock, musicBlock])
+    private nonisolated static let scriptSource = nativePlayerScriptSource(playerBlocks: [spotifyBlock, musicBlock])
 
-    private let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
-
-    init() {}
+    init(dependencies: Dependencies = .live()) {
+        self.dependencies = dependencies
+    }
 
     func setLowCPUMode(_ enabled: Bool) {
         guard lowCPUMode != enabled else { return }
@@ -119,6 +153,19 @@ final class SpotifyMonitor {
     func setBrowserMusicEnabled(_ enabled: Bool) {
         guard browserMusicEnabled != enabled else { return }
         browserMusicEnabled = enabled
+        if !enabled {
+            browserPollGeneration &+= 1
+            if lastSnapshot?.track?.id.hasPrefix("browser:") == true {
+                let idleSnapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
+                lastSnapshot = idleSnapshot
+                lastPollDate = .now
+                if isStarted {
+                    updatePollTimer(isPlaying: false)
+                }
+                updateInterpolationTimer(isPlaying: false)
+                onUpdate?(idleSnapshot)
+            }
+        }
         if isStarted {
             poll()
         }
@@ -140,9 +187,7 @@ final class SpotifyMonitor {
     }
 
     func sendCommand(_ command: PlaybackCommand) {
-        let runningBundleIds = Set(
-            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        )
+        let runningBundleIds = dependencies.runningBundleIds()
         let activeTrackId = lastSnapshot?.track?.id ?? ""
 
         let scriptSource = Self.transportScriptSource(
@@ -150,11 +195,11 @@ final class SpotifyMonitor {
             activeTrackId: activeTrackId,
             runningBundleIds: runningBundleIds
         )
+        let executeTransportScript = dependencies.executeTransportScript
 
         scriptQueue.async { [weak self] in
-            if let source = scriptSource, let script = NSAppleScript(source: source) {
-                var error: NSDictionary?
-                script.executeAndReturnError(&error)
+            if let source = scriptSource {
+                executeTransportScript(source)
             }
 
             Task { @MainActor [weak self] in
@@ -219,6 +264,10 @@ final class SpotifyMonitor {
 
     func stop() {
         isStarted = false
+        activePollToken = nil
+        needsFollowUpPoll = false
+        browserPollGeneration &+= 1
+        lastSnapshot = nil
         pollTimer?.invalidate()
         pollTimer = nil
         interpolationTimer?.invalidate()
@@ -283,21 +332,27 @@ final class SpotifyMonitor {
         }
     }
 
-    private func poll() {
-        guard !isPolling else { return }
-        isPolling = true
+    func poll() {
+        guard activePollToken == nil else {
+            if isStarted {
+                needsFollowUpPoll = true
+            }
+            return
+        }
+        pollSequence &+= 1
+        let token = pollSequence
+        activePollToken = token
         let allowBrowser = browserMusicEnabled
         let includeYouTubeVideos = browserYouTubeVideosEnabled
-        let runningBundleIds = Set(
-            NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
-        )
+        let requestBrowserGeneration = browserPollGeneration
+        let runningBundleIds = dependencies.runningBundleIds()
         let hasNativePlayer = !runningBundleIds.isDisjoint(with: Self.nativePlayerBundleIds)
-        let browserMonitor = self.browserMonitor
-        let spotifyScript = self.spotifyScript
+        let executeNativeScript = dependencies.executeNativeScript
+        let pollBrowser = dependencies.pollBrowser
 
         scriptQueue.async { [weak self] in
             let pollStart = Date()
-            let raw: String? = hasNativePlayer ? spotifyScript.execute() : "IDLE"
+            let raw: String? = hasNativePlayer ? executeNativeScript() : "IDLE"
             let pollEnd = Date()
             // Midpoint compensates for AppleScript round-trip execution latency (~40-80ms)
             let now = Date(timeIntervalSince1970: (pollStart.timeIntervalSince1970 + pollEnd.timeIntervalSince1970) / 2.0)
@@ -306,23 +361,31 @@ final class SpotifyMonitor {
             var browserNow = now
             if (raw == nil || raw == "IDLE") && allowBrowser {
                 let bStart = Date()
-                browserSnap = browserMonitor.poll(
-                    runningBundleIds: runningBundleIds,
-                    includeYouTubeVideos: includeYouTubeVideos
-                )
+                browserSnap = pollBrowser(runningBundleIds, includeYouTubeVideos)
                 let bEnd = Date()
                 browserNow = Date(timeIntervalSince1970: (bStart.timeIntervalSince1970 + bEnd.timeIntervalSince1970) / 2.0)
             }
 
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                defer { self.isPolling = false }
+                guard let self, self.activePollToken == token else { return }
+                self.activePollToken = nil
+                let shouldRepoll = self.needsFollowUpPoll
+                self.needsFollowUpPoll = false
                 let filteredBrowserSnap = Self.acceptedBrowserSnapshot(
                     browserSnap,
                     browserMusicEnabled: self.browserMusicEnabled,
                     includeYouTubeVideos: self.browserYouTubeVideosEnabled
                 )
-                self.handlePollResult(raw: raw, now: now, browserSnap: filteredBrowserSnap, browserNow: browserNow)
+                self.handlePollResult(
+                    raw: raw,
+                    now: now,
+                    browserSnap: filteredBrowserSnap,
+                    browserNow: browserNow,
+                    browserPollGeneration: requestBrowserGeneration
+                )
+                if shouldRepoll, self.isStarted {
+                    self.poll()
+                }
             }
         }
     }
@@ -341,21 +404,34 @@ final class SpotifyMonitor {
         return snapshot
     }
 
-    private func handlePollResult(raw: String?, now: Date, browserSnap: PlaybackSnapshot?, browserNow: Date) {
+    private func handlePollResult(
+        raw: String?,
+        now: Date,
+        browserSnap: PlaybackSnapshot?,
+        browserNow: Date,
+        browserPollGeneration: UInt64
+    ) {
         guard let raw, raw != "IDLE" else {
-            if let browserSnap {
-                lastSnapshot = browserSnap
+            let validBrowserSnap = (browserMusicEnabled && browserPollGeneration == self.browserPollGeneration)
+                ? browserSnap
+                : nil
+            if let validBrowserSnap {
+                lastSnapshot = validBrowserSnap
                 lastPollDate = browserNow
-                updatePollTimer(isPlaying: browserSnap.isPlaying)
-                updateInterpolationTimer(isPlaying: browserSnap.isPlaying)
-                onUpdate?(browserSnap)
+                if isStarted {
+                    updatePollTimer(isPlaying: validBrowserSnap.isPlaying)
+                    updateInterpolationTimer(isPlaying: validBrowserSnap.isPlaying)
+                }
+                onUpdate?(validBrowserSnap)
                 return
             }
             let snapshot = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
             lastSnapshot = snapshot
             lastPollDate = now
-            updatePollTimer(isPlaying: false)
-            updateInterpolationTimer(isPlaying: false)
+            if isStarted {
+                updatePollTimer(isPlaying: false)
+                updateInterpolationTimer(isPlaying: false)
+            }
             onUpdate?(snapshot)
             return
         }
@@ -392,13 +468,18 @@ final class SpotifyMonitor {
         )
         lastSnapshot = snapshot
         lastPollDate = now
-        updatePollTimer(isPlaying: isPlaying)
-        updateInterpolationTimer(isPlaying: isPlaying)
+        if isStarted {
+            updatePollTimer(isPlaying: isPlaying)
+            updateInterpolationTimer(isPlaying: isPlaying)
+        }
         onUpdate?(snapshot)
     }
 
     private func emitInterpolated() {
         guard let snap = lastSnapshot, snap.isPlaying, let track = snap.track else { return }
+        if track.id.hasPrefix("browser:") && !browserMusicEnabled {
+            return
+        }
         let elapsed = Date().timeIntervalSince(lastPollDate)
         let interpolated = PlaybackSnapshot(
             isRunning: snap.isRunning,
