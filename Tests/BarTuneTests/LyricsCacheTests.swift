@@ -73,6 +73,127 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertNotNil(cache.load(trackId: "track-3"))
     }
 
+    @MainActor
+    func testLowerCacheLimitWaitsForConfirmationBeforePersistingOrPruning() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(LyricsCacheLimit.unlimited.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
+        let state = LyricsState(userDefaults: defaults)
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+        for index in 0..<102 {
+            cache.save(trackId: "track-\(index)", lines: sample)
+        }
+        let allFiles = try Set(FileManager.default.contentsOfDirectory(atPath: tempDir.path))
+
+        await state.requestCacheLimit(.songs100, cache: cache)
+        XCTAssertEqual(state.pendingCacheLimit, CacheLimitChange(limit: .songs100, removalCount: 2))
+        XCTAssertEqual(state.lyricsCacheLimit, .unlimited, "The limit must not change before confirmation")
+        XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: tempDir.path)), allFiles)
+
+        state.cancelCacheLimitChange()
+        XCTAssertNil(state.pendingCacheLimit)
+        XCTAssertEqual(state.lyricsCacheLimit, .unlimited)
+        XCTAssertEqual(LyricsDiskCache.configuredMaxEntries(from: defaults), 0)
+        XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: tempDir.path)), allFiles)
+
+        await state.requestCacheLimit(.songs100, cache: cache)
+        let change = try XCTUnwrap(state.pendingCacheLimit)
+        await state.confirmCacheLimitChange(change, cache: cache)
+        XCTAssertNil(state.pendingCacheLimit)
+        XCTAssertEqual(state.lyricsCacheLimit, .songs100)
+        XCTAssertEqual(LyricsDiskCache.configuredMaxEntries(from: defaults), 100)
+        XCTAssertEqual(cache.stats().count, 100)
+
+        // Raising the limit deletes nothing, so it applies without asking.
+        await state.requestCacheLimit(.songs250, cache: cache)
+        XCTAssertNil(state.pendingCacheLimit)
+        XCTAssertEqual(state.lyricsCacheLimit, .songs250)
+        XCTAssertEqual(cache.stats().count, 100)
+    }
+
+    @MainActor
+    func testConfirmedCacheLimitAsksAgainWhenASongWasSavedMeanwhile() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(LyricsCacheLimit.unlimited.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
+        let state = LyricsState(userDefaults: defaults)
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+        for index in 0..<102 {
+            cache.save(trackId: "track-\(index)", lines: sample)
+        }
+
+        await state.requestCacheLimit(.songs100, cache: cache)
+        let stale = try XCTUnwrap(state.pendingCacheLimit)
+        cache.save(trackId: "track-saved-while-asking", lines: sample)
+
+        await state.confirmCacheLimitChange(stale, cache: cache)
+        XCTAssertEqual(state.pendingCacheLimit, CacheLimitChange(limit: .songs100, removalCount: 3))
+        XCTAssertEqual(state.lyricsCacheLimit, .unlimited, "A stale count must not be confirmed")
+        XCTAssertEqual(cache.stats().count, 103)
+
+        let fresh = try XCTUnwrap(state.pendingCacheLimit)
+        await state.confirmCacheLimitChange(fresh, cache: cache)
+        XCTAssertNil(state.pendingCacheLimit)
+        XCTAssertEqual(state.lyricsCacheLimit, .songs100)
+        XCTAssertEqual(cache.stats().count, 100)
+    }
+
+    @MainActor
+    func testLatestCacheLimitSelectionWinsOverAnEarlierScan() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(LyricsCacheLimit.unlimited.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
+        let state = LyricsState(userDefaults: defaults)
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+        for index in 0..<102 {
+            cache.save(trackId: "track-\(index)", lines: sample)
+        }
+
+        // Pick 100 songs, then switch back to Unlimited before that scan finishes.
+        let earlier = Task { await state.requestCacheLimit(.songs100, cache: cache) }
+        await Task.yield()
+        await state.requestCacheLimit(.unlimited, cache: cache)
+        await earlier.value
+
+        XCTAssertNil(state.pendingCacheLimit, "An earlier selection must not ask after a later one")
+        XCTAssertEqual(state.lyricsCacheLimit, .unlimited)
+        XCTAssertEqual(cache.stats().count, 102)
+    }
+
+    @MainActor
+    func testLaterCacheLimitSelectionWinsOverAPendingConfirmation() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set(LyricsCacheLimit.unlimited.rawValue, forKey: LyricsDiskCache.limitDefaultsKey)
+        let state = LyricsState(userDefaults: defaults)
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 0)
+        let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+        for index in 0..<102 {
+            cache.save(trackId: "track-\(index)", lines: sample)
+        }
+
+        await state.requestCacheLimit(.songs100, cache: cache)
+        let change = try XCTUnwrap(state.pendingCacheLimit)
+        // Confirm, then pick Unlimited while the confirmation is still recounting.
+        let confirmation = Task { await state.confirmCacheLimitChange(change, cache: cache) }
+        while state.pendingCacheLimit != nil {
+            await Task.yield()
+        }
+        await state.requestCacheLimit(.unlimited, cache: cache)
+        await confirmation.value
+
+        XCTAssertEqual(state.lyricsCacheLimit, .unlimited)
+        XCTAssertEqual(LyricsDiskCache.configuredMaxEntries(from: defaults), 0)
+        XCTAssertEqual(cache.stats().count, 102)
+    }
+
     func testClearRemovesAllCachedLyrics() {
         let cache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
         let sample = [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
