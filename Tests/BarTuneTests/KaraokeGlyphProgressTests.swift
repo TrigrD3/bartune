@@ -78,6 +78,24 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         }
     }
 
+    func testAudioSyncedJapaneseWordsShowWholeLineRomaji() throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        state.romanizeJapanese = true
+        state.setTrack(track, lyrics: [LyricLine(id: 0, timestamp: 10, duration: 2, text: "固まって")])
+        state.applyAudioSyncedLines([
+            LyricLine(id: 0, timestamp: 10, duration: 2, text: "固まって", words: words(["固まっ", "て"])),
+        ])
+        state.updatePlayback(isPlaying: true, position: 10.5)
+
+        let shown = try XCTUnwrap(state.activeLine)
+        XCTAssertEqual(shown.text, "katamatte")
+        XCTAssertEqual(shown.words.map(\.text), ["katamatte ", ""])
+        XCTAssertNotNil(LyricsState.wordBoundaryFractions(words: shown.words, lineText: shown.text, font: font))
+    }
+
     func testClockIgnoresSmallJitterButFollowsSeeksAndStateChanges() throws {
         let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
         let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))

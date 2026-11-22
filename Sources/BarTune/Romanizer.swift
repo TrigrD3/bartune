@@ -32,7 +32,45 @@ enum JapaneseRomanizer {
 
     static func romanizeLine(_ text: String) -> String {
         guard containsJapaneseOrCJK(text) else { return text }
+        let joined = finish(romanizedParts(text).map(\.text).joined(separator: " "))
+        return joined.isEmpty ? text : joined
+    }
 
+    /// Romanizes the words of one timed line in context, so readings and small っ that span word
+    /// boundaries come out as they do for the whole line. Returns one string per word; a word whose
+    /// reading was merged into the previous word gets "".
+    static func romanizeWords(_ words: [String]) -> [String] {
+        let text = words.joined()
+        guard containsJapaneseOrCJK(text) else { return words }
+        var wordStarts: [Int] = []
+        var location = 0
+        for word in words {
+            wordStarts.append(location)
+            location += (word as NSString).length
+        }
+        var grouped = Array(repeating: [String](), count: words.count)
+        for part in romanizedParts(text) {
+            let owner = wordStarts.lastIndex { $0 <= part.location } ?? 0
+            grouped[owner].append(part.text)
+        }
+        return grouped.map { finish($0.joined(separator: " ")) }
+    }
+
+    private static func finish(_ joined: String) -> String {
+        resolveSokuon(
+            joined
+                .replacingOccurrences(of: "~tsu ", with: "~tsu")
+                .replacingOccurrences(of: " ,", with: ",")
+                .replacingOccurrences(of: " .", with: ".")
+                .replacingOccurrences(of: " !", with: "!")
+                .replacingOccurrences(of: " ?", with: "?")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+    }
+
+    /// Romanized tokens and punctuation of `text`, each with its UTF-16 offset. A token ending in a
+    /// small っ is merged with the token after it, which supplies the doubled consonant.
+    private static func romanizedParts(_ text: String) -> [(location: Int, text: String)] {
         let nsText = text as NSString
         let cfText = text as CFString
         let fullRange = CFRange(location: 0, length: CFStringGetLength(cfText))
@@ -44,10 +82,10 @@ enum JapaneseRomanizer {
             kCFStringTokenizerUnitWord,
             jaLocale
         ) else {
-            return text
+            return [(0, text)]
         }
 
-        var parts: [String] = []
+        var parts: [(location: Int, text: String)] = []
         var cursor = 0
 
         while !CFStringTokenizerAdvanceToNextToken(tokenizer).isEmpty {
@@ -66,7 +104,7 @@ enum JapaneseRomanizer {
                         .replacingOccurrences(of: "？", with: "?")
                         .replacingOccurrences(of: "「", with: "\"")
                         .replacingOccurrences(of: "」", with: "\"")
-                    parts.append(normalizedGap)
+                    parts.append((cursor, normalizedGap))
                 }
             }
 
@@ -85,12 +123,12 @@ enum JapaneseRomanizer {
                     .replacingOccurrences(of: "ī", with: "ii")
                     .replacingOccurrences(of: "ē", with: "ee")
                 if rawToken == "は" && cleaned == "ha" {
-                    parts.append("wa")
+                    parts.append((tokenRange.location, "wa"))
                 } else {
-                    parts.append(cleaned)
+                    parts.append((tokenRange.location, cleaned))
                 }
             } else {
-                parts.append(rawToken)
+                parts.append((tokenRange.location, rawToken))
             }
 
             cursor = tokenRange.location + tokenRange.length
@@ -99,20 +137,19 @@ enum JapaneseRomanizer {
         if cursor < nsText.length {
             let tail = nsText.substring(from: cursor).trimmingCharacters(in: .whitespaces)
             if !tail.isEmpty {
-                parts.append(tail)
+                parts.append((cursor, tail))
             }
         }
 
-        let joined = parts.joined(separator: " ")
-            .replacingOccurrences(of: "~tsu ", with: "~tsu")
-            .replacingOccurrences(of: " ,", with: ",")
-            .replacingOccurrences(of: " .", with: ".")
-            .replacingOccurrences(of: " !", with: "!")
-            .replacingOccurrences(of: " ?", with: "?")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let cleanedSokuon = resolveSokuon(joined)
-        return cleanedSokuon.isEmpty ? text : cleanedSokuon
+        var merged: [(location: Int, text: String)] = []
+        for part in parts {
+            if let last = merged.last, last.text.hasSuffix("~tsu") {
+                merged[merged.count - 1].text = last.text + part.text
+            } else {
+                merged.append(part)
+            }
+        }
+        return merged
     }
 
     /// Converts macOS tokenizer's `~tsu` (small っ) into a doubled following consonant (e.g., `waka~tsuteru` -> `wakatteru`).
