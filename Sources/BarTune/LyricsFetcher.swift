@@ -30,6 +30,16 @@ struct LyricsDiskCache: Sendable {
     let directory: URL
     /// Maximum cached songs (`0` means unlimited).
     let maxEntries: Int
+    let audioSyncCache: AudioSyncedLyricsCache?
+
+    private struct ScannedDiskEntry {
+        let url: URL
+        let cacheKey: String
+        let entry: CachedLyricsEntry
+        let sizeBytes: Int64
+        let fileModifiedAt: Date
+        let sourceTrackId: String?
+    }
 
     static func configuredMaxEntries(from ud: UserDefaults = .standard) -> Int {
         guard ud.object(forKey: limitDefaultsKey) != nil else {
@@ -42,12 +52,21 @@ struct LyricsDiskCache: Sendable {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("com.arya.BarTune/lyrics", isDirectory: true)
-        return LyricsDiskCache(directory: dir, maxEntries: configuredMaxEntries())
+        return LyricsDiskCache(
+            directory: dir,
+            maxEntries: configuredMaxEntries(),
+            audioSyncCache: .default
+        )
     }
 
-    init(directory: URL, maxEntries: Int = defaultMaxEntries) {
+    init(
+        directory: URL,
+        maxEntries: Int = defaultMaxEntries,
+        audioSyncCache: AudioSyncedLyricsCache? = nil
+    ) {
         self.directory = directory
         self.maxEntries = max(0, maxEntries)
+        self.audioSyncCache = audioSyncCache
     }
 
     static func cacheKey(for trackId: String) -> String {
@@ -127,7 +146,7 @@ struct LyricsDiskCache: Sendable {
         try? FileManager.default.removeItem(at: fileURL(forCacheKey: cacheKey))
     }
 
-    func listEntries(audioSyncCache: AudioSyncedLyricsCache = .default) -> [CachedSongSummary] {
+    private func scanEntries() -> [ScannedDiskEntry] {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(
             at: directory,
@@ -135,7 +154,7 @@ struct LyricsDiskCache: Sendable {
             options: [.skipsHiddenFiles]
         ) else { return [] }
 
-        var summaries: [CachedSongSummary] = []
+        var scanned: [ScannedDiskEntry] = []
         for file in files where file.pathExtension == "json" {
             let key = file.deletingPathExtension().lastPathComponent
             guard let data = try? Data(contentsOf: file),
@@ -144,28 +163,48 @@ struct LyricsDiskCache: Sendable {
 
             let values = try? file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             let sizeBytes = Int64(values?.fileSize ?? data.count)
-            let modifiedAt = entry.cachedAt ?? values?.contentModificationDate ?? .distantPast
-            let fallbackTitle = entry.lines.first(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })?.text
-                ?? "Cached Song"
-            let title = (entry.title?.isEmpty == false) ? (entry.title ?? fallbackTitle) : fallbackTitle
-            let artist = entry.artist ?? ""
-            let syncEngine = audioSyncCache.syncEngine(forCacheKey: key)
+            let fileModifiedAt = values?.contentModificationDate ?? entry.cachedAt ?? .distantPast
+            let sourceTrackId = entry.trackId.flatMap(LyricsTranslator.sourceTrackId(fromCacheKey:))
 
-            summaries.append(
-                CachedSongSummary(
+            scanned.append(
+                ScannedDiskEntry(
+                    url: file,
                     cacheKey: key,
+                    entry: entry,
+                    sizeBytes: sizeBytes,
+                    fileModifiedAt: fileModifiedAt,
+                    sourceTrackId: sourceTrackId
+                )
+            )
+        }
+        return scanned
+    }
+
+    func listEntries(audioSyncCache: AudioSyncedLyricsCache = .default) -> [CachedSongSummary] {
+        scanEntries()
+            .filter { $0.sourceTrackId == nil }
+            .map { item in
+                let entry = item.entry
+                let modifiedAt = entry.cachedAt ?? item.fileModifiedAt
+                let fallbackTitle = entry.lines.first(where: {
+                    !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                })?.text ?? "Cached Song"
+                let title = (entry.title?.isEmpty == false) ? (entry.title ?? fallbackTitle) : fallbackTitle
+                let artist = entry.artist ?? ""
+                let syncEngine = audioSyncCache.syncEngine(forCacheKey: item.cacheKey)
+
+                return CachedSongSummary(
+                    cacheKey: item.cacheKey,
                     trackId: entry.trackId,
                     title: title,
                     artist: artist,
                     lineCount: entry.lines.count,
-                    sizeBytes: sizeBytes,
+                    sizeBytes: item.sizeBytes,
                     modifiedAt: modifiedAt,
                     syncEngine: syncEngine
                 )
-            )
-        }
-
-        return summaries.sorted { $0.modifiedAt > $1.modifiedAt }
+            }
+            .sorted { $0.modifiedAt > $1.modifiedAt }
     }
 
     func clear() {
@@ -176,45 +215,55 @@ struct LyricsDiskCache: Sendable {
         }
     }
 
-    func stats() -> (count: Int, bytes: Int64) {
+    func removeTranslations(forTrackId trackId: String) {
         let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles]
-        ) else { return (0, 0) }
-
-        var count = 0
-        var totalBytes: Int64 = 0
-        for file in files where file.pathExtension == "json" {
-            count += 1
-            if let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-                totalBytes += Int64(size)
-            }
+        for item in scanEntries() where item.sourceTrackId == trackId {
+            try? fm.removeItem(at: item.url)
         }
-        return (count, totalBytes)
+    }
+
+    func stats() -> (count: Int, bytes: Int64) {
+        var primaryCount = 0
+        var totalBytes: Int64 = 0
+        for item in scanEntries() {
+            if item.sourceTrackId == nil {
+                primaryCount += 1
+            }
+            totalBytes += item.sizeBytes
+        }
+        return (primaryCount, totalBytes)
     }
 
     func prune(to limit: Int) {
         guard limit > 0 else { return }
-        let fm = FileManager.default
-        guard let files = try? fm.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: [.contentModificationDateKey],
-            options: [.skipsHiddenFiles]
-        ) else { return }
+        // Skip decoding every file when even counting translations stays within the limit.
+        let fileCount = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+            .filter { $0.hasSuffix(".json") }.count ?? 0
+        guard fileCount > limit else { return }
+        let entries = scanEntries()
+        var primary: [ScannedDiskEntry] = []
+        var translationsByTrackId: [String: [URL]] = [:]
 
-        let jsonFiles = files.filter { $0.pathExtension == "json" }
-        guard jsonFiles.count > limit else { return }
-
-        let sorted = jsonFiles.sorted { lhs, rhs in
-            let d1 = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            let d2 = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            return d1 < d2
+        for item in entries {
+            if let sourceTrackId = item.sourceTrackId {
+                translationsByTrackId[sourceTrackId, default: []].append(item.url)
+            } else {
+                primary.append(item)
+            }
         }
+
+        guard primary.count > limit else { return }
+        let sorted = primary.sorted { $0.fileModifiedAt < $1.fileModifiedAt }
         let excess = sorted.count - limit
-        for file in sorted.prefix(excess) {
-            try? fm.removeItem(at: file)
+        let fm = FileManager.default
+        for item in sorted.prefix(excess) {
+            try? fm.removeItem(at: item.url)
+            audioSyncCache?.removeByCacheKey(item.cacheKey)
+            if let trackId = item.entry.trackId {
+                for translationURL in translationsByTrackId[trackId] ?? [] {
+                    try? fm.removeItem(at: translationURL)
+                }
+            }
         }
     }
 }
@@ -275,6 +324,9 @@ struct OfflineCacheRemover: Sendable {
     func remove(_ song: CachedSongSummary) async {
         lyricsCache.removeByCacheKey(song.cacheKey)
         syncCache.removeByCacheKey(song.cacheKey)
+        if let trackId = song.trackId {
+            lyricsCache.removeTranslations(forTrackId: trackId)
+        }
         await fetcher.invalidateMemoryCache(trackId: song.trackId)
         await translator.invalidateMemoryCache(trackId: song.trackId)
     }

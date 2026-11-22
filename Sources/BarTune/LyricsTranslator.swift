@@ -97,6 +97,18 @@ actor LyricsTranslator {
         return "\(trackId):tr:\(targetLanguage.rawValue):\(digest)"
     }
 
+    /// Extracts the owning song `trackId` from a translation cache key (`<trackId>:tr:<lang>:<16-hex>`).
+    static func sourceTrackId(fromCacheKey key: String) -> String? {
+        for language in TranslationLanguage.allCases {
+            let marker = ":tr:\(language.rawValue):"
+            guard let markerRange = key.range(of: marker, options: .backwards) else { continue }
+            let digest = key[markerRange.upperBound...]
+            guard digest.count == 16, digest.allSatisfy(\.isHexDigit) else { continue }
+            return String(key[..<markerRange.lowerBound])
+        }
+        return nil
+    }
+
     func translate(
         lines: [LyricLine],
         trackId: String,
