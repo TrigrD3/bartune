@@ -433,6 +433,8 @@ final class AudioSyncManager {
     private var baseLines: [LyricLine] = []
     /// Lines matched by the partial cached record this session started from; weaker live results don't replace it.
     private var cachedAlignedLineCount = 0
+    /// Words heard on earlier plays of a partially synced track.
+    private var priorHeardWords: [RecognizedAudioWord] = []
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
@@ -518,6 +520,7 @@ final class AudioSyncManager {
         baseLines = rawLines
         recognizedWords = []
         cachedAlignedLineCount = 0
+        priorHeardWords = []
 
         let engine = state.audioSyncEngine
         guard engine != .off else {
@@ -548,6 +551,7 @@ final class AudioSyncManager {
                 // Show the partial sync now and keep listening to fill in the lines it missed.
                 state.applyAudioSyncedLines(cached.lines)
                 cachedAlignedLineCount = cached.alignedLineCount
+                priorHeardWords = cached.heardWords ?? []
             } else {
                 cache.remove(trackId: track.id)
             }
@@ -1112,11 +1116,27 @@ final class AudioSyncManager {
             .joined(separator: " ")
     }
 
+    /// Words from earlier plays fill only the stretches this play hasn't heard; this play's words win.
+    nonisolated static func mergeHeardWords(
+        prior: [RecognizedAudioWord],
+        current: [RecognizedAudioWord],
+        margin: Double = 1.0
+    ) -> [RecognizedAudioWord] {
+        let kept = prior.filter { old in
+            !current.contains { $0.startTime - margin < old.endTime && old.startTime < $0.endTime + margin }
+        }
+        return (kept + current).sorted { $0.startTime < $1.startTime }
+    }
+
+    private var allHeardWords: [RecognizedAudioWord] {
+        Self.mergeHeardWords(prior: priorHeardWords, current: recognizedWords)
+    }
+
     private func applyAlignment(engine: AudioSyncEngine) {
         guard !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
         let result = LyricsAudioAligner.align(
             lines: baseLines,
-            recognizedWords: recognizedWords,
+            recognizedWords: allHeardWords,
             replaceTextWithTranscription: state.replaceLyricsWithTranscription
         )
         let lines = baseLines
@@ -1155,7 +1175,7 @@ final class AudioSyncManager {
         guard engine != .off, !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
         let result = LyricsAudioAligner.align(
             lines: baseLines,
-            recognizedWords: recognizedWords,
+            recognizedWords: allHeardWords,
             replaceTextWithTranscription: state.replaceLyricsWithTranscription
         )
         guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
@@ -1172,7 +1192,8 @@ final class AudioSyncManager {
             medianOffset: result.medianOffset,
             alignedLineCount: result.matchedLineCount,
             sourceLineCount: sourceCount,
-            lines: result.lines
+            lines: result.lines,
+            heardWords: allHeardWords
         )
         cache.save(record)
     }

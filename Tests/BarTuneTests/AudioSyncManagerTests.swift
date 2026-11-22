@@ -1455,6 +1455,47 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(improved)
     }
 
+    func testMergeHeardWordsKeepsEarlierPlaysOnlyWhereThisPlayIsSilent() {
+        func word(_ text: String, _ start: Double) -> RecognizedAudioWord {
+            RecognizedAudioWord(text: text, startTime: start, duration: 0.3, confidence: 0.9)
+        }
+        let prior = [word("a", 1), word("b", 5), word("c", 20)]
+        let current = [word("B", 5.2), word("d", 30)]
+
+        let merged = AudioSyncManager.mergeHeardWords(prior: prior, current: current)
+
+        XCTAssertEqual(merged.map(\.text), ["a", "B", "c", "d"])
+    }
+
+    @MainActor
+    func testLaterPlayAddsToWordsHeardOnEarlierPlays() async {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        // Play 1 heard lines 0-3 (track time = 10 + 3 * line).
+        let firstPlay = Self.tenLineWords.prefix(4).enumerated().flatMap { index, words in
+            words.enumerated().map {
+                RecognizedAudioWord(text: $0.element, startTime: 10.1 + Double(index) * 3 + Double($0.offset) * 0.4, duration: 0.2, confidence: 0.9)
+            }
+        }
+        let firstResult = LyricsAudioAligner.align(lines: tenLines(), recognizedWords: firstPlay)
+        XCTAssertEqual(firstResult.matchedLineCount, 4)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: firstResult.medianOffset,
+            alignedLineCount: 4, sourceLineCount: 10, lines: firstResult.lines, heardWords: firstPlay
+        ))
+
+        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Play 2 only catches lines 4 and 5.
+        let secondPlay = heardSegments(lines: 6).filter { $0.timestamp >= 12 }
+        recognizer.resultHandlers.first?(secondPlay, false, nil)
+        let completed = await waitUntil { state.audioSyncStatus == .cached(.appleSpeech) }
+
+        XCTAssertTrue(completed, "4 earlier + 2 new lines reach 6/10; status \(state.audioSyncStatus)")
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 6)
+    }
+
     @MainActor
     func testRecordAlignedToOtherLyricsIsDiscarded() async {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
