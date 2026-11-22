@@ -277,6 +277,7 @@ final class LyricsState: ObservableObject {
         static let translationLanguage = "bartune.translationLanguage"
         static let lowCPUMode = "bartune.lowCPUMode"
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
+        static let browserYouTubeVideosEnabled = "bartune.browserYouTubeVideosEnabled"
         static let trackOffsets = "bartune.trackOffsets"
         static let audioSyncEngine = "bartune.audioSyncEngine"
         static let whisperModelPath = "bartune.whisperModelPath"
@@ -423,6 +424,10 @@ final class LyricsState: ObservableObject {
 
     @Published var browserMusicEnabled: Bool {
         didSet { userDefaults.set(browserMusicEnabled, forKey: Keys.browserMusicEnabled) }
+    }
+
+    @Published var browserYouTubeVideosEnabled: Bool {
+        didSet { userDefaults.set(browserYouTubeVideosEnabled, forKey: Keys.browserYouTubeVideosEnabled) }
     }
 
     @Published var audioSyncEngine: AudioSyncEngine {
@@ -597,6 +602,7 @@ final class LyricsState: ObservableObject {
         }
         self.lowCPUMode = ud.object(forKey: Keys.lowCPUMode) as? Bool ?? true
         self.browserMusicEnabled = ud.object(forKey: Keys.browserMusicEnabled) as? Bool ?? true
+        self.browserYouTubeVideosEnabled = ud.object(forKey: Keys.browserYouTubeVideosEnabled) as? Bool ?? false
         if let rawEngine = ud.string(forKey: Keys.audioSyncEngine),
            let parsedEngine = AudioSyncEngine(rawValue: rawEngine) {
             self.audioSyncEngine = parsedEngine

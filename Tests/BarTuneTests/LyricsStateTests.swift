@@ -183,6 +183,7 @@ final class LyricsStateTests: XCTestCase {
             "bartune.translationLanguage",
             "bartune.lowCPUMode",
             "bartune.browserMusicEnabled",
+            "bartune.browserYouTubeVideosEnabled",
             "bartune.audioSyncEngine",
             "bartune.whisperModelPath",
             "bartune.replaceLyricsWithTranscription",
@@ -214,6 +215,9 @@ final class LyricsStateTests: XCTestCase {
         let (state, ud, suiteName) = try makeIsolatedState()
         defer { ud.removePersistentDomain(forName: suiteName) }
 
+        XCTAssertTrue(state.browserMusicEnabled)
+        XCTAssertFalse(state.browserYouTubeVideosEnabled)
+
         state.hoverMode = .hideAll
         state.spotlightWidth = 112.0
         state.themeMode = .albumTint
@@ -234,6 +238,7 @@ final class LyricsStateTests: XCTestCase {
         state.translationLanguage = .spanish
         state.lowCPUMode = false
         state.browserMusicEnabled = false
+        state.browserYouTubeVideosEnabled = true
         state.audioSyncEngine = .appleSpeech
         state.whisperModelPath = "/tmp/model.bin"
         state.replaceLyricsWithTranscription = true
@@ -273,6 +278,7 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertEqual(reloaded.translationLanguage, .spanish)
         XCTAssertFalse(reloaded.lowCPUMode)
         XCTAssertFalse(reloaded.browserMusicEnabled)
+        XCTAssertTrue(reloaded.browserYouTubeVideosEnabled)
         XCTAssertEqual(reloaded.audioSyncEngine, .appleSpeech)
         XCTAssertEqual(reloaded.whisperModelPath, "/tmp/model.bin")
         XCTAssertTrue(reloaded.replaceLyricsWithTranscription)

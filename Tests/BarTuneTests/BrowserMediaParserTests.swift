@@ -389,4 +389,71 @@ final class BrowserMediaParserTests: XCTestCase {
         XCTAssertNotEqual(shortTake, try id(payload(mediaId: nil, duration: "240", position: "10")))
         XCTAssertEqual(shortTake, try id(payload(mediaId: nil, duration: "180.2", position: "120")))
     }
+
+    func testDisablingOrdinaryYouTubeVideosPreservesYouTubeMusicSupport() {
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://www.youtube.com/watch?v=xyz789", includeYouTubeVideos: false))
+        XCTAssertFalse(BrowserMediaParser.isSupportedMusicURL("https://youtube.com/watch?v=xyz789", includeYouTubeVideos: false))
+        XCTAssertTrue(BrowserMediaParser.isSupportedMusicURL("https://music.youtube.com/watch?v=abc123", includeYouTubeVideos: false))
+        XCTAssertTrue(BrowserMediaParser.isSupportedMusicURL("https://open.spotify.com/track/123", includeYouTubeVideos: false))
+        XCTAssertTrue(BrowserMediaParser.isSupportedMusicURL("https://www.youtube.com/watch?v=xyz789", includeYouTubeVideos: true))
+
+        let sep = "\u{1F}"
+        let ytPayload = [
+            "BROWSER", "playing", "browser:www.youtube.com:Talk Title|Channel", "Talk Title", "Channel", "", "300", "20", "",
+        ].joined(separator: sep)
+        let ytMusicPayload = [
+            "BROWSER", "playing", "browser:music.youtube.com:Night Dancer|imase", "Night Dancer", "imase", "Bonsai", "210", "15", "",
+        ].joined(separator: sep)
+
+        XCTAssertNil(BrowserMediaParser.parsePayload(ytPayload, includeYouTubeVideos: false))
+        XCTAssertNotNil(BrowserMediaParser.parsePayload(ytPayload, includeYouTubeVideos: true))
+        XCTAssertEqual(
+            BrowserMediaParser.parsePayload(ytMusicPayload, includeYouTubeVideos: false)?.track?.title,
+            "Night Dancer"
+        )
+
+        let tabs = [
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 1, url: "https://www.youtube.com/watch?v=nonmusic"),
+            BrowserTabDescriptor(windowIndex: 1, tabIndex: 2, url: "https://music.youtube.com/watch?v=abc123"),
+        ]
+        var probedWhenDisabled: [BrowserTabDescriptor] = []
+        let monitor = BrowserMediaMonitor(
+            listTabs: { _ in tabs },
+            probeTab: { _, tab in
+                probedWhenDisabled.append(tab)
+                return tab.tabIndex == 1 ? ytPayload : ytMusicPayload
+            }
+        )
+
+        let disabledSnapshot = monitor.poll(runningBundleIds: ["com.google.Chrome"], includeYouTubeVideos: false)
+        XCTAssertEqual(probedWhenDisabled, [tabs[1]])
+        XCTAssertEqual(disabledSnapshot?.track?.title, "Night Dancer")
+
+        var probedWhenEnabled: [BrowserTabDescriptor] = []
+        let enabledMonitor = BrowserMediaMonitor(
+            listTabs: { _ in [tabs[0]] },
+            probeTab: { _, tab in
+                probedWhenEnabled.append(tab)
+                return ytPayload
+            }
+        )
+        let enabledSnapshot = enabledMonitor.poll(runningBundleIds: ["com.google.Chrome"], includeYouTubeVideos: true)
+        XCTAssertEqual(probedWhenEnabled, [tabs[0]])
+        XCTAssertEqual(enabledSnapshot?.track?.title, "Talk Title")
+
+        let restrictedJS = BrowserMediaMonitor.jsProbeSource(includeYouTubeVideos: false)
+        XCTAssertFalse(restrictedJS.contains("www.youtube.com"))
+        XCTAssertFalse(restrictedJS.contains("h==='youtube.com'"))
+        XCTAssertTrue(restrictedJS.contains("music.youtube.com"))
+
+        let permissiveJS = BrowserMediaMonitor.jsProbeSource(includeYouTubeVideos: true)
+        XCTAssertTrue(permissiveJS.contains("www.youtube.com"))
+
+        let restrictedAppleScript = BrowserMediaMonitor.probeScriptSource(
+            for: BrowserMediaMonitor.browsers[0],
+            tab: tabs[1],
+            includeYouTubeVideos: false
+        )
+        XCTAssertFalse(restrictedAppleScript.contains("www.youtube.com"))
+    }
 }

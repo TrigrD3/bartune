@@ -48,6 +48,7 @@ final class SpotifyMonitor {
     private var lastPollDate: Date = .now
     private var lowCPUMode: Bool = true
     private var browserMusicEnabled: Bool = true
+    private var browserYouTubeVideosEnabled: Bool = false
     private var isStarted: Bool = false
     private var isPolling: Bool = false
     private var consecutiveIdlePolls: Int = 0
@@ -123,6 +124,21 @@ final class SpotifyMonitor {
         }
     }
 
+    func setBrowserYouTubeVideosEnabled(_ enabled: Bool) {
+        guard browserYouTubeVideosEnabled != enabled else { return }
+        browserYouTubeVideosEnabled = enabled
+        if !enabled, let trackId = lastSnapshot?.track?.id, BrowserMediaParser.isStandardYouTubeTrackId(trackId) {
+            let idle = PlaybackSnapshot(isRunning: false, isPlaying: false, track: nil, position: 0)
+            lastSnapshot = idle
+            updatePollTimer(isPlaying: false)
+            updateInterpolationTimer(isPlaying: false)
+            onUpdate?(idle)
+        }
+        if isStarted {
+            poll()
+        }
+    }
+
     func sendCommand(_ command: PlaybackCommand) {
         let runningBundleIds = Set(
             NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
@@ -169,10 +185,11 @@ final class SpotifyMonitor {
         return nil
     }
 
-    func start(lowCPUMode: Bool = true, browserMusicEnabled: Bool = true) {
+    func start(lowCPUMode: Bool = true, browserMusicEnabled: Bool = true, browserYouTubeVideosEnabled: Bool = false) {
         stop()
         self.lowCPUMode = lowCPUMode
         self.browserMusicEnabled = browserMusicEnabled
+        self.browserYouTubeVideosEnabled = browserYouTubeVideosEnabled
         self.isStarted = true
 
         // Event-driven playback notifications from Spotify and Apple Music
@@ -270,6 +287,7 @@ final class SpotifyMonitor {
         guard !isPolling else { return }
         isPolling = true
         let allowBrowser = browserMusicEnabled
+        let includeYouTubeVideos = browserYouTubeVideosEnabled
         let runningBundleIds = Set(
             NSWorkspace.shared.runningApplications.compactMap(\.bundleIdentifier)
         )
@@ -288,7 +306,10 @@ final class SpotifyMonitor {
             var browserNow = now
             if (raw == nil || raw == "IDLE") && allowBrowser {
                 let bStart = Date()
-                browserSnap = browserMonitor.poll(runningBundleIds: runningBundleIds)
+                browserSnap = browserMonitor.poll(
+                    runningBundleIds: runningBundleIds,
+                    includeYouTubeVideos: includeYouTubeVideos
+                )
                 let bEnd = Date()
                 browserNow = Date(timeIntervalSince1970: (bStart.timeIntervalSince1970 + bEnd.timeIntervalSince1970) / 2.0)
             }
@@ -296,9 +317,28 @@ final class SpotifyMonitor {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer { self.isPolling = false }
-                self.handlePollResult(raw: raw, now: now, browserSnap: browserSnap, browserNow: browserNow)
+                let filteredBrowserSnap = Self.acceptedBrowserSnapshot(
+                    browserSnap,
+                    browserMusicEnabled: self.browserMusicEnabled,
+                    includeYouTubeVideos: self.browserYouTubeVideosEnabled
+                )
+                self.handlePollResult(raw: raw, now: now, browserSnap: filteredBrowserSnap, browserNow: browserNow)
             }
         }
+    }
+
+    nonisolated static func acceptedBrowserSnapshot(
+        _ snapshot: PlaybackSnapshot?,
+        browserMusicEnabled: Bool,
+        includeYouTubeVideos: Bool
+    ) -> PlaybackSnapshot? {
+        guard browserMusicEnabled, let snapshot else { return nil }
+        if !includeYouTubeVideos,
+           let trackId = snapshot.track?.id,
+           BrowserMediaParser.isStandardYouTubeTrackId(trackId) {
+            return nil
+        }
+        return snapshot
     }
 
     private func handlePollResult(raw: String?, now: Date, browserSnap: PlaybackSnapshot?, browserNow: Date) {

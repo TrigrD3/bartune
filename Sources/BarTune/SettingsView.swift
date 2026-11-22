@@ -88,6 +88,17 @@ final class OfflineCacheStatsModel: ObservableObject {
 }
 
 struct SettingsView: View {
+    static let browserMediaDisclosure =
+        "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle "
+            + "(requires \"Allow JavaScript from Apple Events\" in your browser). Ordinary youtube.com/watch pages "
+            + "(including non-music videos) stay off unless enabled above. When lyrics aren't cached locally, "
+            + "BarTune sends track title and artist to NetEase (music.163.com), and title, artist, album, and "
+            + "duration to LRCLIB (lrclib.net)."
+
+    static let translationDisclosure =
+        "When uncached, lyric text lines and your selected target language are sent to Google Translate "
+            + "(translate.googleapis.com). Translations are cached locally in Offline Cache for instant repeat playback."
+
     @ObservedObject var state: LyricsState
     let cacheRemover: OfflineCacheRemover
     @ObservedObject var updater: AppUpdaterModel
@@ -193,13 +204,12 @@ struct SettingsView: View {
             }
 
             Section("Media Sources") {
-                Toggle("Browser Music (YouTube Music, etc.)", isOn: $state.browserMusicEnabled)
-                Text(
-                    "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle. "
-                        + "Requires \"Allow JavaScript from Apple Events\" in your browser."
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Toggle("Browser Music (YouTube Music, Spotify Web, SoundCloud, Apple Music Web)", isOn: $state.browserMusicEnabled)
+                Toggle("Include Ordinary YouTube Videos (youtube.com/watch)", isOn: $state.browserYouTubeVideosEnabled)
+                    .disabled(!state.browserMusicEnabled)
+                Text(Self.browserMediaDisclosure)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Startup") {
@@ -461,7 +471,7 @@ struct SettingsView: View {
                     }
                 }
 
-                Text("Translations are cached locally in Offline Cache for instant repeat playback.")
+                Text(Self.translationDisclosure)
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

@@ -31,7 +31,7 @@ Most desktop lyrics apps float over your editor, browser tabs, or terminal. **Ba
 
 - **Tucked beside the notch.** BarTune occupies only the unused menu bar space to the left of your MacBook notch (`NSScreen.auxiliaryTopLeftArea`), so it never floats over your editor, browser, or terminal.
 - **Steps aside on hover.** Pick **Cursor Spotlight** to peek only the menu item under your pointer, or **Hide Entire Bar** to reveal the full app menu bar on hover.
-- **Works across desktop and web players.** Tracks **Spotify** and **Apple Music** natively, and falls back to **YouTube Music, YouTube (including Chapters), Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari.
+- **Works across desktop and web players.** Tracks **Spotify** and **Apple Music** natively, and falls back to **YouTube Music, Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari. Ordinary **YouTube** videos (including Chapters) are opt-in.
 - **Word-level karaoke sync and audio alignment.** Pulls millisecond **NetEase YRC** lyrics with **LRCLIB** fallback, and can optionally align lyrics to the playing audio using on-device **Apple Speech** (with automatic language detection) or **Local Whisper** (`whisper-server`, which loads the model once per sync session, reusing shared GGML models from `~/.cache/whisper` and `~/.cache/huggingface`). Synced timings are cached on disk so repeat plays load without recalculating, with a toggleable sync badge in the lyrics bar.
 - **Translation and offline romanization.** Translate lyrics into your preferred language (cached locally) or turn on offline **Japanese → Romaji**, **Korean → Romanized**, and **Chinese → Pinyin** for sing-along readability.
 - **Offline cache you can inspect.** Stores fetched lyrics, translations, audio-synced timings, and per-track timing offsets locally with a configurable cache limit and a searchable **Cached Songs** list in Settings.
@@ -65,7 +65,7 @@ BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 6-tab nati
 
 | Tab | Options |
 | :--- | :--- |
-| **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music toggle, Launch at Login, macOS Permission Status, Live & Average CPU/Memory Usage |
+| **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music and Ordinary YouTube Videos toggles (with what is sent to NetEase and LRCLIB), Launch at Login, macOS Permission Status, Live & Average CPU/Memory Usage |
 | **Appearance** | Color Theme (*System*, *Album Accent*, *Album Tint*), Background Opacity, Font Family, Weight, Size, Karaoke Sweep Highlight |
 | **Visualizer** | Live Preview, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width, Animation toggle |
 | **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Audio Karaoke Sync (*Off / Apple Speech / Local Whisper*, shared model picker, transcribed-audio overwrite, lyrics-bar sync badge), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
