@@ -11,6 +11,17 @@ protocol AudioCaptureProviding: AnyObject {
     @MainActor func stop()
 }
 
+enum AudioLevel {
+    /// Scales a chunk so its peak reaches 0.95. Capture follows the player's volume, and a quiet
+    /// player leaves too little signal for recognition. Near-silence is left as is so its noise isn't amplified.
+    static func normalizedForRecognition(_ samples: [Float], maxGain: Float = 100) -> [Float] {
+        let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
+        guard peak > 0.0001 else { return samples }
+        let gain = min(0.95 / peak, maxGain)
+        return samples.map { $0 * gain }
+    }
+}
+
 enum AudioSampleExtractor {
     static func extractMonoSamples(
         from blockBuffer: CMBlockBuffer,
@@ -781,7 +792,7 @@ final class AudioSyncManager {
         let targetFrames = max(1, Int(sampleRate * whisperChunkDurationSeconds))
         guard whisperSampleBuffer.count >= targetFrames else { return }
 
-        let chunk = Array(whisperSampleBuffer.prefix(targetFrames))
+        let chunk = AudioLevel.normalizedForRecognition(Array(whisperSampleBuffer.prefix(targetFrames)))
         let chunkStart = whisperChunkStartPos ?? currentPlaybackPosition()
         whisperSampleBuffer.removeFirst(targetFrames)
         if whisperSampleBuffer.isEmpty {
