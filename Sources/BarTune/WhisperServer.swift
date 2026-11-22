@@ -124,9 +124,6 @@ final class WhisperServer: WhisperTranscribing, @unchecked Sendable {
     func transcribe(_ request: AudioSyncManager.WhisperChunkRequest) async throws -> [RecognizedAudioWord] {
         let wav = WAVEncoder.encodeMono16BitPCM(samples: request.samples, sampleRate: request.sampleRate)
         var fields = ["response_format": "verbose_json"]
-        if !request.prompt.isEmpty {
-            fields["prompt"] = request.prompt
-        }
         if let language = request.language, !language.isEmpty {
             fields["language"] = language
         }

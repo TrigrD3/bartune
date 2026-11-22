@@ -795,7 +795,6 @@ final class AudioSyncManager {
             sampleRate: Int(sampleRate),
             chunkStartTime: chunkStart,
             playbackRate: whisperChunkPlaybackRate,
-            prompt: promptSnippet(around: chunkStart),
             language: whisperLanguage
         )
         whisperProcessingTask = Task { [weak self] in
@@ -828,14 +827,6 @@ final class AudioSyncManager {
     private func currentPlaybackPosition() -> Double {
         let elapsed = max(0.0, Date().timeIntervalSince(state.playbackAnchorDate))
         return state.playbackAnchorPosition + (state.isPlaying ? elapsed * state.playbackRate : 0.0)
-    }
-
-    private func promptSnippet(around position: Double) -> String {
-        baseLines
-            .filter { $0.timestamp >= position - 4.0 && $0.timestamp <= position + 20.0 }
-            .prefix(6)
-            .map(\.text)
-            .joined(separator: " ")
     }
 
     /// Words from earlier plays fill only the stretches this play hasn't heard; this play's words win.
@@ -926,7 +917,6 @@ final class AudioSyncManager {
         let chunkStartTime: Double
         /// Media seconds per recorded second, used to map in-chunk word offsets to track time.
         let playbackRate: Double
-        let prompt: String
         var language: String?
     }
 
