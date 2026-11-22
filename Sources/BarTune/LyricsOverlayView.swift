@@ -114,6 +114,7 @@ struct KaraokeLineView: View {
     let isPlaying: Bool
     let lowCPUMode: Bool
     var glowEnabled: Bool = false
+    var wordPopEnabled: Bool = false
 
     @State private var textWidth: CGFloat = 0
 
@@ -170,48 +171,24 @@ struct KaraokeLineView: View {
                     availableWidth: availableWidth
                 )
 
-                ZStack(alignment: .leading) {
-                    if karaokeEnabled {
-                        Text(text)
-                            .font(font)
-                            .foregroundStyle(unsungColor)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .background(widthReader)
-
-                        Text(text)
-                            .font(font)
-                            .foregroundStyle(sungColor)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .mask {
-                                let w = max(1, textWidth)
-                                let featherFrac = min(0.25, Double(14 / w))
-                                let edge = max(0.0, min(1.0, progress))
-                                let fadeEnd = min(1.0, edge + featherFrac)
-                                LinearGradient(
-                                    stops: [
-                                        .init(color: .white, location: 0),
-                                        .init(color: .white, location: edge),
-                                        .init(color: .clear, location: fadeEnd),
-                                        .init(color: .clear, location: 1),
-                                    ],
-                                    startPoint: .leading,
-                                    endPoint: .trailing
-                                )
-                            }
-                            .shadow(
-                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
-                                radius: glowEnabled ? 4 : 0
-                            )
+                let pop = wordPopEnabled && karaokeEnabled
+                    ? measureFont.flatMap { state.liveWordPop(at: timeline.date, font: $0) }
+                    : nil
+                Group {
+                    if let pop, pop.strength > 0.001 {
+                        let strength = CGFloat(pop.strength)
+                        ZStack(alignment: .leading) {
+                            sweptText(progress: progress, measuring: true)
+                                .mask(WordSpanMask(start: pop.start, end: pop.end, inverted: true))
+                            sweptText(progress: progress, measuring: false)
+                                .mask(WordSpanMask(start: pop.start, end: pop.end, inverted: false))
+                                .brightness(0.18 * strength)
+                                .scaleEffect(1 + 0.08 * strength, anchor: UnitPoint(x: (pop.start + pop.end) / 2, y: 0.5))
+                                .offset(y: -2 * strength)
+                                .shadow(color: sungColor.opacity(0.6 * strength), radius: 3 * strength)
+                        }
                     } else {
-                        Text(text)
-                            .font(font)
-                            .foregroundStyle(sungColor)
-                            .fixedSize(horizontal: true, vertical: false)
-                            .background(widthReader)
-                            .shadow(
-                                color: glowEnabled ? sungColor.opacity(0.55) : .clear,
-                                radius: glowEnabled ? 4 : 0
-                            )
+                        sweptText(progress: progress, measuring: true)
                     }
                 }
                 .offset(x: scrollOffset)
@@ -219,6 +196,54 @@ struct KaraokeLineView: View {
             }
         }
         .clipped()
+    }
+
+    /// The line with the karaoke sweep at `progress`; `measuring` attaches the width reader (once per line).
+    private func sweptText(progress: Double, measuring: Bool) -> some View {
+        ZStack(alignment: .leading) {
+            if karaokeEnabled {
+                Text(text)
+                    .font(font)
+                    .foregroundStyle(unsungColor)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(measuring ? widthReader : nil)
+
+                Text(text)
+                    .font(font)
+                    .foregroundStyle(sungColor)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .mask {
+                        let w = max(1, textWidth)
+                        let featherFrac = min(0.25, Double(14 / w))
+                        let edge = max(0.0, min(1.0, progress))
+                        let fadeEnd = min(1.0, edge + featherFrac)
+                        LinearGradient(
+                            stops: [
+                                .init(color: .white, location: 0),
+                                .init(color: .white, location: edge),
+                                .init(color: .clear, location: fadeEnd),
+                                .init(color: .clear, location: 1),
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    }
+                    .shadow(
+                        color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                        radius: glowEnabled ? 4 : 0
+                    )
+            } else {
+                Text(text)
+                    .font(font)
+                    .foregroundStyle(sungColor)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .background(measuring ? widthReader : nil)
+                    .shadow(
+                        color: glowEnabled ? sungColor.opacity(0.55) : .clear,
+                        radius: glowEnabled ? 4 : 0
+                    )
+            }
+        }
     }
 
     private var widthReader: some View {
@@ -357,6 +382,7 @@ struct LyricsOverlayView: View {
                     )
                 }
 
+                ZStack(alignment: .leading) {
                 KaraokeLineView(
                     text: state.currentText,
                     state: state,
@@ -367,16 +393,20 @@ struct LyricsOverlayView: View {
                     karaokeEnabled: state.karaokeAnimationEnabled,
                     isPlaying: state.isEnabled && state.isPlaying,
                     lowCPUMode: state.lowCPUMode,
-                    glowEnabled: state.karaokeGlowEnabled
+                    glowEnabled: state.karaokeGlowEnabled,
+                    wordPopEnabled: state.wordPopEnabled
                 )
                 .id(
                     "\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)-\(state.translateLyrics)-\(state.translationLanguage.rawValue)"
                 )
-                .transition(.asymmetric(
-                    insertion: .opacity.combined(with: .offset(y: 6)),
-                    removal: .opacity.combined(with: .offset(y: -6))
-                ))
-                .animation(.spring(response: 0.28, dampingFraction: 0.85), value: state.currentLineId)
+                .transition(LineTransition.transition(for: state.lineTransitionStyle))
+                }
+                // Old and new line overlap in one clipped slot, so slides travel the bar instead of spilling out of it.
+                .clipped()
+                .animation(
+                    LineTransition.animation(for: state.lineTransitionStyle, duration: state.lineTransitionDuration),
+                    value: state.currentLineId
+                )
 
                 if state.showTrackTitle, !state.trackSummary.isEmpty, state.trackSummary != "Not Playing" {
                     MarqueeTrackLabelView(
@@ -573,5 +603,82 @@ private struct MarqueeTrackLabelView: View {
             .font(.system(size: 10.5, weight: .regular))
             .foregroundStyle(color)
             .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+/// Shows only one word's span of the line (or everything but it, when `inverted`).
+struct WordSpanMask: View {
+    let start: Double
+    let end: Double
+    let inverted: Bool
+
+    var body: some View {
+        let inside: Color = inverted ? .clear : .white
+        let outside: Color = inverted ? .white : .clear
+        LinearGradient(
+            stops: [
+                .init(color: outside, location: 0),
+                .init(color: outside, location: start),
+                .init(color: inside, location: start),
+                .init(color: inside, location: end),
+                .init(color: outside, location: end),
+                .init(color: outside, location: 1),
+            ],
+            startPoint: .leading,
+            endPoint: .trailing
+        )
+    }
+}
+
+/// The look and timing of the change from one lyric line to the next.
+enum LineTransition {
+    static func transition(for style: LineTransitionStyle) -> AnyTransition {
+        switch style {
+        case .subtle:
+            return .asymmetric(
+                insertion: .opacity.combined(with: .offset(y: 6)),
+                removal: .opacity.combined(with: .offset(y: -6))
+            )
+        case .slide:
+            return .asymmetric(
+                insertion: .move(edge: .bottom).combined(with: .opacity),
+                removal: .move(edge: .top).combined(with: .opacity)
+            )
+        case .blurFade:
+            return .modifier(active: BlurFade(amount: 1), identity: BlurFade(amount: 0))
+        case .pop:
+            return .asymmetric(
+                insertion: .scale(scale: 0.7, anchor: .leading).combined(with: .opacity),
+                removal: .scale(scale: 1.12, anchor: .leading).combined(with: .opacity)
+            )
+        case .push:
+            return .asymmetric(
+                insertion: .move(edge: .trailing).combined(with: .opacity),
+                removal: .move(edge: .leading).combined(with: .opacity)
+            )
+        case .none:
+            return .identity
+        }
+    }
+
+    static func animation(for style: LineTransitionStyle, duration: Double) -> Animation? {
+        switch style {
+        case .subtle: return .spring(response: duration, dampingFraction: 0.85)
+        case .slide, .push: return .spring(response: duration, dampingFraction: 0.86)
+        case .blurFade: return .easeInOut(duration: duration)
+        case .pop: return .spring(response: duration, dampingFraction: 0.55)
+        case .none: return nil
+        }
+    }
+}
+
+private struct BlurFade: ViewModifier {
+    /// 0 is the settled line, 1 fully blurred and transparent.
+    let amount: Double
+
+    func body(content: Content) -> some View {
+        content
+            .blur(radius: 6 * amount)
+            .opacity(1 - amount)
     }
 }

@@ -402,7 +402,31 @@ struct SettingsView: View {
 
                 Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
                 Toggle("Sung Text Glow", isOn: $state.karaokeGlowEnabled)
+                Toggle("Word Pop", isOn: $state.wordPopEnabled)
+                    .help("Each word lifts and brightens as the sweep reaches it (word-timed lyrics only).")
                 Toggle("Show Track Title in Bar", isOn: $state.showTrackTitle)
+            }
+
+            Section("Line Transition") {
+                Picker("Style", selection: $state.lineTransitionStyle) {
+                    ForEach(LineTransitionStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                if state.lineTransitionStyle != .none {
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Speed")
+                            Spacer()
+                            Text(String(format: "%.2f s", state.lineTransitionDuration))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $state.lineTransitionDuration, in: LyricsState.lineTransitionDurationRange, step: 0.05)
+                    }
+                    Toggle("Start Early", isOn: $state.lineTransitionStartsEarly)
+                        .help("Show the next line one transition early, so it is in place when the singing starts.")
+                }
             }
         }
         .formStyle(.grouped)

@@ -159,6 +159,28 @@ enum FontWeightOption: String, CaseIterable, Identifiable {
     }
 }
 
+enum LineTransitionStyle: String, CaseIterable, Identifiable {
+    case subtle
+    case slide
+    case blurFade
+    case pop
+    case push
+    case none
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .subtle: return "Subtle"
+        case .slide: return "Slide"
+        case .blurFade: return "Blur Fade"
+        case .pop: return "Pop"
+        case .push: return "Push"
+        case .none: return "None"
+        }
+    }
+}
+
 enum VisualizerStyle: String, CaseIterable, Identifiable {
     case bars
     case wave
@@ -305,6 +327,10 @@ final class LyricsState: ObservableObject {
         static let showEqualizer = "bartune.showEqualizer"
         static let animateVisualizer = "bartune.animateVisualizer"
         static let visualizerStyle = "bartune.visualizerStyle"
+        static let lineTransitionStyle = "bartune.lineTransitionStyle"
+        static let lineTransitionDuration = "bartune.lineTransitionDuration"
+        static let lineTransitionStartsEarly = "bartune.lineTransitionStartsEarly"
+        static let wordPopEnabled = "bartune.wordPopEnabled"
         static let visualizerColorTheme = "bartune.visualizerColorTheme"
         static let visualizerWidth = "bartune.visualizerWidth"
         static let fontSize = "bartune.fontSize"
@@ -405,6 +431,36 @@ final class LyricsState: ObservableObject {
 
     @Published var visualizerStyle: VisualizerStyle {
         didSet { userDefaults.set(visualizerStyle.rawValue, forKey: Keys.visualizerStyle) }
+    }
+
+    static let lineTransitionDurationRange: ClosedRange<Double> = 0.15...0.6
+
+    @Published var lineTransitionStyle: LineTransitionStyle {
+        didSet { userDefaults.set(lineTransitionStyle.rawValue, forKey: Keys.lineTransitionStyle) }
+    }
+
+    /// Seconds one line takes to replace the previous one.
+    @Published var lineTransitionDuration: Double {
+        didSet {
+            let range = Self.lineTransitionDurationRange
+            if !range.contains(lineTransitionDuration) {
+                lineTransitionDuration = min(range.upperBound, max(range.lowerBound, lineTransitionDuration))
+            }
+            userDefaults.set(lineTransitionDuration, forKey: Keys.lineTransitionDuration)
+        }
+    }
+
+    /// Changes line one transition early, so the new line is in place when its singing starts.
+    @Published var lineTransitionStartsEarly: Bool {
+        didSet { userDefaults.set(lineTransitionStartsEarly, forKey: Keys.lineTransitionStartsEarly) }
+    }
+
+    @Published var wordPopEnabled: Bool {
+        didSet { userDefaults.set(wordPopEnabled, forKey: Keys.wordPopEnabled) }
+    }
+
+    private var lineTransitionLead: Double {
+        lineTransitionStartsEarly && lineTransitionStyle != .none ? lineTransitionDuration : 0
     }
 
     @Published var visualizerColorTheme: VisualizerColorTheme {
@@ -645,6 +701,15 @@ final class LyricsState: ObservableObject {
         self.karaokeAnimationEnabled = ud.object(forKey: Keys.karaokeEnabled) as? Bool ?? true
         self.showEqualizer = ud.object(forKey: Keys.showEqualizer) as? Bool ?? true
         self.animateVisualizer = ud.object(forKey: Keys.animateVisualizer) as? Bool ?? true
+        self.lineTransitionStyle = ud.string(forKey: Keys.lineTransitionStyle)
+            .flatMap(LineTransitionStyle.init(rawValue:)) ?? .subtle
+        let savedDuration = ud.object(forKey: Keys.lineTransitionDuration) as? Double ?? 0.28
+        self.lineTransitionDuration = min(
+            Self.lineTransitionDurationRange.upperBound,
+            max(Self.lineTransitionDurationRange.lowerBound, savedDuration)
+        )
+        self.lineTransitionStartsEarly = ud.object(forKey: Keys.lineTransitionStartsEarly) as? Bool ?? false
+        self.wordPopEnabled = ud.object(forKey: Keys.wordPopEnabled) as? Bool ?? false
         if let raw = ud.string(forKey: Keys.visualizerStyle), let parsed = VisualizerStyle(rawValue: raw) {
             self.visualizerStyle = parsed
         } else {
@@ -985,12 +1050,13 @@ final class LyricsState: ObservableObject {
         }
 
         var matchedIndex: Int?
+        let selectionPos = effectivePos + lineTransitionLead
 
         var lo = 0
         var hi = lines.count - 1
         while lo <= hi {
             let mid = (lo + hi) / 2
-            if lines[mid].timestamp <= effectivePos {
+            if lines[mid].timestamp <= selectionPos {
                 matchedIndex = mid
                 lo = mid + 1
             } else {
@@ -1021,6 +1087,39 @@ final class LyricsState: ObservableObject {
             activeLineNextTimestamp = 0.0
             lineProgress = 0.0
         }
+    }
+
+    struct WordPop: Equatable {
+        /// The popping word's span, as shares of the rendered line width.
+        let start: Double
+        let end: Double
+        /// 0...1: rises over `attack` seconds from the word's start, then fades over `release`.
+        let strength: Double
+    }
+
+    /// The word sung most recently and how strongly it pops at `position`; nil before the first word
+    /// or when `boundaries` (`words.count + 1` values) don't describe the words.
+    static func wordPop(
+        words: [WordTimestamp],
+        boundaries: [Double],
+        position: Double,
+        attack: Double = 0.08,
+        release: Double = 0.32
+    ) -> WordPop? {
+        guard boundaries.count == words.count + 1,
+              let index = words.lastIndex(where: { $0.timestamp <= position })
+        else { return nil }
+        let elapsed = position - words[index].timestamp
+        let strength = elapsed < attack ? elapsed / attack : max(0, 1 - (elapsed - attack) / release)
+        return WordPop(start: boundaries[index], end: boundaries[index + 1], strength: strength)
+    }
+
+    /// The word popping now on the active line, for the overlay; nil without measured word positions.
+    func liveWordPop(at date: Date, font: NSFont) -> WordPop? {
+        guard isPlaying, let line = activeLine, let boundaries = wordBoundaries(for: line, font: font) else { return nil }
+        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
+        let position = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
+        return Self.wordPop(words: line.words, boundaries: boundaries, position: position)
     }
 
     private struct BoundaryKey: Equatable {
