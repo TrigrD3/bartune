@@ -347,6 +347,7 @@ final class LyricsState: ObservableObject {
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
         static let browserYouTubeVideosEnabled = "bartune.browserYouTubeVideosEnabled"
         static let trackOffsets = "bartune.trackOffsets"
+        static let trackLyricSources = "bartune.trackLyricSources"
         static let audioSyncEngine = "bartune.audioSyncEngine"
         static let whisperModelPath = "bartune.whisperModelPath"
         static let replaceLyricsWithTranscription = "bartune.replaceLyricsWithTranscription"
@@ -370,6 +371,7 @@ final class LyricsState: ObservableObject {
     var playbackRate: Double = 1.0
     @Published var cursorLocalX: CGFloat? = nil
     @Published var trackSummary: String = "Not Playing"
+    @Published private(set) var currentTrack: TrackInfo? = nil
     @Published var isPlaying: Bool = false
     @Published var isEnabled: Bool = true
     @Published var hasLyrics: Bool = false
@@ -646,6 +648,7 @@ final class LyricsState: ObservableObject {
     private var isChineseSong: Bool = false
     private var currentTrackId: String?
     private var trackOffsets: [String: Double] = [:]
+    private var trackLyricSources: [String: String] = [:]
     private var isRestoringOffset: Bool = false
     private var isSyncingLaunchAtLogin: Bool = false
 
@@ -767,14 +770,44 @@ final class LyricsState: ObservableObject {
         let storedLimit = LyricsDiskCache.configuredMaxEntries(from: ud)
         self.lyricsCacheLimit = LyricsCacheLimit(rawValue: storedLimit) ?? .songs1000
         self.trackOffsets = ud.dictionary(forKey: Keys.trackOffsets) as? [String: Double] ?? [:]
+        self.trackLyricSources = ud.dictionary(forKey: Keys.trackLyricSources) as? [String: String] ?? [:]
 
         self.isSyncingLaunchAtLogin = true
         self.launchAtLogin = (SMAppService.mainApp.status == .enabled)
         self.isSyncingLaunchAtLogin = false
     }
 
+    func lyricSourceChoice(for trackId: String) -> TrackLyricSource? {
+        trackLyricSources[trackId].flatMap(TrackLyricSource.init(rawValue:))
+    }
+
+    func setLyricSourceChoice(_ choice: TrackLyricSource?, for trackId: String) {
+        if let choice {
+            trackLyricSources[trackId] = choice.rawValue
+            if trackLyricSources.count > Self.maxStoredOffsets,
+               let victim = trackLyricSources.keys.first(where: { $0 != trackId }) {
+                trackLyricSources.removeValue(forKey: victim)
+            }
+        } else {
+            trackLyricSources.removeValue(forKey: trackId)
+        }
+        userDefaults.set(trackLyricSources, forKey: Keys.trackLyricSources)
+    }
+
+    /// Current playback position in track seconds without the per-track sync offset, used for manual stamping.
+    func currentPlaybackPosition(at date: Date = Date()) -> Double {
+        let elapsed = isPlaying ? max(0.0, date.timeIntervalSince(playbackAnchorDate)) : 0.0
+        return max(0.0, playbackAnchorPosition + elapsed * playbackRate)
+    }
+
+    func refreshActiveLineForCurrentPosition(at date: Date = Date()) {
+        guard isPlaying, !activeLines.isEmpty else { return }
+        syncActiveLine(for: currentPlaybackPosition(at: date) + offsetSeconds, in: activeLines)
+    }
+
     func setTrack(_ track: TrackInfo?, lyrics: [LyricLine]) {
         let previousTrackId = currentTrackId
+        currentTrack = track
         currentTrackId = track?.id
         if currentTrackId != previousTrackId {
             isRestoringOffset = true
