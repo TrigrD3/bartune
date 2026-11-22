@@ -77,4 +77,28 @@ final class KaraokeGlyphProgressTests: XCTestCase {
             }
         }
     }
+
+    func testClockIgnoresSmallJitterButFollowsSeeksAndStateChanges() throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        state.setTrack(track, lyrics: [LyricLine(id: 0, timestamp: 0, text: "line")])
+
+        state.updatePlayback(isPlaying: true, position: 20.0)
+        let anchorDate = state.playbackAnchorDate
+
+        state.updatePlayback(isPlaying: true, position: 20.05)
+        XCTAssertEqual(state.playbackAnchorDate, anchorDate, "a 50 ms report is jitter")
+        XCTAssertEqual(state.playbackAnchorPosition, 20.0)
+
+        state.updatePlayback(isPlaying: true, position: 20.3)
+        XCTAssertEqual(state.playbackAnchorPosition, 20.3, "300 ms is a real correction")
+
+        state.updatePlayback(isPlaying: true, position: 20.31, playbackRate: 2.0)
+        XCTAssertEqual(state.playbackAnchorPosition, 20.31, "a rate change re-anchors")
+
+        state.updatePlayback(isPlaying: false, position: 20.32, playbackRate: 2.0)
+        XCTAssertEqual(state.playbackAnchorPosition, 20.32, "pausing re-anchors")
+    }
 }

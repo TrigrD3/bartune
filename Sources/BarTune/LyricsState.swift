@@ -907,12 +907,23 @@ final class LyricsState: ObservableObject {
         }
     }
 
+    /// Position reports closer than this to the running clock are poll jitter, not seeks.
+    static let clockDeadband: Double = 0.075
+
     func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0) {
+        let now = Date()
+        let predicted = playbackAnchorPosition
+            + (self.isPlaying ? max(0, now.timeIntervalSince(playbackAnchorDate)) * self.playbackRate : 0)
+        let keepsClock = isPlaying && self.isPlaying
+            && playbackRate == self.playbackRate
+            && abs(position - predicted) < Self.clockDeadband
         if self.isPlaying != isPlaying {
             self.isPlaying = isPlaying
         }
-        playbackAnchorPosition = position
-        playbackAnchorDate = Date()
+        if !keepsClock {
+            playbackAnchorPosition = position
+            playbackAnchorDate = now
+        }
         self.playbackRate = playbackRate
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
