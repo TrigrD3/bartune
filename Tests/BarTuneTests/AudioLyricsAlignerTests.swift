@@ -134,6 +134,29 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(words[2].startTime, 27.0, accuracy: 0.001)
     }
 
+    func testAudioSyncedLyricsCacheDiscardsAppleSpeechRecords() throws {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "spotify:track:apple",
+                engine: .whisper,
+                syncedAt: Date(),
+                medianOffset: 0.1,
+                alignedLineCount: 1,
+                lines: [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+            )
+        )
+        let url = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
+                .first { $0.pathExtension == "json" }
+        )
+        let json = try String(contentsOf: url, encoding: .utf8)
+        try json.replacingOccurrences(of: "\"whisper\"", with: "\"appleSpeech\"").write(to: url, atomically: true, encoding: .utf8)
+
+        XCTAssertNil(cache.load(trackId: "spotify:track:apple"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+    }
+
     func testAudioSyncedLyricsCacheRoundTripAndClear() {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let lines = [
@@ -306,7 +329,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(cachedBadge?.text, "Synced")
         XCTAssertEqual(cachedBadge?.isSynced, true)
 
-        let listeningBadge = AudioSyncStatus.syncing(engine: .appleSpeech, alignedLines: 0, totalLines: 10).overlayBadge
+        let listeningBadge = AudioSyncStatus.syncing(engine: .whisper, alignedLines: 0, totalLines: 10).overlayBadge
         XCTAssertEqual(listeningBadge?.text, "Listening")
         XCTAssertEqual(listeningBadge?.isSynced, false)
 
@@ -455,7 +478,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         state.replaceLyricsWithTranscription = false
 
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -485,7 +508,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         manager.handleTrackLoaded(track: track, rawLines: yrcLines)
 
         XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
     }
 
     func testTranscriptionOverwriteRejectsUnrelatedExternalSpeech() {
@@ -584,7 +607,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let singleLinePartial = AudioSyncedLyricsRecord(
             trackId: "spotify:track:partial",
-            engine: .appleSpeech,
+            engine: .whisper,
             syncedAt: Date(),
             medianOffset: 0.2,
             alignedLineCount: 1,
@@ -594,7 +617,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let outlierOffset = AudioSyncedLyricsRecord(
             trackId: "spotify:track:outlier",
-            engine: .appleSpeech,
+            engine: .whisper,
             syncedAt: Date(),
             medianOffset: 9.85,
             alignedLineCount: 3,

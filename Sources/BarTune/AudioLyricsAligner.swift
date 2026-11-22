@@ -4,7 +4,6 @@ import NaturalLanguage
 
 enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     case off = "off"
-    case appleSpeech = "appleSpeech"
     case whisper = "whisper"
 
     var id: String { rawValue }
@@ -12,7 +11,6 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     var title: String {
         switch self {
         case .off: return "Off"
-        case .appleSpeech: return "Apple Speech"
         case .whisper: return "Local Whisper"
         }
     }
@@ -21,8 +19,6 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .off:
             return "Uses fetched LRC/YRC timestamps only (no System Audio Recording permission required)."
-        case .appleSpeech:
-            return "Zero-dependency on-device Apple Speech alignment. Caches synced karaoke timings per track."
         case .whisper:
             return "Uses a local whisper-server (whisper.cpp) and shared GGML models for higher accuracy on singing vocals and multiple languages."
         }
@@ -202,10 +198,13 @@ struct AudioSyncedLyricsCache: Sendable {
 
     func load(trackId: String) -> AudioSyncedLyricsRecord? {
         let url = fileURL(for: trackId)
-        guard let data = try? Data(contentsOf: url),
-              let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: data),
-              !record.lines.isEmpty
-        else { return nil }
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        // A record that no longer decodes (e.g. from the removed Apple Speech engine) is dropped so the song syncs fresh.
+        guard let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: data) else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
+        guard !record.lines.isEmpty else { return nil }
         try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
         return record
     }
@@ -541,8 +540,8 @@ enum WhisperJSONParser {
 }
 
 enum LyricsLanguageDetector {
-    /// Detects the best speech recognition locale from fetched lyrics so Apple Speech
-    /// doesn't default to English on Japanese, Korean, Chinese, or other non-English songs.
+    /// Detects the lyric language from fetched lyrics so Whisper
+    /// doesn't guess it on Japanese, Korean, Chinese, or other non-English songs.
     static func detectSpeechLocale(for lines: [LyricLine]) -> Locale {
         guard !lines.isEmpty else { return .current }
         let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -600,7 +599,7 @@ enum LyricsAudioAligner {
         }
     }
 
-    /// Recognizers return Japanese and Chinese as single characters (Whisper) or whole phrases (Apple Speech).
+    /// Whisper returns Japanese and Chinese as single characters or, at times, whole phrases.
     /// Each unspaced CJK run is re-split with the lyric tokenizer, timing each character by interpolation
     /// inside its recognized word, so recognized words line up with lyric tokens.
     static func regroupCJKWords(_ words: [RecognizedAudioWord], maxGap: Double = 1.0) -> [RecognizedAudioWord] {

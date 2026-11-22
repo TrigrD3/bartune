@@ -160,6 +160,15 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertEqual(changeCount, 0, "Repeated ticks on an instrumental track must not trigger SwiftUI redraws")
     }
 
+    func testRemovedAppleSpeechEngineReadsAsOff() throws {
+        let (_, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        ud.set("appleSpeech", forKey: "bartune.audioSyncEngine")
+
+        XCTAssertEqual(LyricsState(userDefaults: ud).audioSyncEngine, .off)
+        XCTAssertEqual(AudioSyncEngine.allCases, [.off, .whisper])
+    }
+
     func testPersistedPreferencesWriteOnlyToInjectedUserDefaultsSuite() throws {
         let standard = UserDefaults.standard
         let trackedKeys = [
@@ -239,7 +248,7 @@ final class LyricsStateTests: XCTestCase {
         state.lowCPUMode = false
         state.browserMusicEnabled = false
         state.browserYouTubeVideosEnabled = true
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         state.whisperModelPath = "/tmp/model.bin"
         state.replaceLyricsWithTranscription = true
         state.showSyncBadge = false
@@ -279,7 +288,7 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertFalse(reloaded.lowCPUMode)
         XCTAssertFalse(reloaded.browserMusicEnabled)
         XCTAssertTrue(reloaded.browserYouTubeVideosEnabled)
-        XCTAssertEqual(reloaded.audioSyncEngine, .appleSpeech)
+        XCTAssertEqual(reloaded.audioSyncEngine, .whisper)
         XCTAssertEqual(reloaded.whisperModelPath, "/tmp/model.bin")
         XCTAssertTrue(reloaded.replaceLyricsWithTranscription)
         XCTAssertFalse(reloaded.showSyncBadge)

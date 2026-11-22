@@ -4,53 +4,11 @@ import CoreGraphics
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
-import Speech
 
 protocol AudioCaptureProviding: AnyObject {
     var onAudioSamples: (([Float], Double) -> Void)? { get set }
     @MainActor func start(targetBundleIds: Set<String>) async throws
     @MainActor func stop()
-}
-
-protocol SpeechRecognitionTaskHandling: AnyObject {
-    func cancel()
-}
-
-extension SFSpeechRecognitionTask: SpeechRecognitionTaskHandling {}
-
-struct SpeechRecognizedSegment: Sendable {
-    let substring: String
-    let timestamp: TimeInterval
-    let duration: TimeInterval
-    let confidence: Float
-}
-
-protocol SpeechRecognizing: AnyObject {
-    var isAvailable: Bool { get }
-    var supportsOnDeviceRecognition: Bool { get }
-    func startRecognitionTask(
-        with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
-    ) -> SpeechRecognitionTaskHandling
-}
-
-extension SFSpeechRecognizer: SpeechRecognizing {
-    func startRecognitionTask(
-        with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
-    ) -> SpeechRecognitionTaskHandling {
-        recognitionTask(with: request) { result, error in
-            let segments = result?.bestTranscription.segments.map {
-                SpeechRecognizedSegment(
-                    substring: $0.substring,
-                    timestamp: $0.timestamp,
-                    duration: $0.duration,
-                    confidence: $0.confidence
-                )
-            }
-            resultHandler(segments, result?.isFinal ?? false, error)
-        }
-    }
 }
 
 enum AudioSampleExtractor {
@@ -381,10 +339,6 @@ final class AudioSyncManager {
         var capture: AudioCaptureProviding
         var hasScreenCaptureAccess: () -> Bool
         var requestScreenCaptureAccess: () -> Void
-        var speechAuthorizationStatus: () -> SFSpeechRecognizerAuthorizationStatus
-        var requestSpeechAuthorization: (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void
-        var makeSpeechRecognizer: (Locale?) -> SpeechRecognizing?
-        var makeSpeechRequest: () -> SFSpeechAudioBufferRecognitionRequest
         var locateWhisperServer: () -> String?
         var resolveWhisperModelPath: @Sendable (String) -> String?
         var launchWhisper: @Sendable (_ serverPath: String, _ modelPath: String) async -> WhisperTranscribing?
@@ -395,17 +349,6 @@ final class AudioSyncManager {
                 capture: SystemAudioCapture(),
                 hasScreenCaptureAccess: { CGPreflightScreenCaptureAccess() },
                 requestScreenCaptureAccess: { CGRequestScreenCaptureAccess() },
-                speechAuthorizationStatus: { SFSpeechRecognizer.authorizationStatus() },
-                requestSpeechAuthorization: { handler in
-                    SFSpeechRecognizer.requestAuthorization(handler)
-                },
-                makeSpeechRecognizer: { locale in
-                    if let locale {
-                        return SFSpeechRecognizer(locale: locale)
-                    }
-                    return SFSpeechRecognizer()
-                },
-                makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
                 locateWhisperServer: { WhisperModelLocator.locateWhisperServer() },
                 resolveWhisperModelPath: { selected in
                     let trimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -440,17 +383,7 @@ final class AudioSyncManager {
     private var syncGeneration: UInt64 = 0
     private var captureTargetGeneration: UInt64 = 0
 
-    // Apple Speech state
-    private var speechRecognizer: SpeechRecognizing?
-    private var speechRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var speechTask: SpeechRecognitionTaskHandling?
-    /// Timed segments heard so far this session, in recognizer stream time.
-    private var speechSegments: [SpeechRecognizedSegment] = []
-    /// Track position and playback rate at each stream time where playback (re)started; a same-track seek or rate change appends one.
-    private var speechTimelineAnchors: [(streamTime: Double, trackPosition: Double, playbackRate: Double)] = []
-    private var speechStreamDuration: Double = 0
     private static let seekTolerance: Double = 2.0
-    private var speechAudioFormat: AVAudioFormat?
 
     // Whisper chunk state
     private var whisperSampleBuffer: [Float] = []
@@ -492,14 +425,6 @@ final class AudioSyncManager {
         isLiveSyncActive = false
         capture.onAudioSamples = nil
         capture.stop()
-        speechRequest?.endAudio()
-        speechTask?.cancel()
-        speechRequest = nil
-        speechTask = nil
-        speechRecognizer = nil
-        speechTimelineAnchors.removeAll(keepingCapacity: false)
-        speechStreamDuration = 0
-        speechSegments.removeAll(keepingCapacity: false)
         whisperStartupTask?.cancel()
         whisperStartupTask = nil
         whisperProcessingTask?.cancel()
@@ -655,9 +580,6 @@ final class AudioSyncManager {
 
     func handlePlaybackStateChanged(isPlaying: Bool, position: Double, playbackRate: Double? = nil) {
         let resolvedRate = Self.sanitizedPlaybackRate(playbackRate ?? state.playbackRate)
-        if isPlaying {
-            reanchorSpeechTimelineIfNeeded(to: position, playbackRate: resolvedRate)
-        }
         discardWhisperChunkIfSeeked(to: position, playbackRate: resolvedRate, isPlaying: isPlaying)
         guard !isPlaying, isLiveSyncActive else { return }
         // Persist whatever alignment we gathered before pausing/stopping.
@@ -666,27 +588,6 @@ final class AudioSyncManager {
 
     private static func sanitizedPlaybackRate(_ rate: Double) -> Double {
         (rate.isFinite && rate > 0) ? rate : 1.0
-    }
-
-    private func reanchorSpeechTimelineIfNeeded(to position: Double, playbackRate: Double) {
-        guard isLiveSyncActive, speechRequest != nil, let anchor = speechTimelineAnchors.last else { return }
-        let expected = anchor.trackPosition + (speechStreamDuration - anchor.streamTime) * anchor.playbackRate
-        let seeked = abs(position - expected) > Self.seekTolerance
-        let rateChanged = abs(playbackRate - anchor.playbackRate) > 0.001
-        guard seeked || rateChanged else { return }
-        if anchor.streamTime == speechStreamDuration {
-            speechTimelineAnchors[speechTimelineAnchors.count - 1] = (
-                streamTime: speechStreamDuration,
-                trackPosition: position,
-                playbackRate: playbackRate
-            )
-        } else {
-            speechTimelineAnchors.append((
-                streamTime: speechStreamDuration,
-                trackPosition: position,
-                playbackRate: playbackRate
-            ))
-        }
     }
 
     private func discardWhisperChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
@@ -718,19 +619,6 @@ final class AudioSyncManager {
         }
     }
 
-    private func speechAnchor(forStreamTime streamTime: Double) -> (streamTime: Double, trackPosition: Double, playbackRate: Double)? {
-        speechTimelineAnchors.last(where: { $0.streamTime <= streamTime }) ?? speechTimelineAnchors.first
-    }
-
-    private func speechPlaybackRate(forStreamTime streamTime: Double) -> Double {
-        speechAnchor(forStreamTime: streamTime)?.playbackRate ?? 1.0
-    }
-
-    private func trackPosition(forSpeechStreamTime streamTime: Double) -> Double {
-        guard let anchor = speechAnchor(forStreamTime: streamTime) else { return streamTime }
-        return anchor.trackPosition + (streamTime - anchor.streamTime) * anchor.playbackRate
-    }
-
     func resyncCurrentTrack() {
         guard let trackId = activeTrackId, !baseLines.isEmpty else { return }
         let track = TrackInfo(
@@ -760,24 +648,9 @@ final class AudioSyncManager {
         switch engine {
         case .off:
             state.audioSyncStatus = .idle
-        case .appleSpeech:
-            startAppleSpeechSync(track: track, lines: lines)
         case .whisper:
             startWhisperSync(track: track, lines: lines)
         }
-    }
-
-    /// Apple Speech restarts its transcript after a pause and reports partial-result segments untimed
-    /// (timestamp and duration 0), so earlier timed segments are kept and each result only revises
-    /// from its own first timed segment onward.
-    nonisolated static func mergeSpeechSegments(
-        _ committed: [SpeechRecognizedSegment],
-        with incoming: [SpeechRecognizedSegment]
-    ) -> [SpeechRecognizedSegment] {
-        let timed = incoming.filter { $0.timestamp > 0 || $0.duration > 0 }
-        guard let cutoff = timed.first?.timestamp else { return committed }
-        // The tolerance absorbs a revised first word whose start moved slightly later.
-        return committed.filter { $0.timestamp < cutoff - 0.25 } + timed
     }
 
     private func handleCaptureStartFailure(_ error: Error, generation: UInt64) {
@@ -788,162 +661,6 @@ final class AudioSyncManager {
         } else {
             state.audioSyncStatus = .permissionRequired("Audio capture failed: \(error.localizedDescription)")
         }
-    }
-
-    private func startAppleSpeechSync(track: TrackInfo, lines: [LyricLine]) {
-        let generation = syncGeneration
-        let authStatus = dependencies.speechAuthorizationStatus()
-        if authStatus == .notDetermined {
-            dependencies.requestSpeechAuthorization { [weak self] newStatus in
-                Task { @MainActor in
-                    guard let self,
-                          self.syncGeneration == generation,
-                          self.activeTrackId == track.id,
-                          self.state.audioSyncEngine == .appleSpeech
-                    else { return }
-                    if newStatus == .authorized {
-                        self.beginAppleSpeechSession(track: track, lines: lines, generation: generation)
-                    } else {
-                        self.state.audioSyncStatus = .permissionRequired("Speech Recognition permission required")
-                    }
-                }
-            }
-            return
-        }
-
-        guard authStatus == .authorized else {
-            state.audioSyncStatus = .permissionRequired("Speech Recognition permission required")
-            return
-        }
-
-        beginAppleSpeechSession(track: track, lines: lines, generation: generation)
-    }
-
-    private func beginAppleSpeechSession(track: TrackInfo, lines: [LyricLine], generation: UInt64) {
-        guard syncGeneration == generation,
-              activeTrackId == track.id,
-              state.audioSyncEngine == .appleSpeech
-        else { return }
-
-        let detectedLocale = LyricsLanguageDetector.detectSpeechLocale(for: lines)
-        var usesFallback = false
-        var selectedRecognizer: SpeechRecognizing?
-        if let preferred = dependencies.makeSpeechRecognizer(detectedLocale),
-           preferred.isAvailable,
-           preferred.supportsOnDeviceRecognition {
-            selectedRecognizer = preferred
-        } else if let fallback = dependencies.makeSpeechRecognizer(nil),
-                  fallback.isAvailable,
-                  fallback.supportsOnDeviceRecognition {
-            selectedRecognizer = fallback
-            usesFallback = true
-        }
-
-        guard let recognizer = selectedRecognizer else {
-            diagnostics.note("No on-device Apple Speech recognizer for \(detectedLocale.identifier) or the system locale")
-            state.audioSyncStatus = .unavailable("On-device Apple Speech recognition is unavailable for this locale")
-            return
-        }
-        diagnostics.update { $0.localeIdentifier = detectedLocale.identifier }
-        if usesFallback {
-            diagnostics.note("\(detectedLocale.identifier) has no on-device recognizer; using the system default locale")
-        }
-
-        let request = dependencies.makeSpeechRequest()
-        request.shouldReportPartialResults = true
-        request.requiresOnDeviceRecognition = true
-        request.contextualStrings = Array(lines.prefix(40).map(\.text))
-
-        let anchorPos = currentPlaybackPosition()
-        let initialRate = Self.sanitizedPlaybackRate(state.playbackRate)
-        speechRecognizer = recognizer
-        speechRequest = request
-        speechTimelineAnchors = [(streamTime: 0, trackPosition: anchorPos, playbackRate: initialRate)]
-        speechStreamDuration = 0
-        speechAudioFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16000, channels: 1, interleaved: false)
-
-        state.audioSyncStatus = .syncing(engine: .appleSpeech, alignedLines: 0, totalLines: lines.count)
-
-        speechTask = recognizer.startRecognitionTask(with: request) { [weak self] segments, isFinal, error in
-            Task { @MainActor in
-                guard let self,
-                      self.syncGeneration == generation,
-                      self.activeTrackId == track.id,
-                      self.state.audioSyncEngine == .appleSpeech
-                else { return }
-                if let segments {
-                    self.speechSegments = Self.mergeSpeechSegments(self.speechSegments, with: segments)
-                    let words: [RecognizedAudioWord] = self.speechSegments.map { seg in
-                        let rate = self.speechPlaybackRate(forStreamTime: seg.timestamp)
-                        return RecognizedAudioWord(
-                            text: seg.substring,
-                            startTime: self.trackPosition(forSpeechStreamTime: seg.timestamp),
-                            duration: max(0.05, seg.duration * rate),
-                            confidence: Double(seg.confidence)
-                        )
-                    }
-                    self.recognizedWords = words
-                    self.diagnostics.update { $0.record(words: words, replacing: true) }
-                    self.applyAlignment(engine: .appleSpeech)
-                }
-                if error != nil || isFinal, self.isLiveSyncActive {
-                    // applyAlignment above already saved this callback's words.
-                    if segments == nil {
-                        self.persistCurrentAlignmentIfReady()
-                    }
-                    self.stop()
-                    let message = error.map { "Apple Speech recognition stopped: \($0.localizedDescription)" }
-                        ?? "Apple Speech recognition finished before syncing completed"
-                    self.diagnostics.note(message)
-                    self.state.audioSyncStatus = .unavailable(message)
-                }
-            }
-        }
-
-        capture.onAudioSamples = { [weak self] samples, sampleRate in
-            Task { @MainActor in
-                guard let self,
-                      self.syncGeneration == generation,
-                      self.isLiveSyncActive,
-                      self.state.audioSyncEngine == .appleSpeech,
-                      let req = self.speechRequest
-                else { return }
-                let format: AVAudioFormat
-                if let cached = self.speechAudioFormat, cached.sampleRate == sampleRate {
-                    format = cached
-                } else if let created = AVAudioFormat(
-                    commonFormat: .pcmFormatFloat32,
-                    sampleRate: sampleRate,
-                    channels: 1,
-                    interleaved: false
-                ) {
-                    self.speechAudioFormat = created
-                    format = created
-                } else {
-                    return
-                }
-                guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else {
-                    return
-                }
-
-                buffer.frameLength = AVAudioFrameCount(samples.count)
-                if let channelData = buffer.floatChannelData?[0] {
-                    samples.withUnsafeBufferPointer { src in
-                        if let base = src.baseAddress {
-                            channelData.update(from: base, count: samples.count)
-                        }
-                    }
-                }
-                req.append(buffer)
-                if sampleRate > 0 {
-                    self.speechStreamDuration += Double(samples.count) / sampleRate
-                    self.diagnostics.recordAudio(totalSeconds: self.speechStreamDuration)
-                }
-            }
-        }
-
-        isLiveSyncActive = true
-        startCaptureForCurrentTarget(trackId: track.id, engine: .appleSpeech, generation: generation)
     }
 
     private func startWhisperSync(track: TrackInfo, lines: [LyricLine]) {

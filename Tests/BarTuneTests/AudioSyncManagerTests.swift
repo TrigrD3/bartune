@@ -3,7 +3,6 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import ScreenCaptureKit
-import Speech
 import XCTest
 
 final class AudioSyncManagerTests: XCTestCase {
@@ -239,201 +238,6 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(nonInterleaved.count, 2)
         XCTAssertEqual(nonInterleaved[0], 0.5, accuracy: 0.0001)
         XCTAssertEqual(nonInterleaved[1], -0.5, accuracy: 0.0001)
-    }
-
-    // MARK: - #54: On-device Apple Speech privacy guard
-
-    @MainActor
-    func testAppleSpeechRefusesCloudOnlyRecognizersAndNeverStartsCapture() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let preferredRecognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: false)
-        let defaultRecognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: false)
-
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .authorized,
-            makeSpeechRecognizer: { locale in
-                locale == nil ? defaultRecognizer : preferredRecognizer
-            }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        await Task.yield()
-
-        XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(fakeCapture.startCount, 0)
-        XCTAssertTrue(preferredRecognizer.startedRequests.isEmpty)
-        XCTAssertTrue(defaultRecognizer.startedRequests.isEmpty)
-        if case .unavailable = state.audioSyncStatus {
-            // Expected
-        } else {
-            XCTFail("Expected .unavailable status when on-device speech recognition is unsupported, got \(state.audioSyncStatus)")
-        }
-    }
-
-    @MainActor
-    func testAppleSpeechFallsBackToDefaultLocaleOnlyWhenOnDeviceSupported() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let preferredRecognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: false)
-        let defaultRecognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .authorized,
-            makeSpeechRecognizer: { locale in
-                locale == nil ? defaultRecognizer : preferredRecognizer
-            }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        await Task.yield()
-
-        XCTAssertTrue(manager.isLiveSyncActive)
-        XCTAssertEqual(fakeCapture.startCount, 1)
-        XCTAssertTrue(preferredRecognizer.startedRequests.isEmpty)
-        XCTAssertEqual(defaultRecognizer.startedRequests.count, 1)
-        XCTAssertEqual(defaultRecognizer.startedRequests.first?.requiresOnDeviceRecognition, true)
-    }
-
-    // MARK: - #55: Stale Speech authorization callback
-
-    @MainActor
-    func testStaleSpeechAuthCallbackDoesNotStartCaptureAfterSwitchingOff() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-
-        var pendingAuthCallback: (@Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void)?
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .notDetermined,
-            requestSpeechAuth: { handler in
-                pendingAuthCallback = handler
-            },
-            makeSpeechRecognizer: { _ in recognizer }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        let track = sampleTrack()
-        let lines = sampleLines()
-
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        XCTAssertNotNil(pendingAuthCallback)
-
-        // User turns audio sync off while the Speech permission prompt is still open.
-        state.audioSyncEngine = .off
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        XCTAssertEqual(state.audioSyncStatus, .idle)
-
-        // Stale permission callback arrives later with .authorized.
-        pendingAuthCallback?(.authorized)
-        for _ in 0..<5 {
-            await Task.yield()
-        }
-
-        XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(fakeCapture.startCount, 0)
-        XCTAssertTrue(recognizer.startedRequests.isEmpty)
-        XCTAssertEqual(state.audioSyncStatus, .idle)
-    }
-
-    @MainActor
-    func testStaleSpeechAuthCallbackIsIgnoredAfterRestartOnSameTrackAndEngine() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-
-        var authCallbacks: [@Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void] = []
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .notDetermined,
-            requestSpeechAuth: { handler in
-                authCallbacks.append(handler)
-            },
-            makeSpeechRecognizer: { _ in recognizer }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        let track = sampleTrack()
-        let lines = sampleLines()
-
-        // Apple Speech -> off -> Apple Speech on the same track while the first prompt is still pending.
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        manager.stop()
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        XCTAssertEqual(authCallbacks.count, 2)
-
-        authCallbacks[0](.authorized)
-        for _ in 0..<5 {
-            await Task.yield()
-        }
-
-        XCTAssertTrue(recognizer.startedRequests.isEmpty)
-        XCTAssertEqual(fakeCapture.startCount, 0)
-        XCTAssertFalse(manager.isLiveSyncActive)
-
-        authCallbacks[1](.authorized)
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-
-        XCTAssertTrue(started)
-        XCTAssertEqual(recognizer.startedRequests.count, 1)
-        XCTAssertEqual(fakeCapture.startCount, 1)
-    }
-
-    @MainActor
-    func testStaleSpeechAuthCallbackDoesNotClobberWhisperEngine() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-
-        var pendingAuthCallback: (@Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void)?
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .notDetermined,
-            requestSpeechAuth: { handler in
-                pendingAuthCallback = handler
-            },
-            makeSpeechRecognizer: { _ in recognizer },
-            locateWhisperServer: { "/usr/local/bin/whisper-server" },
-            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        let track = sampleTrack()
-        let lines = sampleLines()
-
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        XCTAssertNotNil(pendingAuthCallback)
-
-        // User switches to Whisper before Apple Speech auth completes.
-        state.audioSyncEngine = .whisper
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        let whisperStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(whisperStarted)
-
-        XCTAssertTrue(manager.isLiveSyncActive)
-        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count))
-        let captureStartsBeforeCallback = fakeCapture.startCount
-
-        pendingAuthCallback?(.authorized)
-        for _ in 0..<5 {
-            await Task.yield()
-        }
-
-        XCTAssertTrue(recognizer.startedRequests.isEmpty)
-        XCTAssertEqual(fakeCapture.startCount, captureStartsBeforeCallback)
-        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count))
     }
 
     // MARK: - #64: Whisper Pipe deadlock & unbounded sample buffer
@@ -737,21 +541,14 @@ final class AudioSyncManagerTests: XCTestCase {
     @MainActor
     func testStopBeforeCaptureStartTaskRunsSkipsCaptureStart() async {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(
-            isAvailable: true,
-            supportsOnDeviceRecognition: true
-        )
-
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            speechAuthStatus: .authorized,
-            makeSpeechRecognizer: { _ in recognizer }
-        )
+        let deps = whisperDependencies(capture: fakeCapture, feed: LockedBox([]))
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let launched = await waitUntil { manager.isLiveSyncActive }
+        XCTAssertTrue(launched)
         // Stop immediately before the deferred capture.start Task runs.
         manager.stop()
 
@@ -799,72 +596,6 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertFalse(ranOnMainThread.withLock { $0 }, "Whisper model discovery must run off the main actor")
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(fakeCapture.startCount, 0)
-    }
-
-    // MARK: - #62: Same-track seek re-anchors Apple Speech segment timing
-
-    @MainActor
-    func testSameTrackSeekReanchorsSpeech() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        state.playbackAnchorPosition = 10.0
-        state.playbackAnchorDate = Date()
-        state.isPlaying = false
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-
-        // 2 s of audio at track time 10 s, then a seek to 90 s on the same playing track.
-        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
-        for _ in 0..<10 {
-            await Task.yield()
-        }
-        manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
-
-        let segments = [
-            SpeechRecognizedSegment(substring: "before", timestamp: 1.0, duration: 0.3, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "after", timestamp: 3.0, duration: 0.3, confidence: 0.9),
-        ]
-        recognizer.resultHandlers.first?(segments, false, nil)
-        let delivered = await waitUntil { manager.recognizedWords.count == 2 }
-        XCTAssertTrue(delivered)
-
-        XCTAssertEqual(manager.recognizedWords.first?.startTime ?? -1, 11.0, accuracy: 0.01)
-        XCTAssertEqual(manager.recognizedWords.last?.startTime ?? -1, 91.0, accuracy: 0.01)
-    }
-
-    // MARK: - #65: Terminal recognition error ends the session
-
-    @MainActor
-    func testTerminalSpeechErrorStopsCapture() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-        let stopsBeforeError = fakeCapture.stopCount
-
-        let error = NSError(domain: "kAFAssistantErrorDomain", code: 1110, userInfo: [
-            NSLocalizedDescriptionKey: "No speech detected",
-        ])
-        recognizer.resultHandlers.first?(nil, false, error)
-        let ended = await waitUntil { !manager.isLiveSyncActive }
-
-        XCTAssertTrue(ended)
-        XCTAssertEqual(fakeCapture.stopCount, stopsBeforeError + 1)
-        XCTAssertNil(fakeCapture.onAudioSamples)
-        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
-        XCTAssertEqual(state.audioSyncStatus, .unavailable("Apple Speech recognition stopped: No speech detected"))
     }
 
     // MARK: - #63: Late Whisper completion after a same-track restart
@@ -945,7 +676,7 @@ final class AudioSyncManagerTests: XCTestCase {
         releaseB.signal()
     }
 
-    // MARK: - #115: Seek discards partial Whisper chunk & Speech re-anchors on playback rate changes
+    // MARK: - #115: Seek discards partial Whisper chunk
 
     @MainActor
     func testWhisperDiscardsPartialChunkOnSameTrackSeek() async {
@@ -1200,210 +931,40 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(recordedRequests.withLock { $0.first?.playbackRate } ?? -1, 2.0, accuracy: 0.001)
     }
 
-    @MainActor
-    func testAppleSpeechReanchorsOnPlaybackRateChangeFrom1xTo2x() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        state.playbackAnchorPosition = 10.0
-        state.playbackAnchorDate = Date()
-        state.isPlaying = false
-        state.playbackRate = 1.0
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-
-        // 2 s of audio at 1x -> media position reaches 12.0.
-        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
-        for _ in 0..<10 {
-            await Task.yield()
-        }
-
-        // Switch playback rate from 1x to 2x at track position 12.0 without seeking.
-        state.playbackRate = 2.0
-        manager.handlePlaybackStateChanged(isPlaying: true, position: 12.0)
-
-        // 2 s more captured audio at 2x -> media advances by 4 s (12.0 -> 16.0).
-        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
-        for _ in 0..<10 {
-            await Task.yield()
-        }
-
-        let segments = [
-            SpeechRecognizedSegment(substring: "oneX", timestamp: 1.0, duration: 0.3, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "switch", timestamp: 2.0, duration: 0.2, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "twoXMid", timestamp: 3.0, duration: 0.3, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "twoXEnd", timestamp: 4.0, duration: 0.2, confidence: 0.9),
-        ]
-        recognizer.resultHandlers.first?(segments, false, nil)
-        guard await waitUntil({ manager.recognizedWords.count == 4 }) else {
-            XCTFail("Expected four recognized words, got \(manager.recognizedWords.count)")
-            return
-        }
-
-        XCTAssertEqual(manager.recognizedWords[0].startTime, 11.0, accuracy: 0.01)
-        XCTAssertEqual(manager.recognizedWords[1].startTime, 12.0, accuracy: 0.01)
-        XCTAssertEqual(manager.recognizedWords[2].startTime, 14.0, accuracy: 0.01)
-        XCTAssertEqual(manager.recognizedWords[3].startTime, 16.0, accuracy: 0.01)
-        XCTAssertEqual(manager.recognizedWords[2].duration, 0.6, accuracy: 0.01)
-    }
-
-    // MARK: - #114: Final Apple Speech result without error ends capture when below threshold
-
-    @MainActor
-    func testFinalSpeechResultBelowThresholdWithoutErrorStopsCaptureAndUpdatesStatus() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        state.playbackAnchorPosition = 10.0
-        state.playbackAnchorDate = Date()
-        state.isPlaying = false
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let spyRequest = SpySpeechRequest()
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            makeSpeechRecognizer: { _ in recognizer },
-            makeSpeechRequest: { spyRequest }
-        )
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-
-        // Feed audio before completion and confirm the request received it.
-        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 1600), sampleRate: 16000)
-        let firstAppend = await waitUntil { spyRequest.appendCount == 1 }
-        XCTAssertTrue(firstAppend)
-        let capturedClosureBeforeFinal = fakeCapture.onAudioSamples
-        let stopsBeforeFinal = fakeCapture.stopCount
-
-        // Deliver a final result matching only 1 of 2 lines (below confidentThreshold = 2) with nil error.
-        let partialSegments = [
-            SpeechRecognizedSegment(substring: "hello", timestamp: 0.1, duration: 0.2, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "world", timestamp: 0.4, duration: 0.2, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "from", timestamp: 0.7, duration: 0.2, confidence: 0.9),
-            SpeechRecognizedSegment(substring: "test", timestamp: 1.0, duration: 0.2, confidence: 0.9),
-        ]
-        recognizer.resultHandlers.first?(partialSegments, true, nil)
-        let ended = await waitUntil { !manager.isLiveSyncActive }
-
-        XCTAssertTrue(ended)
-        XCTAssertEqual(fakeCapture.stopCount, stopsBeforeFinal + 1)
-        XCTAssertNil(fakeCapture.onAudioSamples)
-        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
-        XCTAssertGreaterThanOrEqual(spyRequest.endAudioCount, 1)
-        XCTAssertNil(state.audioSyncStatus.overlayBadge, "Visible overlay badge must not stay on Syncing/Listening after capture stops")
-        if case .unavailable = state.audioSyncStatus {
-            // Expected
-        } else {
-            XCTFail("Expected .unavailable status after final result below threshold, got \(state.audioSyncStatus)")
-        }
-
-        // Subsequent audio callbacks (even through a retained closure) must not reach the old request.
-        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 1600), sampleRate: 16000)
-        capturedClosureBeforeFinal?([Float](repeating: 0.2, count: 1600), 16000)
-        for _ in 0..<10 {
-            await Task.yield()
-        }
-        XCTAssertEqual(spyRequest.appendCount, 1)
-    }
-
     // MARK: - #137: Diagnostics record recognizer output even when no line matches
 
     @MainActor
-    func testDiagnosticsRecordUnmatchedSpeechResult() async {
+    func testDiagnosticsRecordUnmatchedRecognizerResult() async {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         state.isPlaying = false
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let feed = LockedBox<[[RecognizedAudioWord]]>([])
+        let deps = whisperDependencies(capture: fakeCapture, feed: feed)
         let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
         let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
         XCTAssertTrue(started)
 
-        let unrelated = [
-            SpeechRecognizedSegment(substring: "banana", timestamp: 0.1, duration: 0.2, confidence: 0.4),
-            SpeechRecognizedSegment(substring: "orange", timestamp: 0.5, duration: 0.2, confidence: 0.3),
-        ]
-        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 40000), sampleRate: 16000)
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 250), sampleRate: 100)
         let audioCounted = await waitUntil { manager.diagnostics.snapshot?.audioSeconds == 2 }
         XCTAssertTrue(audioCounted, "2.5 s of captured audio should read as 2 whole seconds")
-        recognizer.resultHandlers.first?(unrelated, false, nil)
-        let recorded = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        let unrelated = [
+            RecognizedAudioWord(text: "banana", startTime: 10.1, duration: 0.2, confidence: 0.4),
+            RecognizedAudioWord(text: "orange", startTime: 10.5, duration: 0.2, confidence: 0.3),
+        ]
+        let heard = await hear(unrelated, manager: manager, capture: fakeCapture, feed: feed)
 
-        XCTAssertTrue(recorded)
+        XCTAssertTrue(heard)
         let snapshot = manager.diagnostics.snapshot
-        XCTAssertEqual(snapshot?.engine, .appleSpeech)
-        XCTAssertEqual(snapshot?.localeIdentifier, "en-US")
+        XCTAssertEqual(snapshot?.engine, .whisper)
+        XCTAssertEqual(snapshot?.localeIdentifier, "en")
         XCTAssertEqual(snapshot?.recentWords.map(\.text), ["banana", "orange"])
         XCTAssertEqual(snapshot?.matchedLineCount, 0)
         XCTAssertEqual(snapshot?.totalLines, 2)
         XCTAssertEqual(snapshot?.lineResults.map(\.matched), [false, false])
-    }
-
-    // MARK: - #136: Apple Speech restarts its transcript after a pause
-
-    private func segment(_ text: String, _ timestamp: TimeInterval, duration: TimeInterval = 0.2) -> SpeechRecognizedSegment {
-        SpeechRecognizedSegment(substring: text, timestamp: timestamp, duration: duration, confidence: 0.9)
-    }
-
-    func testMergeKeepsEarlierSegmentsWhenTranscriptRestarts() {
-        let committed = [segment("hello", 1.0), segment("world", 1.5)]
-        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: [segment("again", 5.0)])
-        XCTAssertEqual(merged.map(\.substring), ["hello", "world", "again"])
-    }
-
-    func testMergeLetsAContinuingTranscriptReviseItsOwnWords() {
-        let committed = [segment("early", 0.5), segment("hello", 1.0), segment("word", 1.5)]
-        let revised = [segment("hello", 1.1), segment("world", 1.5), segment("again", 2.0)]
-        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: revised)
-        XCTAssertEqual(merged.map(\.substring), ["early", "hello", "world", "again"])
-    }
-
-    func testMergeIgnoresUntimedPartialSegments() {
-        let committed = [segment("hello", 1.0)]
-        let partial = [segment("hel", 0, duration: 0), segment("lo", 0, duration: 0)]
-        let merged = AudioSyncManager.mergeSpeechSegments(committed, with: partial)
-        XCTAssertEqual(merged.map(\.substring), ["hello"])
-    }
-
-    @MainActor
-    func testAppleSpeechAlignsLinesHeardBeforeATranscriptRestart() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
-        state.playbackAnchorPosition = 10.0
-        state.playbackAnchorDate = Date()
-        state.isPlaying = false
-        let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
-        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
-        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-
-        let firstPhrase = [segment("hello", 0.1), segment("world", 0.4), segment("from", 0.7), segment("test", 1.0)]
-        recognizer.resultHandlers.first?(firstPhrase, false, nil)
-        let firstMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 1 }
-        XCTAssertTrue(firstMatched)
-
-        // After a pause the transcript holds only the new phrase.
-        let secondPhrase = [segment("second", 5.1), segment("line", 5.4), segment("of", 5.7), segment("lyrics", 6.0)]
-        recognizer.resultHandlers.first?(secondPhrase, false, nil)
-        let bothMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 2 }
-
-        XCTAssertTrue(bothMatched, "got \(String(describing: manager.diagnostics.snapshot?.matchedLineCount)) matched lines")
-        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
-        XCTAssertEqual(manager.recognizedWords.map(\.text), ["hello", "world", "from", "test", "second", "line", "of", "lyrics"])
     }
 
     private static let tenLineWords = [
@@ -1419,45 +980,86 @@ final class AudioSyncManagerTests: XCTestCase {
         }
     }
 
-    /// Apple Speech segments for the first `count` lines, timed from a capture that starts at track time 10.
-    private func heardSegments(lines count: Int) -> [SpeechRecognizedSegment] {
-        Self.tenLineWords.prefix(count).enumerated().flatMap { index, words in
-            words.enumerated().map { segment($0.element, Double(index) * 3.0 + 0.1 + Double($0.offset) * 0.4) }
+    /// Words for the given lines as Whisper would report them, at track time 10 + 3 s per line.
+    private func heardWords(lines range: Range<Int>) -> [RecognizedAudioWord] {
+        range.flatMap { index in
+            Self.tenLineWords[index].enumerated().map {
+                RecognizedAudioWord(
+                    text: $0.element,
+                    startTime: 10.1 + Double(index) * 3.0 + Double($0.offset) * 0.4,
+                    duration: 0.2,
+                    confidence: 0.9
+                )
+            }
         }
     }
 
+    /// Dependencies whose Whisper engine returns `feed`'s batches in order, one per 1 s chunk of 100 Hz samples.
+    private func whisperDependencies(
+        capture: FakeAudioCapture,
+        feed: LockedBox<[[RecognizedAudioWord]]>,
+        launchWhisper: (@Sendable (String, String) async -> WhisperTranscribing?)? = nil
+    ) -> AudioSyncManager.Dependencies {
+        makeDependencies(
+            capture: capture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            runWhisperChunk: { _ in feed.withLock { $0.isEmpty ? [] : $0.removeFirst() } },
+            launchWhisper: launchWhisper,
+            whisperChunkDurationSeconds: 1.0
+        )
+    }
+
+    /// Delivers one Whisper chunk that hears `words`, then waits for it to be processed.
     @MainActor
-    private func startTenLineSync(cache: AudioSyncedLyricsCache) -> (AudioSyncManager, FakeSpeechRecognizer, FakeAudioCapture, LyricsState) {
+    private func hear(
+        _ words: [RecognizedAudioWord],
+        manager: AudioSyncManager,
+        capture: FakeAudioCapture,
+        feed: LockedBox<[[RecognizedAudioWord]]>
+    ) async -> Bool {
+        feed.withLock { $0.append(words) }
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        return await waitUntil { feed.withLock { $0.isEmpty } && !manager.isWhisperProcessing }
+    }
+
+    @MainActor
+    private func startTenLineSync(
+        cache: AudioSyncedLyricsCache
+    ) -> (AudioSyncManager, LockedBox<[[RecognizedAudioWord]]>, FakeAudioCapture, LyricsState) {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         state.isPlaying = false
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let feed = LockedBox<[[RecognizedAudioWord]]>([])
+        let manager = AudioSyncManager(
+            state: state,
+            cache: cache,
+            dependencies: whisperDependencies(capture: fakeCapture, feed: feed)
+        )
         state.setTrack(sampleTrack(), lyrics: tenLines())
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: tenLines())
-        return (manager, recognizer, fakeCapture, state)
+        return (manager, feed, fakeCapture, state)
     }
 
     @MainActor
     func testLiveSyncKeepsListeningUntilMostLinesAreHeard() async {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
         let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
         XCTAssertTrue(started)
 
-        recognizer.resultHandlers.first?(heardSegments(lines: 3), false, nil)
-        let threeMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 3 }
-        XCTAssertTrue(threeMatched)
+        let firstChunk = await hear(heardWords(lines: 0..<3), manager: manager, capture: capture, feed: feed)
+        XCTAssertTrue(firstChunk)
+        XCTAssertEqual(manager.diagnostics.snapshot?.matchedLineCount, 3)
         XCTAssertTrue(manager.isLiveSyncActive, "3 of 10 lines must not end the sync")
-        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .appleSpeech, alignedLines: 3, totalLines: 10))
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 3, totalLines: 10))
         XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 3, "partial progress is saved")
 
-        recognizer.resultHandlers.first?(heardSegments(lines: 6), false, nil)
-        let finished = await waitUntil { state.audioSyncStatus == .cached(.appleSpeech) }
+        _ = await hear(heardWords(lines: 3..<6), manager: manager, capture: capture, feed: feed)
+        let finished = await waitUntil { state.audioSyncStatus == .cached(.whisper) }
         XCTAssertTrue(finished, "6 of 10 lines completes the sync; status \(state.audioSyncStatus)")
         XCTAssertFalse(manager.isLiveSyncActive)
     }
@@ -1472,22 +1074,23 @@ final class AudioSyncManagerTests: XCTestCase {
             )
         }
         cache.save(AudioSyncedLyricsRecord(
-            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.5,
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: 0.5,
             alignedLineCount: 3, sourceLineCount: 10, lines: cachedLines
         ))
 
-        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
         let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
         XCTAssertTrue(started, "a partial record keeps listening")
         state.updatePlayback(isPlaying: true, position: 10.2)
         XCTAssertNil(state.activeLine, "the partial record's timings are shown while listening")
+        state.updatePlayback(isPlaying: false, position: 10.0)
 
-        recognizer.resultHandlers.first?(heardSegments(lines: 1), false, nil)
-        let oneMatched = await waitUntil { manager.diagnostics.snapshot?.matchedLineCount == 1 }
-        XCTAssertTrue(oneMatched)
+        let oneHeard = await hear(heardWords(lines: 0..<1), manager: manager, capture: capture, feed: feed)
+        XCTAssertTrue(oneHeard)
+        XCTAssertEqual(manager.diagnostics.snapshot?.matchedLineCount, 1)
         XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 3, "a weaker result must not replace the cache")
 
-        recognizer.resultHandlers.first?(heardSegments(lines: 4), false, nil)
+        _ = await hear(heardWords(lines: 1..<4), manager: manager, capture: capture, feed: feed)
         let improved = await waitUntil { cache.load(trackId: sampleTrack().id)?.alignedLineCount == 4 }
         XCTAssertTrue(improved)
     }
@@ -1508,26 +1111,21 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLaterPlayAddsToWordsHeardOnEarlierPlays() async {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         // Play 1 heard lines 0-3 (track time = 10 + 3 * line).
-        let firstPlay = Self.tenLineWords.prefix(4).enumerated().flatMap { index, words in
-            words.enumerated().map {
-                RecognizedAudioWord(text: $0.element, startTime: 10.1 + Double(index) * 3 + Double($0.offset) * 0.4, duration: 0.2, confidence: 0.9)
-            }
-        }
+        let firstPlay = heardWords(lines: 0..<4)
         let firstResult = LyricsAudioAligner.align(lines: tenLines(), recognizedWords: firstPlay)
         XCTAssertEqual(firstResult.matchedLineCount, 4)
         cache.save(AudioSyncedLyricsRecord(
-            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: firstResult.medianOffset,
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: firstResult.medianOffset,
             alignedLineCount: 4, sourceLineCount: 10, lines: firstResult.lines, heardWords: firstPlay
         ))
 
-        let (manager, recognizer, capture, state) = startTenLineSync(cache: cache)
+        let (manager, feed, capture, state) = startTenLineSync(cache: cache)
         let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
         XCTAssertTrue(started)
 
         // Play 2 only catches lines 4 and 5.
-        let secondPlay = heardSegments(lines: 6).filter { $0.timestamp >= 12 }
-        recognizer.resultHandlers.first?(secondPlay, false, nil)
-        let completed = await waitUntil { state.audioSyncStatus == .cached(.appleSpeech) }
+        _ = await hear(heardWords(lines: 4..<6), manager: manager, capture: capture, feed: feed)
+        let completed = await waitUntil { state.audioSyncStatus == .cached(.whisper) }
 
         XCTAssertTrue(completed, "4 earlier + 2 new lines reach 6/10; status \(state.audioSyncStatus)")
         XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 6)
@@ -1538,7 +1136,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let oldLyrics = tenLines().map { LyricLine(id: $0.id, timestamp: $0.timestamp, text: $0.text + " / annotation") }
         cache.save(AudioSyncedLyricsRecord(
-            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.2,
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: 0.2,
             alignedLineCount: 8, sourceLineCount: 10, lines: oldLyrics
         ))
 
@@ -1555,13 +1153,13 @@ final class AudioSyncManagerTests: XCTestCase {
     func testCompleteCacheSkipsListening() {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         cache.save(AudioSyncedLyricsRecord(
-            trackId: sampleTrack().id, engine: .appleSpeech, syncedAt: Date(), medianOffset: 0.2,
+            trackId: sampleTrack().id, engine: .whisper, syncedAt: Date(), medianOffset: 0.2,
             alignedLineCount: 6, sourceLineCount: 10, lines: tenLines()
         ))
 
         let (manager, _, capture, state) = startTenLineSync(cache: cache)
 
-        XCTAssertEqual(state.audioSyncStatus, .cached(.appleSpeech))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(capture.startCount, 0)
     }
@@ -1571,15 +1169,15 @@ final class AudioSyncManagerTests: XCTestCase {
     @MainActor
     func testTranscriptionOverwriteSingleCommonWordAbsentFromDisplayedAndCachedLyrics() async {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         state.replaceLyricsWithTranscription = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         state.isPlaying = false
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let feed = LockedBox<[[RecognizedAudioWord]]>([])
+        let deps = whisperDependencies(capture: fakeCapture, feed: feed)
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         let track = sampleTrack()
         let lines = [
@@ -1591,15 +1189,13 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started)
 
         // One common word ("the") with unrelated speech on either side.
-        let mixedSegments = [
-            SpeechRecognizedSegment(substring: "unrelated", timestamp: 0.0, duration: 0.2, confidence: 0.95),
-            SpeechRecognizedSegment(substring: "the", timestamp: 0.4, duration: 0.2, confidence: 0.95),
-            SpeechRecognizedSegment(substring: "chatter", timestamp: 0.8, duration: 0.2, confidence: 0.95),
+        let mixedWords = [
+            RecognizedAudioWord(text: "unrelated", startTime: 10.0, duration: 0.2, confidence: 0.95),
+            RecognizedAudioWord(text: "the", startTime: 10.4, duration: 0.2, confidence: 0.95),
+            RecognizedAudioWord(text: "chatter", startTime: 10.8, duration: 0.2, confidence: 0.95),
         ]
-        recognizer.resultHandlers.first?(mixedSegments, true, nil)
-        for _ in 0..<20 {
-            await Task.yield()
-        }
+        let heard = await hear(mixedWords, manager: manager, capture: fakeCapture, feed: feed)
+        XCTAssertTrue(heard)
 
         let displayedText = state.rawLyricLines.map(\.text).joined(separator: " ")
         XCTAssertFalse(displayedText.contains("unrelated"))
@@ -1655,10 +1251,19 @@ final class AudioSyncManagerTests: XCTestCase {
 
         // AudioSyncManager with an unresolved track prefix must not start capture or recognition.
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: capture, makeSpeechRecognizer: { _ in recognizer })
+        let launches = LockedBox<[FakeWhisperEngine]>([])
+        let deps = makeDependencies(
+            capture: capture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
+            launchWhisper: { _, _ in
+                let engine = FakeWhisperEngine(transcribe: { _ in [] })
+                launches.withLock { $0.append(engine) }
+                return engine
+            }
+        )
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         let unknownTrack = TrackInfo(
             id: "unknown:track:1",
@@ -1674,7 +1279,7 @@ final class AudioSyncManagerTests: XCTestCase {
         }
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertTrue(backend.startedStreams.isEmpty)
-        XCTAssertTrue(recognizer.startedRequests.isEmpty)
+        XCTAssertTrue(launches.withLock { $0 }.isEmpty)
         if case .unavailable = state.audioSyncStatus {
             // Expected
         } else {
@@ -1690,7 +1295,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(settled)
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertTrue(backend.startedStreams.isEmpty)
-        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
+        XCTAssertEqual(launches.withLock { $0 }.first?.shutdownCount, 1)
     }
 
     // MARK: - #118: Browser handoff updates audio capture target without resetting live alignment
@@ -1698,11 +1303,14 @@ final class AudioSyncManagerTests: XCTestCase {
     @MainActor
     func testUpdateSourceBundleRetargetsLiveCaptureAndPreservesAlignedWords() async {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let feed = LockedBox<[[RecognizedAudioWord]]>([])
+        let deps = whisperDependencies(capture: fakeCapture, feed: feed)
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
 
         let chromeTrack = TrackInfo(
@@ -1729,10 +1337,13 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(chromeStarted)
         XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.google.Chrome"])
 
-        recognizer.resultHandlers.first?([
-            SpeechRecognizedSegment(substring: "Hello", timestamp: 0.5, duration: 0.3, confidence: 0.9),
-        ], false, nil)
-        let wordRecorded = await waitUntil { manager.recognizedWords.count == 1 }
+        _ = await hear(
+            [RecognizedAudioWord(text: "Hello", startTime: 10.5, duration: 0.3, confidence: 0.9)],
+            manager: manager,
+            capture: fakeCapture,
+            feed: feed
+        )
+        let wordRecorded = manager.recognizedWords.count == 1
         XCTAssertTrue(wordRecorded)
 
         let callsBeforeHandoff = fakeCapture.calls.count
@@ -1872,25 +1483,24 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testFailedRetargetCaptureTearsDownRecognitionSession() async throws {
+    func testFailedRetargetCaptureTearsDownRecognitionSession() async {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .appleSpeech
+        state.audioSyncEngine = .whisper
         let fakeCapture = FakeAudioCapture()
-        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
-        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let engine = FakeWhisperEngine(transcribe: { _ in [] })
+        let deps = whisperDependencies(capture: fakeCapture, feed: LockedBox([]), launchWhisper: { _, _ in engine })
         let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
 
         manager.handleTrackLoaded(track: browserTrack(sourceBundleId: "com.google.Chrome"), rawLines: sampleLines())
         let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
         XCTAssertTrue(chromeStarted)
-        let speechTask = try XCTUnwrap(recognizer.createdTasks.first)
 
         fakeCapture.startError = FakeCaptureError()
         manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
         let failed = await waitUntil { fakeCapture.startCount == 2 && !manager.isLiveSyncActive }
         XCTAssertTrue(failed)
 
-        XCTAssertTrue(speechTask.isCancelled, "A failed replacement capture must end the recognition session")
+        XCTAssertEqual(engine.shutdownCount, 1, "A failed replacement capture must end the recognition session")
         XCTAssertNil(fakeCapture.onAudioSamples)
         if case .permissionRequired = state.audioSyncStatus {} else {
             XCTFail("Expected the capture failure to be reported, got \(state.audioSyncStatus)")
@@ -1940,10 +1550,6 @@ final class AudioSyncManagerTests: XCTestCase {
     private func makeDependencies(
         capture: AudioCaptureProviding,
         hasScreenCaptureAccess: Bool = true,
-        speechAuthStatus: SFSpeechRecognizerAuthorizationStatus = .authorized,
-        requestSpeechAuth: @escaping (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void = { _ in },
-        makeSpeechRecognizer: @escaping (Locale?) -> SpeechRecognizing? = { _ in nil },
-        makeSpeechRequest: @escaping () -> SFSpeechAudioBufferRecognitionRequest = { SFSpeechAudioBufferRecognitionRequest() },
         locateWhisperServer: @escaping () -> String? = { nil },
         resolveWhisperModelPath: @escaping @Sendable (String) -> String? = { _ in nil },
         runWhisperChunk: @escaping @Sendable (AudioSyncManager.WhisperChunkRequest) -> [RecognizedAudioWord] = { _ in [] },
@@ -1954,10 +1560,6 @@ final class AudioSyncManagerTests: XCTestCase {
             capture: capture,
             hasScreenCaptureAccess: { hasScreenCaptureAccess },
             requestScreenCaptureAccess: {},
-            speechAuthorizationStatus: { speechAuthStatus },
-            requestSpeechAuthorization: requestSpeechAuth,
-            makeSpeechRecognizer: makeSpeechRecognizer,
-            makeSpeechRequest: makeSpeechRequest,
             locateWhisperServer: locateWhisperServer,
             resolveWhisperModelPath: resolveWhisperModelPath,
             launchWhisper: launchWhisper ?? { _, _ in FakeWhisperEngine(transcribe: runWhisperChunk) },
@@ -1997,38 +1599,6 @@ private final class FakeAudioCapture: AudioCaptureProviding {
 
 private struct FakeCaptureError: Error {}
 
-private final class FakeSpeechTask: SpeechRecognitionTaskHandling {
-    private(set) var isCancelled = false
-
-    func cancel() {
-        isCancelled = true
-    }
-}
-
-private final class FakeSpeechRecognizer: SpeechRecognizing {
-    let isAvailable: Bool
-    let supportsOnDeviceRecognition: Bool
-    private(set) var startedRequests: [SFSpeechAudioBufferRecognitionRequest] = []
-    private(set) var createdTasks: [FakeSpeechTask] = []
-    private(set) var resultHandlers: [@Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void] = []
-
-    init(isAvailable: Bool, supportsOnDeviceRecognition: Bool) {
-        self.isAvailable = isAvailable
-        self.supportsOnDeviceRecognition = supportsOnDeviceRecognition
-    }
-
-    func startRecognitionTask(
-        with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
-    ) -> SpeechRecognitionTaskHandling {
-        startedRequests.append(request)
-        resultHandlers.append(resultHandler)
-        let task = FakeSpeechTask()
-        createdTasks.append(task)
-        return task
-    }
-}
-
 private final class FakeWhisperEngine: WhisperTranscribing, @unchecked Sendable {
     private let handler: @Sendable (AudioSyncManager.WhisperChunkRequest) throws -> [RecognizedAudioWord]
     private let shutdowns = LockedBox<Int>(0)
@@ -2046,38 +1616,6 @@ private final class FakeWhisperEngine: WhisperTranscribing, @unchecked Sendable 
 
     func shutdown() {
         shutdowns.withLock { $0 += 1 }
-    }
-}
-
-private final class SpySpeechRequest: SFSpeechAudioBufferRecognitionRequest, @unchecked Sendable {
-    private let lock = NSLock()
-    private var _appendCount = 0
-    private var _endAudioCount = 0
-
-    var appendCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _appendCount
-    }
-
-    var endAudioCount: Int {
-        lock.lock()
-        defer { lock.unlock() }
-        return _endAudioCount
-    }
-
-    override func append(_ audioPCMBuffer: AVAudioPCMBuffer) {
-        lock.lock()
-        _appendCount += 1
-        lock.unlock()
-        super.append(audioPCMBuffer)
-    }
-
-    override func endAudio() {
-        lock.lock()
-        _endAudioCount += 1
-        lock.unlock()
-        super.endAudio()
     }
 }
 

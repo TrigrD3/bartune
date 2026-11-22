@@ -3,7 +3,6 @@ import ApplicationServices
 import Combine
 import CoreGraphics
 import Darwin
-import Speech
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -223,11 +222,6 @@ struct SettingsView: View {
                     title: "Screen & System Audio",
                     status: permissions.screenAudio,
                     settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-                )
-                permissionRow(
-                    title: "Speech Recognition",
-                    status: permissions.speechRecognition,
-                    settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
                 )
                 permissionRow(
                     title: "Spotify Automation",
@@ -960,7 +954,7 @@ struct SettingsView: View {
         } message: {
             Text(
                 "\(updater.installedAppURL.path) will be replaced and BarTune will restart. "
-                    + "macOS may ask again for Screen Recording, Speech Recognition, and Automation access."
+                    + "macOS may ask again for Screen Recording and Automation access."
             )
         }
     }
@@ -1226,15 +1220,6 @@ enum PermissionAuthorizationState: Equatable, Sendable {
         granted ? .granted : .notRequested
     }
 
-    static func fromSpeechStatus(_ status: SFSpeechRecognizerAuthorizationStatus) -> PermissionAuthorizationState {
-        switch status {
-        case .authorized: return .granted
-        case .notDetermined: return .notRequested
-        case .denied, .restricted: return .denied
-        @unknown default: return .notRequested
-        }
-    }
-
     static func fromAutomationStatus(_ status: OSStatus) -> PermissionAuthorizationState {
         switch status {
         case noErr:
@@ -1251,12 +1236,10 @@ enum PermissionAuthorizationState: Equatable, Sendable {
 
 struct AppPermissionsSnapshot: Equatable, Sendable {
     let screenAudio: PermissionAuthorizationState
-    let speechRecognition: PermissionAuthorizationState
     let spotifyAutomation: PermissionAuthorizationState
 
     static let empty = AppPermissionsSnapshot(
         screenAudio: .notRequested,
-        speechRecognition: .notRequested,
         spotifyAutomation: .targetNotRunning
     )
 }
@@ -1264,11 +1247,9 @@ struct AppPermissionsSnapshot: Equatable, Sendable {
 private enum AppPermissionsChecker {
     static func current() -> AppPermissionsSnapshot {
         let screenAudio = PermissionAuthorizationState.fromScreenCapture(CGPreflightScreenCaptureAccess())
-        let speech = PermissionAuthorizationState.fromSpeechStatus(SFSpeechRecognizer.authorizationStatus())
         let automation = checkAutomation(bundleIdentifier: "com.spotify.client")
         return AppPermissionsSnapshot(
             screenAudio: screenAudio,
-            speechRecognition: speech,
             spotifyAutomation: automation
         )
     }
