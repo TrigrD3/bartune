@@ -668,6 +668,7 @@ enum AppUpdateState: Equatable, Sendable {
     case updateAvailable(AppReleaseInfo, isDevBuild: Bool)
     case downloading(AppReleaseInfo)
     case downloaded(AppReleaseInfo, fileURL: URL)
+    case installing(AppReleaseInfo)
     case failed(message: String, release: AppReleaseInfo?)
 }
 
@@ -688,6 +689,8 @@ final class AppUpdaterModel: ObservableObject {
     }
 
     private let service: AppUpdateService
+    private let installer: AppInstaller
+    private let relaunch: @MainActor (URL) throws -> Void
     private let defaults: UserDefaults
     private let isAppleSilicon: Bool
     private var operationID = 0
@@ -706,11 +709,15 @@ final class AppUpdaterModel: ObservableObject {
     init(
         currentVersion: AppVersionInfo = .fromBundle(),
         service: AppUpdateService = AppUpdateService(),
+        installer: AppInstaller = .current(),
+        relaunch: @escaping @MainActor (URL) throws -> Void = AppInstaller.relaunch,
         isAppleSilicon: Bool = AppUpdaterModel.runningOnAppleSilicon,
         defaults: UserDefaults = .standard
     ) {
         self.currentVersion = currentVersion
         self.service = service
+        self.installer = installer
+        self.relaunch = relaunch
         self.isAppleSilicon = isAppleSilicon
         self.defaults = defaults
         channel = defaults.string(forKey: Self.channelDefaultsKey).flatMap(UpdateChannel.init) ?? .stable
@@ -718,11 +725,20 @@ final class AppUpdaterModel: ObservableObject {
 
     var isBusy: Bool {
         switch state {
-        case .checking, .downloading:
+        case .checking, .downloading, .installing:
             return true
         case .idle, .upToDate, .updateAvailable, .downloaded, .failed:
             return false
         }
+    }
+
+    /// Why Install & Relaunch is unavailable for this copy, or nil when it can replace itself.
+    var installBlocker: AppInstallError? {
+        installer.installBlocker()
+    }
+
+    var installedAppURL: URL {
+        installer.installedAppURL
     }
 
     var hasAvailableUpdate: Bool {
@@ -737,7 +753,8 @@ final class AppUpdaterModel: ObservableObject {
         case let .upToDate(release),
              let .updateAvailable(release, _),
              let .downloading(release),
-             let .downloaded(release, _):
+             let .downloaded(release, _),
+             let .installing(release):
             return release
         case let .failed(_, release):
             return release
@@ -794,7 +811,7 @@ final class AppUpdaterModel: ObservableObject {
         switch state {
         case let .updateAvailable(release, _), let .failed(_, release?):
             targetRelease = release
-        case .idle, .checking, .upToDate, .downloading, .downloaded, .failed(_, nil):
+        case .idle, .checking, .upToDate, .downloading, .downloaded, .installing, .failed(_, nil):
             return nil
         }
 
@@ -821,6 +838,37 @@ final class AppUpdaterModel: ObservableObject {
             } catch {
                 guard id == operationID else { return }
                 state = .failed(message: error.localizedDescription, release: targetRelease)
+            }
+        }
+    }
+
+    @discardableResult
+    func installDownloadedUpdate() -> Task<Void, Never>? {
+        guard case let .downloaded(release, fileURL) = state else { return nil }
+
+        operationID += 1
+        let id = operationID
+        state = .installing(release)
+        let installer = installer
+
+        return Task {
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try installer.install(dmgURL: fileURL)
+                }.value
+            } catch {
+                guard id == operationID else { return }
+                state = .failed(message: error.localizedDescription, release: release)
+                return
+            }
+            guard id == operationID else { return }
+            do {
+                try relaunch(installer.installedAppURL)
+            } catch {
+                state = .failed(
+                    message: "Installed \(release.version.tagFormatted). Quit and reopen BarTune to finish updating.",
+                    release: nil
+                )
             }
         }
     }
