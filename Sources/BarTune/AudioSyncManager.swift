@@ -74,7 +74,7 @@ enum AudioSampleExtractor {
             bufferListSize: 0,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
-            flags: 0,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
             blockBufferOut: nil
         ) == noErr, sizeNeeded > 0 else { return [] }
         let raw = UnsafeMutableRawPointer.allocate(byteCount: sizeNeeded, alignment: MemoryLayout<AudioBufferList>.alignment)
@@ -88,7 +88,7 @@ enum AudioSampleExtractor {
             bufferListSize: sizeNeeded,
             blockBufferAllocator: nil,
             blockBufferMemoryAllocator: nil,
-            flags: 0,
+            flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
             blockBufferOut: &retained
         ) == noErr else { return [] }
 
@@ -1068,20 +1068,14 @@ final class AudioSyncManager {
         return Self.mergeHeardWords(prior: priorHeardWords, current: recognizedWords)
     }
 
-    /// Every word heard, with timings refined against this play's vocal envelope.
+    /// Every word heard; Lyrics Alignment words are refined against this play's vocal envelope.
+    /// Whisper words are not: on annotated songs its sung word times are too far off for the envelope
+    /// to improve, and lengthening them made word ends worse.
     private func refinedHeardWords() -> [RecognizedAudioWord] {
-        let (words, stats) = WaveformTimingRefiner.refine(
-            allHeardWords,
-            envelope: vocalEnvelope,
-            onsetWindow: Self.onsetWindow(for: chunkEngine)
-        )
+        guard chunkEngine == .lyricsAlignment else { return allHeardWords }
+        let (words, stats) = WaveformTimingRefiner.refine(allHeardWords, envelope: vocalEnvelope, timingError: 0.06)
         diagnostics.update { $0.waveformRefinement = stats }
         return words
-    }
-
-    /// How far a word start may move onto an onset: about the engine's own start-time error.
-    nonisolated static func onsetWindow(for engine: AudioSyncEngine) -> Double {
-        engine == .lyricsAlignment ? 0.06 : 0.15
     }
 
     /// Aligns the lyrics to every word heard, keeping lines anchored from an earlier play exactly as saved.

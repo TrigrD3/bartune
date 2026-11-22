@@ -63,6 +63,17 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertNil(env.segment(covering: 10.8...80.2))
     }
 
+    func testOneContinuousSegmentIsTrimmedToCapacity() {
+        // 1 kHz keeps the test fast: 10 samples per frame, 1000 frames past capacity.
+        var env = VocalEnvelope()
+        let frames = VocalEnvelope.maxFrames + 1000
+        env.append(mid: [Float](repeating: 0.1, count: frames * 10), side: [], sampleRate: 1000, startTime: 0, rate: 1)
+        XCTAssertEqual(env.segments.count, 1)
+        XCTAssertEqual(env.segments[0].levels.count, VocalEnvelope.maxFrames)
+        XCTAssertEqual(env.segments[0].start, 10, accuracy: 1e-6)
+        XCTAssertEqual(env.segments[0].end, Double(frames) * 0.01, accuracy: 1e-6)
+    }
+
     func testPlaybackRateScalesFrameTimes() {
         var env = VocalEnvelope()
         env.append(mid: tone(1), side: [], sampleRate: sampleRate, startTime: 0, rate: 1.5)
@@ -74,35 +85,34 @@ final class VocalWaveformTests: XCTestCase {
     func testHeldNoteLengthensTheWordUntilItFades() {
         // Silence, then a note from 1.0 s to 2.5 s, then silence.
         let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
-        let result = WaveformTimingRefiner.refine([word(1.0, 0.2)], envelope: env, onsetWindow: 0)
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.2)], envelope: env, timingError: 0)
         XCTAssertEqual(result.words[0].endTime, 2.5, accuracy: 0.03)
         XCTAssertEqual(result.stats.extended, 1)
     }
 
     func testHeldNoteStopsShortOfTheNextWord() {
         let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
-        let result = WaveformTimingRefiner.refine([word(1.0, 0.2), word(2.0, 0.3)], envelope: env, onsetWindow: 0)
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.2), word(2.0, 0.3)], envelope: env, timingError: 0)
         XCTAssertEqual(result.words[0].endTime, 2.0 - WaveformTimingRefiner.minimumGap, accuracy: 0.01)
     }
 
-    func testWordStartSnapsOntoTheNearbyOnset() {
-        let env = envelope([(1, 0), (0.55, 0.5), (1, 0)])
-        let result = WaveformTimingRefiner.refine([word(1.05, 0.5)], envelope: env, onsetWindow: 0.06)
-        XCTAssertEqual(result.words[0].startTime, 1.0, accuracy: 0.015)
-        XCTAssertEqual(result.words[0].endTime, 1.55, accuracy: 1e-9, "Snapping a start keeps the word's end")
-        XCTAssertEqual(result.stats.snapped, 1)
+    func testWordInDigitalSilenceIsNotExtended() {
+        // All-zero audio has no dynamic range, so the silence gate is off; nothing may be held either.
+        let env = envelope([(8, 0)])
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.2)], envelope: env, timingError: 0)
+        XCTAssertEqual(result.words[0].endTime, 1.2, accuracy: 1e-9)
+        XCTAssertEqual(result.stats.extended, 0)
     }
 
-    func testOnsetOutsideTheWindowIsIgnored() {
+    func testWordStartsAreLeftAlone() {
         let env = envelope([(1, 0), (1, 0.5)])
-        let result = WaveformTimingRefiner.refine([word(1.2, 0.5)], envelope: env, onsetWindow: 0.06)
-        XCTAssertEqual(result.words[0].startTime, 1.2)
-        XCTAssertEqual(result.stats.snapped, 0)
+        let result = WaveformTimingRefiner.refine([word(1.05, 0.2)], envelope: env, timingError: 0.06)
+        XCTAssertEqual(result.words[0].startTime, 1.05)
     }
 
     func testWordHeardInSilenceIsDropped() {
         let env = envelope([(4, 0), (4, 0.5)])
-        let result = WaveformTimingRefiner.refine([word(1.0, 0.3), word(5.0, 0.3)], envelope: env, onsetWindow: 0)
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.3), word(5.0, 0.3)], envelope: env, timingError: 0)
         XCTAssertEqual(result.words.map(\.startTime), [5.0])
         XCTAssertEqual(result.stats.dropped, 1)
     }
@@ -110,28 +120,27 @@ final class VocalWaveformTests: XCTestCase {
     func testEarlyWordJustBeforeTheVoiceIsKept() {
         // Recognized 0.15 s early: its whole span is in the gap before the voice at 5.0 s.
         let env = envelope([(5, 0), (3, 0.5)])
-        let result = WaveformTimingRefiner.refine([word(4.85, 0.08)], envelope: env, onsetWindow: 0.15)
+        let result = WaveformTimingRefiner.refine([word(4.85, 0.08)], envelope: env, timingError: 0.15)
         XCTAssertEqual(result.words.count, 1)
-        XCTAssertEqual(result.words[0].startTime, 5.0, accuracy: 0.015)
     }
 
     func testSongWithoutQuietPartsKeepsEveryWord() {
         // Steady sound throughout: no dynamic range, so nothing can be called silence.
         let env = envelope([(8, 0.2)])
-        let result = WaveformTimingRefiner.refine([word(1.0, 0.3), word(5.0, 0.3)], envelope: env, onsetWindow: 0)
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.3), word(5.0, 0.3)], envelope: env, timingError: 0)
         XCTAssertEqual(result.words.count, 2)
     }
 
     func testWordsOutsideTheHeardAudioAreUnchanged() {
         let env = envelope([(1, 0), (1, 0.5)])
         let words = [word(40.0, 0.2)]
-        XCTAssertEqual(WaveformTimingRefiner.refine(words, envelope: env, onsetWindow: 0.15).words, words)
+        XCTAssertEqual(WaveformTimingRefiner.refine(words, envelope: env, timingError: 0.15).words, words)
     }
 
     func testRefiningTwiceChangesNothingMore() {
         let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
-        let once = WaveformTimingRefiner.refine([word(1.04, 0.2)], envelope: env, onsetWindow: 0.06).words
-        let twice = WaveformTimingRefiner.refine(once, envelope: env, onsetWindow: 0.06)
+        let once = WaveformTimingRefiner.refine([word(1.04, 0.2)], envelope: env, timingError: 0.06).words
+        let twice = WaveformTimingRefiner.refine(once, envelope: env, timingError: 0.06)
         XCTAssertEqual(twice.words, once)
     }
 }

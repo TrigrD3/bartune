@@ -88,8 +88,8 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
         out.append("Capture delay: \(captureDelay.map(Self.formatTime) ?? "—")")
         if let waveformRefinement {
             out.append(
-                "Waveform refinement: \(waveformRefinement.snapped) starts snapped, "
-                    + "\(waveformRefinement.extended) notes held, \(waveformRefinement.dropped) words in silence dropped"
+                "Waveform refinement: \(waveformRefinement.extended) notes held, "
+                    + "\(waveformRefinement.dropped) words in silence dropped"
             )
         }
         if let note {
