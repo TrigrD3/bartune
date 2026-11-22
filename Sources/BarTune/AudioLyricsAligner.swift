@@ -104,6 +104,8 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let lines: [LyricLine]
     /// Words heard so far, so a later play can add to a partial sync instead of starting over.
     let heardWords: [RecognizedAudioWord]?
+    /// Lyrics Alignment: lines the engine had the audio for but could not align; not listened for again.
+    let checkedLineIDs: [Int]?
 
     init(
         trackId: String,
@@ -113,7 +115,8 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         alignedLineCount: Int,
         sourceLineCount: Int? = nil,
         lines: [LyricLine],
-        heardWords: [RecognizedAudioWord]? = nil
+        heardWords: [RecognizedAudioWord]? = nil,
+        checkedLineIDs: [Int]? = nil
     ) {
         self.trackId = trackId
         self.engine = engine
@@ -123,6 +126,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         self.sourceLineCount = sourceLineCount
         self.lines = lines
         self.heardWords = heardWords
+        self.checkedLineIDs = checkedLineIDs
     }
 
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
