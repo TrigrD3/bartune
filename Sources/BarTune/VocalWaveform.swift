@@ -55,7 +55,7 @@ struct VoiceBandFilter {
 struct VocalEnvelope {
     struct Segment: Equatable {
         /// Track time of the first frame.
-        let start: Double
+        var start: Double
         /// Track seconds per frame.
         let step: Double
         var levels: [Float]
@@ -131,6 +131,13 @@ struct VocalEnvelope {
         while total > Self.maxFrames, segments.count > 1 {
             total -= segments.removeFirst().levels.count
         }
+        // One continuous segment past capacity keeps its newest frames.
+        if total > Self.maxFrames, var only = segments.first {
+            let excess = total - Self.maxFrames
+            only.levels.removeFirst(excess)
+            only.start += Double(excess) * only.step
+            segments[0] = only
+        }
     }
 
     /// The newest segment holding every frame of `range`.
@@ -147,11 +154,13 @@ struct VocalEnvelope {
     }
 }
 
-/// Refines recognized word timings with the vocal envelope: drops words heard in silence, moves
-/// word starts onto nearby vocal onsets, and lengthens words to cover the note the singer holds.
+/// Refines recognized word timings with the vocal envelope: drops words heard in silence and
+/// lengthens words to cover the note the singer holds.
+///
+/// Word starts are left alone: on annotated songs (JamendoLyrics), moving them onto envelope onsets
+/// made Lyrics Alignment starts slightly worse, because sung onsets are rarely sharp in loudness.
 enum WaveformTimingRefiner {
     struct Stats: Equatable, Sendable {
-        var snapped = 0
         var extended = 0
         var dropped = 0
     }
@@ -160,62 +169,48 @@ enum WaveformTimingRefiner {
     static let silenceMargin: Float = 6
     /// Gating needs this much range between the quiet and loud frames, so a song with no quiet parts keeps every word.
     static let minimumDynamicRange: Float = 15
-    /// Rise over 20 ms that counts as a vocal onset.
-    static let onsetRise: Float = 6
     /// A held note continues while the level stays within this many dB of the word's peak.
     static let sustainDrop: Float = 8
+    /// A word peaking below this heard digital silence, so it holds no note to extend.
+    static let minimumSignalLevel: Float = -80
     static let maxExtension = 1.5
     static let minimumGap = 0.02
 
-    /// `onsetWindow` is how far (seconds) a start may move: about the engine's own timing error.
+    /// `timingError` is about how far (seconds) the engine's word times can be off; silence is judged
+    /// that far around each word.
     static func refine(
         _ words: [RecognizedAudioWord],
         envelope: VocalEnvelope,
-        onsetWindow: Double
+        timingError: Double
     ) -> (words: [RecognizedAudioWord], stats: Stats) {
         var stats = Stats()
-        let sorted = words.sorted { $0.startTime < $1.startTime }
         let floor = envelope.percentile(0.1)
         let gateLevel: Float? = {
             guard let floor, let loud = envelope.percentile(0.9), loud - floor >= minimumDynamicRange else { return nil }
             return floor + silenceMargin
         }()
 
-        // Pass 1: drop words heard in silence and snap starts onto onsets.
-        var kept: [RecognizedAudioWord] = []
-        for word in sorted {
-            let end = word.endTime
-            guard let segment = envelope.segment(covering: word.startTime...end) else {
-                kept.append(word)
-                continue
-            }
-            // Look a little past the word: its recognized span can sit in the gap before the voice.
-            let slack = onsetWindow + 0.1
-            let peak = maxLevel(in: segment, from: word.startTime - slack, to: end + slack)
-            if let gateLevel, let peak, peak < gateLevel {
+        // Pass 1: drop words heard in silence.
+        var refined: [RecognizedAudioWord] = []
+        for word in words.sorted(by: { $0.startTime < $1.startTime }) {
+            let slack = timingError + 0.1
+            if let gateLevel,
+               let segment = envelope.segment(covering: word.startTime...word.endTime),
+               let peak = maxLevel(in: segment, from: word.startTime - slack, to: word.endTime + slack),
+               peak < gateLevel {
                 stats.dropped += 1
                 continue
             }
-            let earliest = max(word.startTime - onsetWindow, (kept.last?.startTime ?? -.infinity) + 0.05)
-            let latest = word.startTime + onsetWindow
-            if latest > earliest, let onset = strongestOnset(in: segment, from: earliest, to: latest),
-               abs(onset - word.startTime) >= segment.step {
-                // A word recognized early can end before its onset; it keeps at least 50 ms after it.
-                let duration = max(end - onset, 0.05)
-                kept.append(RecognizedAudioWord(text: word.text, startTime: onset, duration: duration, confidence: word.confidence))
-                stats.snapped += 1
-            } else {
-                kept.append(word)
-            }
+            refined.append(word)
         }
 
         // Pass 2: lengthen each word over the note it holds, up to the next word.
-        var refined = kept
         for index in refined.indices {
             let word = refined[index]
             let end = word.startTime + word.duration
             guard let segment = envelope.segment(covering: word.startTime...end),
-                  let peak = maxLevel(in: segment, from: word.startTime, to: end)
+                  let peak = maxLevel(in: segment, from: word.startTime, to: end),
+                  peak >= minimumSignalLevel
             else { continue }
             let nextStart = index + 1 < refined.count ? refined[index + 1].startTime : .infinity
             let limit = min(nextStart - minimumGap, end + maxExtension, segment.end)
@@ -244,21 +239,5 @@ enum WaveformTimingRefiner {
         let high = min(segment.levels.count - 1, max(low, segment.frame(at: end) - 1))
         guard low <= high else { return nil }
         return segment.levels[low...high].max()
-    }
-
-    /// Time of the steepest voice-band rise between `start` and `end`, if it is steep enough.
-    private static func strongestOnset(in segment: VocalEnvelope.Segment, from start: Double, to end: Double) -> Double? {
-        let low = max(2, segment.frame(at: start))
-        let high = min(segment.levels.count - 1, segment.frame(at: end))
-        guard low <= high else { return nil }
-        var best: (frame: Int, rise: Float)?
-        for frame in low...high {
-            let rise = segment.levels[frame] - segment.levels[frame - 2]
-            if rise >= onsetRise, rise > (best?.rise ?? -.infinity) {
-                best = (frame, rise)
-            }
-        }
-        // The rise spans the two frames before `frame`; the onset sits between them.
-        return best.map { segment.time(ofFrame: $0.frame - 1) }
     }
 }

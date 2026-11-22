@@ -1873,7 +1873,7 @@ final class AudioSyncManagerTests: XCTestCase {
     @MainActor
     func testAlignedWordsFollowTheCapturedVocalWaveform() async throws {
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         state.isPlaying = false
@@ -1885,13 +1885,10 @@ final class AudioSyncManagerTests: XCTestCase {
         }
         let feed = LockedBox<[[RecognizedAudioWord]]>([words])
         let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let deps = makeDependencies(
-            capture: fakeCapture,
-            locateWhisperServer: { "/usr/local/bin/whisper-server" },
-            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
-            runWhisperChunk: { _ in feed.withLock { $0.isEmpty ? [] : $0.removeFirst() } },
-            whisperChunkDurationSeconds: 6.0
-        )
+        var deps = makeDependencies(capture: fakeCapture, whisperChunkDurationSeconds: 6.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeWhisperEngine(transcribe: { _ in feed.withLock { $0.isEmpty ? [] : $0.removeFirst() } })
+        }
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
         let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
