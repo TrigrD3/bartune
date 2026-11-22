@@ -725,7 +725,11 @@ final class LyricsState: ObservableObject {
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
         if isJapaneseSong {
-            romanizedLines = Self.romanizeLines(lyrics, using: JapaneseRomanizer.romanizeLine, words: JapaneseRomanizer.romanizeWords)
+            romanizedLines = Self.romanizeLines(
+                lyrics,
+                using: JapaneseRomanizer.romanizeLine,
+                wordSpans: JapaneseRomanizer.romanizeWordSpans
+            )
         } else {
             romanizedLines = []
         }
@@ -757,21 +761,47 @@ final class LyricsState: ObservableObject {
         if lineProgress != 0.0 { lineProgress = 0.0 }
     }
 
-    /// `wordsTransform` romanizes a timed line's words in context; without it each word is romanized alone.
+    /// `wordSpans` romanizes a timed line's words in context and reports the source word range merged
+    /// into each output word; without it each word is romanized alone with its original timing.
     private static func romanizeLines(
         _ lyrics: [LyricLine],
         using transform: (String) -> String,
-        words wordsTransform: (([String]) -> [String])? = nil
+        wordSpans: (([String]) -> [JapaneseRomanizer.RomanizedWordSpan])? = nil
     ) -> [LyricLine] {
         lyrics.map { line in
             if !line.words.isEmpty {
-                let romanized = wordsTransform?(line.words.map(\.text)) ?? line.words.map { transform($0.text) }
-                let romWords = zip(line.words, romanized).map { w, text in
-                    WordTimestamp(
-                        timestamp: w.timestamp,
-                        duration: w.duration,
-                        text: text.isEmpty ? "" : text + " "
-                    )
+                let romWords: [WordTimestamp] = if let wordSpans {
+                    wordSpans(line.words.map(\.text)).compactMap { span in
+                        guard !span.text.isEmpty else { return nil }
+                        let first = line.words[span.sourceRange.lowerBound]
+                        let duration: Double?
+                        if span.sourceRange.lowerBound == span.sourceRange.upperBound {
+                            duration = first.duration
+                        } else {
+                            let last = line.words[span.sourceRange.upperBound]
+                            if let lastDuration = last.duration {
+                                duration = max(0, last.timestamp + lastDuration - first.timestamp)
+                            } else if span.sourceRange.upperBound + 1 < line.words.count {
+                                duration = max(0, line.words[span.sourceRange.upperBound + 1].timestamp - first.timestamp)
+                            } else {
+                                duration = nil
+                            }
+                        }
+                        return WordTimestamp(
+                            timestamp: first.timestamp,
+                            duration: duration,
+                            text: span.text + " "
+                        )
+                    }
+                } else {
+                    line.words.map { w in
+                        let text = transform(w.text)
+                        return WordTimestamp(
+                            timestamp: w.timestamp,
+                            duration: w.duration,
+                            text: text.isEmpty ? "" : text + " "
+                        )
+                    }
                 }
                 let joined = romWords.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
                 return LyricLine(
@@ -800,7 +830,7 @@ final class LyricsState: ObservableObject {
             translationsById = [:]
             translatedLines = []
             if isPlaying {
-                syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+                syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
             } else {
                 refreshCurrentLineText()
             }
@@ -810,7 +840,7 @@ final class LyricsState: ObservableObject {
             translationsById = [:]
             translatedLines = lines
             if isPlaying {
-                syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+                syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
             } else {
                 refreshCurrentLineText()
             }
@@ -833,7 +863,7 @@ final class LyricsState: ObservableObject {
         translationsById = entries
         translatedLines = Self.projectTranslatedLines(entries, onto: rawLines)
         if isPlaying {
-            syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+            syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
         } else {
             refreshCurrentLineText()
         }
@@ -848,7 +878,11 @@ final class LyricsState: ObservableObject {
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lines)
         isChineseSong = ChineseRomanizer.isChineseTrack(lines)
         romanizedLines = isJapaneseSong
-            ? Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine, words: JapaneseRomanizer.romanizeWords)
+            ? Self.romanizeLines(
+                lines,
+                using: JapaneseRomanizer.romanizeLine,
+                wordSpans: JapaneseRomanizer.romanizeWordSpans
+            )
             : []
         koreanRomanizedLines = isKoreanSong
             ? Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
@@ -863,7 +897,7 @@ final class LyricsState: ObservableObject {
             )
         }
         if isPlaying {
-            syncActiveLine(for: playbackAnchorPosition + offsetSeconds, in: activeLines)
+            syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
         } else {
             refreshCurrentLineText()
         }
@@ -916,10 +950,14 @@ final class LyricsState: ObservableObject {
     /// Position reports closer than this to the running clock are poll jitter, not seeks.
     static let clockDeadband: Double = 0.075
 
+    func extrapolatedPlaybackPosition(at date: Date = Date()) -> Double {
+        let elapsed = isPlaying ? max(0.0, date.timeIntervalSince(playbackAnchorDate)) : 0.0
+        return playbackAnchorPosition + elapsed * playbackRate
+    }
+
     func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0) {
         let now = Date()
-        let predicted = playbackAnchorPosition
-            + (self.isPlaying ? max(0, now.timeIntervalSince(playbackAnchorDate)) * self.playbackRate : 0)
+        let predicted = extrapolatedPlaybackPosition(at: now)
         let keepsClock = isPlaying && self.isPlaying
             && playbackRate == self.playbackRate
             && abs(position - predicted) < Self.clockDeadband
@@ -1023,7 +1061,14 @@ final class LyricsState: ObservableObject {
     static func wordBoundaryFractions(words: [WordTimestamp], lineText: String, font: NSFont) -> [Double]? {
         guard !words.isEmpty, !lineText.isEmpty else { return nil }
         let joined = words.map(\.text).joined()
-        guard joined == lineText || joined.trimmingCharacters(in: .whitespacesAndNewlines) == lineText else {
+        let leadingTrimLength: Int
+        if joined == lineText {
+            leadingTrimLength = 0
+        } else if joined.trimmingCharacters(in: .whitespacesAndNewlines) == lineText {
+            let trimmedRange = (joined as NSString).range(of: lineText)
+            guard trimmedRange.location != NSNotFound else { return nil }
+            leadingTrimLength = trimmedRange.location
+        } else {
             return nil
         }
         let ctLine = CTLineCreateWithAttributedString(NSAttributedString(string: lineText, attributes: [.font: font]))
@@ -1031,9 +1076,10 @@ final class LyricsState: ObservableObject {
         guard width > 0 else { return nil }
         let length = (lineText as NSString).length
         var fractions: [Double] = [0]
-        var index = 0
+        var rawIndex = 0
         for word in words {
-            index = min(length, index + (word.text as NSString).length)
+            rawIndex += (word.text as NSString).length
+            let index = min(length, max(0, rawIndex - leadingTrimLength))
             let offset = Double(CTLineGetOffsetForStringIndex(ctLine, index, nil)) / width
             fractions.append(min(1, max(fractions[fractions.count - 1], offset)))
         }

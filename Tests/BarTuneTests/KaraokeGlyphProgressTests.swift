@@ -45,6 +45,19 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         XCTAssertEqual(fractions.last ?? 0, 1, accuracy: 0.0001)
     }
 
+    func testLeadingWhitespaceInWordsDoesNotShiftBoundaries() throws {
+        let baseline = try XCTUnwrap(
+            LyricsState.wordBoundaryFractions(words: words(["hello ", "world"]), lineText: "hello world", font: font)
+        )
+        let leadingSpace = try XCTUnwrap(
+            LyricsState.wordBoundaryFractions(words: words([" hello ", "world"]), lineText: "hello world", font: font)
+        )
+        XCTAssertEqual(leadingSpace.count, baseline.count)
+        for (actual, expected) in zip(leadingSpace, baseline) {
+            XCTAssertEqual(actual, expected, accuracy: 0.0001)
+        }
+    }
+
     func testWordsThatDoNotSpellTheLineFallBack() {
         XCTAssertNil(LyricsState.wordBoundaryFractions(words: words(["hello ", "world"]), lineText: "bonjour monde", font: font))
     }
@@ -84,16 +97,56 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
         let state = LyricsState(userDefaults: ud)
         state.romanizeJapanese = true
-        state.setTrack(track, lyrics: [LyricLine(id: 0, timestamp: 10, duration: 2, text: "固まって")])
+        state.setTrack(track, lyrics: [LyricLine(id: 0, timestamp: 10, duration: 3, text: "固まっていく")])
         state.applyAudioSyncedLines([
-            LyricLine(id: 0, timestamp: 10, duration: 2, text: "固まって", words: words(["固まっ", "て"])),
+            LyricLine(id: 0, timestamp: 10, duration: 3, text: "固まっていく", words: words(["固まっ", "て", "いく"])),
         ])
         state.updatePlayback(isPlaying: true, position: 10.5)
 
         let shown = try XCTUnwrap(state.activeLine)
-        XCTAssertEqual(shown.text, "katamatte")
-        XCTAssertEqual(shown.words.map(\.text), ["katamatte ", ""])
-        XCTAssertNotNil(LyricsState.wordBoundaryFractions(words: shown.words, lineText: shown.text, font: font))
+        XCTAssertEqual(shown.text, "katamatte iku")
+        XCTAssertEqual(shown.words.map(\.text), ["katamatte ", "iku "])
+        XCTAssertEqual(shown.words[0].timestamp, 10.0, accuracy: 0.001)
+        XCTAssertEqual(shown.words[0].duration ?? 0, 2.0, accuracy: 0.001)
+        XCTAssertEqual(shown.words[1].timestamp, 12.0, accuracy: 0.001)
+        XCTAssertEqual(shown.words[1].duration ?? 0, 1.0, accuracy: 0.001)
+        let boundaries = try XCTUnwrap(LyricsState.wordBoundaryFractions(words: shown.words, lineText: shown.text, font: font))
+        let midMergedWord = LyricsState.computeLineProgress(
+            line: shown, nextTimestamp: 14, position: 11.0, boundaries: boundaries
+        )
+        XCTAssertEqual(midMergedWord, boundaries[1] / 2, accuracy: 0.001)
+    }
+
+    func testApplyAudioSyncedLinesAndTranslationUseExtrapolatedPositionWhenAnchorIsRetained() throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let state = LyricsState(userDefaults: ud)
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, duration: 5, text: "first line"),
+            LyricLine(id: 1, timestamp: 30, duration: 5, text: "second line"),
+        ]
+        state.setTrack(track, lyrics: lines)
+        state.updatePlayback(isPlaying: true, position: 10.0)
+        // Simulate 20 seconds elapsing while reports stay within the clock deadband and retain the anchor.
+        state.playbackAnchorDate = Date().addingTimeInterval(-20.0)
+        state.updatePlayback(isPlaying: true, position: 30.02)
+        XCTAssertEqual(state.playbackAnchorPosition, 10.0, "deadband must retain the earlier anchor")
+        XCTAssertEqual(state.currentLineId, 1)
+
+        state.applyAudioSyncedLines([
+            LyricLine(id: 0, timestamp: 10.2, duration: 5, text: "first line"),
+            LyricLine(id: 1, timestamp: 29.8, duration: 5, text: "second line"),
+        ])
+        XCTAssertEqual(state.currentLineId, 1, "applyAudioSyncedLines must use extrapolated position, not retained anchor")
+
+        state.translateLyrics = true
+        state.setTranslatedLines([
+            LyricLine(id: 0, timestamp: 10.2, duration: 5, text: "translated first"),
+            LyricLine(id: 1, timestamp: 29.8, duration: 5, text: "translated second"),
+        ])
+        XCTAssertEqual(state.currentLineId, 1, "setTranslatedLines must use extrapolated position, not retained anchor")
+        XCTAssertEqual(state.currentText, "translated second")
     }
 
     func testClockIgnoresSmallJitterButFollowsSeeksAndStateChanges() throws {
