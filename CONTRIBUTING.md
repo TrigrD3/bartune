@@ -109,6 +109,7 @@ A test counts when it fails without your change:
 4. Use a Conventional Commit PR title (checked by `Conventional PR Title`).
 5. Fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md): what changed and why with `Closes #<number>`, the Tests evidence, AI assistance (or delete it), and the checklist. This applies to PRs opened with `gh pr create --body` too: reproduce the template's headings.
 6. Docs-only PRs (`*.md`, `docs/**`) automatically skip macOS CI builds via `.github/filters.yml`.
+7. CodeRabbit doesn't review automatically. When the PR is ready, comment `@coderabbitai review` to request a review. Its comments are advisory: resolving them is not required to merge.
 
 ## Reporting Issues
 
