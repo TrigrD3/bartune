@@ -94,7 +94,7 @@ struct SettingsView: View {
     @State private var songPendingDeletion: CachedSongSummary?
     @State private var showClearCacheConfirmation: Bool = false
     @State private var discoveredModels: [DiscoveredWhisperModel] = []
-    @State private var whisperCLIFound: Bool = false
+    @State private var whisperServerFound: Bool = false
     @State private var isDownloadingModel: Bool = false
     @State private var modelDownloadError: String?
     @State private var selectedDownloadPreset: WhisperModelPreset = .base
@@ -490,11 +490,11 @@ struct SettingsView: View {
 
                 if state.audioSyncEngine == .whisper {
                     HStack {
-                        Text("whisper-cli")
+                        Text("whisper-server")
                         Spacer()
-                        Text(whisperCLIFound ? "Installed" : "Not found (brew install whisper-cpp)")
+                        Text(whisperServerFound ? "Installed" : "Not found (brew install whisper-cpp)")
                             .font(.caption)
-                            .foregroundStyle(whisperCLIFound ? Color.secondary : Color.orange)
+                            .foregroundStyle(whisperServerFound ? Color.secondary : Color.orange)
                     }
 
                     if !discoveredModels.isEmpty {
@@ -843,7 +843,7 @@ struct SettingsView: View {
     }
 
     private func refreshWhisperDiscovery() {
-        whisperCLIFound = WhisperModelLocator.locateWhisperCLI() != nil
+        whisperServerFound = WhisperModelLocator.locateWhisperServer() != nil
         discoveredModels = WhisperModelLocator.discoverModels(customPath: state.whisperModelPath)
     }
 

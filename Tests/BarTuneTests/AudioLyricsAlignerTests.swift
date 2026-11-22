@@ -80,16 +80,17 @@ final class AudioLyricsAlignerTests: XCTestCase {
     func testWhisperJSONParserMergesSubwordsAndSkipsSpecialTokens() throws {
         let json = """
         {
-          "transcription": [
+          "segments": [
             {
-              "offsets": { "from": 0, "to": 2500 },
+              "start": 0.0,
+              "end": 2.5,
               "text": " Hello world",
-              "tokens": [
-                { "text": "[_BEG_]", "offsets": { "from": 0, "to": 0 }, "p": 1.0 },
-                { "text": " Hel", "offsets": { "from": 200, "to": 450 }, "p": 0.8 },
-                { "text": "lo", "offsets": { "from": 450, "to": 700 }, "p": 0.9 },
-                { "text": " world", "offsets": { "from": 800, "to": 1400 }, "p": 0.95 },
-                { "text": "[BLANK_AUDIO]", "offsets": { "from": 1500, "to": 2000 }, "p": 0.5 }
+              "words": [
+                { "word": "[_BEG_]", "start": 0.0, "end": 0.0, "probability": 1.0 },
+                { "word": " Hel", "start": 0.2, "end": 0.45, "probability": 0.8 },
+                { "word": "lo", "start": 0.45, "end": 0.7, "probability": 0.9 },
+                { "word": " world", "start": 0.8, "end": 1.4, "probability": 0.95 },
+                { "word": "[BLANK_AUDIO]", "start": 1.5, "end": 2.0, "probability": 0.5 }
               ]
             }
           ]

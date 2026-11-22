@@ -14,6 +14,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   SpotifyMonitor.swift     # Event-driven AppleScript playback monitor (Spotify, Apple Music, browser fallback)
   BrowserMediaMonitor.swift # Browser tab music monitor (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web)
   LyricsFetcher.swift      # NetEase YRC & LRCLIB lyrics fetching and caching
+  WhisperServer.swift      # One local whisper-server per Whisper sync session (model loaded once)
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
   AlbumArtColorExtractor.swift # Dominant/accent color extraction from album artwork
   Romanizer.swift          # Offline Japanese → Romaji conversion via CFStringTokenizer

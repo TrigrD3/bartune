@@ -24,7 +24,7 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
         case .appleSpeech:
             return "Zero-dependency on-device Apple Speech alignment. Caches synced karaoke timings per track."
         case .whisper:
-            return "Uses local whisper-cli and shared GGML models for higher accuracy on singing vocals and multiple languages."
+            return "Uses a local whisper-server (whisper.cpp) and shared GGML models for higher accuracy on singing vocals and multiple languages."
         }
     }
 }
@@ -356,17 +356,17 @@ enum WhisperModelLocator {
         return results
     }
 
-    static func locateWhisperCLI(
+    static func locateWhisperServer(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> String? {
         let fm = FileManager.default
         var candidates = [
-            "/opt/homebrew/bin/whisper-cli",
-            "/usr/local/bin/whisper-cli",
+            "/opt/homebrew/bin/whisper-server",
+            "/usr/local/bin/whisper-server",
         ]
         if let pathEnv = environment["PATH"] {
             for dir in pathEnv.split(separator: ":") {
-                candidates.append("\(dir)/whisper-cli")
+                candidates.append("\(dir)/whisper-server")
             }
         }
         for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
@@ -378,45 +378,41 @@ enum WhisperModelLocator {
 
 enum WhisperJSONParser {
     private struct OutputRoot: Decodable {
-        let transcription: [Segment]?
+        let segments: [Segment]?
     }
 
     private struct Segment: Decodable {
-        let offsets: Offsets?
+        let start: Double?
+        let end: Double?
         let text: String?
-        let tokens: [Token]?
+        let words: [Token]?
     }
 
     private struct Token: Decodable {
-        let text: String?
-        let offsets: Offsets?
-        let p: Double?
+        let word: String?
+        let start: Double?
+        let end: Double?
+        let probability: Double?
     }
 
-    private struct Offsets: Decodable {
-        let from: Double?
-        let to: Double?
-    }
-
-    /// Parses `whisper-cli -ojf` JSON output into track-relative `RecognizedAudioWord` items.
+    /// Parses `whisper-server` `verbose_json` output into track-relative `RecognizedAudioWord` items.
     static func parse(data: Data, chunkStartTime: Double) -> [RecognizedAudioWord] {
         guard let root = try? JSONDecoder().decode(OutputRoot.self, from: data),
-              let segments = root.transcription
+              let segments = root.segments
         else { return [] }
 
         var words: [RecognizedAudioWord] = []
 
         for segment in segments {
-            if let tokens = segment.tokens, !tokens.isEmpty {
+            if let tokens = segment.words, !tokens.isEmpty {
                 words.append(contentsOf: mergeTokens(tokens, chunkStartTime: chunkStartTime))
-            } else if let text = segment.text, let offsets = segment.offsets,
-                      let fromMs = offsets.from, let toMs = offsets.to {
+            } else if let text = segment.text, let from = segment.start, let to = segment.end {
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty, !trimmed.hasPrefix("[") else { continue }
                 let parts = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
                 guard !parts.isEmpty else { continue }
-                let startSec = chunkStartTime + fromMs / 1000.0
-                let totalDur = max(0.1, (toMs - fromMs) / 1000.0)
+                let startSec = chunkStartTime + from
+                let totalDur = max(0.1, to - from)
                 let perWord = totalDur / Double(parts.count)
                 for (i, part) in parts.enumerated() {
                     words.append(
@@ -464,16 +460,16 @@ enum WhisperJSONParser {
         }
 
         for token in tokens {
-            guard let rawText = token.text else { continue }
+            guard let rawText = token.word else { continue }
             let trimmedCheck = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmedCheck.isEmpty { continue }
             if trimmedCheck.hasPrefix("[") && trimmedCheck.hasSuffix("]") {
                 flush()
                 continue
             }
-            guard let fromMs = token.offsets?.from, let toMs = token.offsets?.to else { continue }
-            let start = chunkStartTime + fromMs / 1000.0
-            let end = chunkStartTime + max(fromMs + 40, toMs) / 1000.0
+            guard let from = token.start, let to = token.end else { continue }
+            let start = chunkStartTime + from
+            let end = chunkStartTime + max(from + 0.04, to)
             let startsNewWord = rawText.first?.isWhitespace == true
 
             if startsNewWord && !currentText.isEmpty {
@@ -485,7 +481,7 @@ enum WhisperJSONParser {
             }
             currentText += rawText
             currentEnd = max(currentEnd, end)
-            confSum += token.p ?? 0.7
+            confSum += token.probability ?? 0.7
             confCount += 1
         }
         flush()
