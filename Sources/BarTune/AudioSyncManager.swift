@@ -431,6 +431,8 @@ final class AudioSyncManager {
     private var activeTrackId: String?
     private var activeSourceBundleId: String?
     private var baseLines: [LyricLine] = []
+    /// Lines matched by the partial cached record this session started from; weaker live results don't replace it.
+    private var cachedAlignedLineCount = 0
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
@@ -515,6 +517,7 @@ final class AudioSyncManager {
         activeSourceBundleId = track.sourceBundleId
         baseLines = rawLines
         recognizedWords = []
+        cachedAlignedLineCount = 0
 
         let engine = state.audioSyncEngine
         guard engine != .off else {
@@ -530,7 +533,8 @@ final class AudioSyncManager {
                 cache.remove(trackId: track.id)
             }
         } else if let cached = cache.load(trackId: track.id) {
-            if cached.isReliable(expectedSourceLineCount: expectedSourceLineCount) {
+            let reliable = cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
+            if reliable, rawLines.isEmpty || cached.isComplete(expectedSourceLineCount: expectedSourceLineCount) {
                 if baseLines.isEmpty {
                     baseLines = cached.lines
                 }
@@ -538,7 +542,13 @@ final class AudioSyncManager {
                 state.audioSyncStatus = .cached(cached.engine)
                 return
             }
-            cache.remove(trackId: track.id)
+            if reliable {
+                // Show the partial sync now and keep listening to fill in the lines it missed.
+                state.applyAudioSyncedLines(cached.lines)
+                cachedAlignedLineCount = cached.alignedLineCount
+            } else {
+                cache.remove(trackId: track.id)
+            }
         }
 
         guard !rawLines.isEmpty else {
@@ -1112,7 +1122,7 @@ final class AudioSyncManager {
         AudioSyncDiagnosticsModel.logger.debug(
             "Alignment: \(result.matchedLineCount, privacy: .public)/\(lines.count, privacy: .public) lines, \(self.recognizedWords.count, privacy: .public) words heard"
         )
-        guard result.matchedLineCount > 0 else { return }
+        guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
 
         state.applyAudioSyncedLines(result.lines)
         state.audioSyncStatus = .syncing(
@@ -1127,7 +1137,7 @@ final class AudioSyncManager {
         )
         let confidentThreshold = state.replaceLyricsWithTranscription
             ? nonEmptyCount
-            : min(nonEmptyCount, result.medianOffset != nil ? 2 : 3)
+            : AudioSyncedLyricsRecord.linesNeededForCompletion(of: nonEmptyCount)
 
         if result.matchedLineCount >= confidentThreshold {
             persistAlignment(result, engine: engine)
@@ -1146,7 +1156,7 @@ final class AudioSyncManager {
             recognizedWords: recognizedWords,
             replaceTextWithTranscription: state.replaceLyricsWithTranscription
         )
-        guard result.matchedLineCount > 0 else { return }
+        guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
         persistAlignment(result, engine: engine)
     }
 

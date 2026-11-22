@@ -129,6 +129,21 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         isReliable(expectedSourceLineCount: nil)
     }
 
+    /// Share of lyric lines that must be heard before a sync counts as complete and stops listening.
+    static let completeLineFraction = 0.6
+
+    static func linesNeededForCompletion(of lineCount: Int) -> Int {
+        max(1, Int((Double(lineCount) * completeLineFraction).rounded(.up)))
+    }
+
+    /// A reliable record that matched enough lines to skip listening again on the next play.
+    func isComplete(expectedSourceLineCount: Int?) -> Bool {
+        guard isReliable(expectedSourceLineCount: expectedSourceLineCount) else { return false }
+        let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        let reference = max(nonEmpty, sourceLineCount ?? expectedSourceLineCount ?? 0)
+        return alignedLineCount >= Self.linesNeededForCompletion(of: reference)
+    }
+
     func isReliable(expectedSourceLineCount: Int?) -> Bool {
         let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !nonEmpty.isEmpty else { return false }
