@@ -1,3 +1,4 @@
+import Speech
 @testable import BarTune
 import XCTest
 
@@ -53,6 +54,25 @@ final class SpotifyMonitorTests: XCTestCase {
         XCTAssertEqual(
             SpotifyMonitor.transportScriptSource(for: .playPause, activeTrackId: "spotify:track:1", runningBundleIds: both),
             "tell application \"Spotify\" to playpause"
+        )
+    }
+
+    func testActiveTrackOfAQuitPlayerRoutesToTheRunningPlayer() {
+        XCTAssertEqual(
+            SpotifyMonitor.transportScriptSource(
+                for: .playPause,
+                activeTrackId: "spotify:track:1",
+                runningBundleIds: ["com.apple.Music"]
+            ),
+            "tell application \"Music\" to playpause"
+        )
+        XCTAssertEqual(
+            SpotifyMonitor.transportScriptSource(
+                for: .nextTrack,
+                activeTrackId: "music:ABC",
+                runningBundleIds: ["com.spotify.client"]
+            ),
+            "tell application \"Spotify\" to next track"
         )
     }
 
@@ -316,6 +336,262 @@ final class SpotifyMonitorTests: XCTestCase {
         XCTAssertFalse(state.hasLyrics)
     }
 
+    // MARK: - #118: Retain native transport target across pauses & browser handoff without idle gap
+
+    @MainActor
+    func testPausedAppleMusicResumesAppleMusicInsteadOfSpotifyWhileBothRun() async {
+        let runningBox = MonitorLockedBox<Set<String>>(["com.spotify.client", "com.apple.Music"])
+        let musicPlaying = ["MUSIC", "playing", "music:ABC", "Song", "Artist", "Album", "200", "15", ""].joined(separator: "\u{1F}")
+
+        let nativeResponseBox = MonitorLockedBox<String?>(musicPlaying)
+        let executedScriptsBox = MonitorLockedBox<[String]>([])
+        let firstTransport = expectation(description: "First transport command executed")
+        let fallbackTransport = expectation(description: "Fallback transport command executed after Music quit")
+
+        let deps = SpotifyMonitor.Dependencies(
+            runningBundleIds: { runningBox.withLock { $0 } },
+            executeNativeScript: { nativeResponseBox.withLock { $0 } },
+            pollBrowser: { _, _ in nil },
+            executeTransportScript: { source in
+                let count = executedScriptsBox.withLock { list -> Int in
+                    list.append(source)
+                    return list.count
+                }
+                if count == 1 {
+                    firstTransport.fulfill()
+                } else if count == 2 {
+                    fallbackTransport.fulfill()
+                }
+            }
+        )
+        let monitor = SpotifyMonitor(dependencies: deps)
+
+        let firstPollDone = expectation(description: "Apple Music snapshot published")
+        let pausePollDone = expectation(description: "Paused IDLE snapshot published")
+        var fulfilledFirst = false
+        var fulfilledPause = false
+        var postCommandPolls = 0
+        var countPostCommandPolls = false
+        monitor.onUpdate = { snap in
+            if !fulfilledFirst, snap.track?.id == "music:ABC" {
+                fulfilledFirst = true
+                firstPollDone.fulfill()
+            } else if !fulfilledPause, !snap.isRunning {
+                fulfilledPause = true
+                pausePollDone.fulfill()
+            } else if countPostCommandPolls {
+                postCommandPolls += 1
+            }
+        }
+
+        monitor.poll()
+        await fulfillment(of: [firstPollDone], timeout: 2.0)
+
+        // Apple Music pauses while Spotify stays open in the background.
+        nativeResponseBox.withLock { $0 = "IDLE" }
+        monitor.poll()
+        await fulfillment(of: [pausePollDone], timeout: 2.0)
+
+        countPostCommandPolls = true
+        monitor.sendCommand(.playPause)
+        await fulfillment(of: [firstTransport], timeout: 2.0)
+        XCTAssertEqual(executedScriptsBox.withLock { $0 }, ["tell application \"Music\" to playpause"])
+        let firstCommandPolled = await monitorWaitUntil { postCommandPolls >= 1 && !monitor.isPolling }
+        XCTAssertTrue(firstCommandPolled)
+
+        // Once Apple Music is quit and only Spotify remains running, transport should fall back to Spotify.
+        runningBox.withLock { $0 = ["com.spotify.client"] }
+        monitor.sendCommand(.playPause)
+        await fulfillment(of: [fallbackTransport], timeout: 2.0)
+        XCTAssertEqual(
+            executedScriptsBox.withLock { $0 },
+            ["tell application \"Music\" to playpause", "tell application \"Spotify\" to playpause"]
+        )
+        let secondCommandPolled = await monitorWaitUntil { postCommandPolls >= 2 && !monitor.isPolling }
+        XCTAssertTrue(secondCommandPolled)
+    }
+
+    @MainActor
+    func testAppDelegateBrowserHandoffUpdatesAudioCaptureTargetWithoutIdleGap() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BarTuneHandoff118-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let state = LyricsState(userDefaults: ud)
+        state.audioSyncEngine = .appleSpeech
+
+        let fakeCapture = MonitorFakeAudioCapture()
+        let fakeRecognizer = MonitorFakeSpeechRecognizer()
+        let syncDeps = AudioSyncManager.Dependencies(
+            capture: fakeCapture,
+            hasScreenCaptureAccess: { true },
+            requestScreenCaptureAccess: {},
+            speechAuthorizationStatus: { .authorized },
+            requestSpeechAuthorization: { _ in },
+            makeSpeechRecognizer: { _ in fakeRecognizer },
+            makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
+            locateWhisperServer: { nil },
+            resolveWhisperModelPath: { _ in nil },
+            launchWhisper: { _, _ in nil },
+            whisperChunkDurationSeconds: 12.0
+        )
+        let syncManager = AudioSyncManager(
+            state: state,
+            cache: AudioSyncedLyricsCache(directory: tempDir),
+            dependencies: syncDeps
+        )
+
+        let fetchCountBox = MonitorLockedBox(0)
+        let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            if url.host == "lrclib.net", url.path == "/api/get" {
+                fetchCountBox.withLock { $0 += 1 }
+                let json = #"{"syncedLyrics":"[00:10.00]Hello world","trackName":"Night Dancer","artistName":"imase","duration":210}"#
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+                return (Data(json.utf8), response)
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+
+        let delegate = AppDelegate(
+            state: state,
+            spotifyMonitor: SpotifyMonitor(),
+            lyricsFetcher: fetcher,
+            audioSyncManager: syncManager
+        )
+        defer { delegate.stopPlaybackMonitoring() }
+
+        let chromeTrack = TrackInfo(
+            id: "browser:www.youtube.com:Night Dancer|imase|v:sameVideo",
+            title: "Night Dancer",
+            artist: "imase",
+            album: "",
+            duration: 210,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let safariTrack = TrackInfo(
+            id: "browser:www.youtube.com:Night Dancer|imase|v:sameVideo",
+            title: "Night Dancer",
+            artist: "imase",
+            album: "",
+            duration: 210,
+            artworkURL: nil,
+            sourceBundleId: "com.apple.Safari"
+        )
+
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: chromeTrack, position: 10.0))
+        let chromeCaptureStarted = await monitorWaitUntil { fakeCapture.startCount == 1 }
+        XCTAssertTrue(chromeCaptureStarted)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.google.Chrome"])
+
+        // Move the exact same recording to Safari without an intervening idle poll.
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: safariTrack, position: 11.0))
+        // A new lookup would clear the loaded lyrics synchronously before fetching.
+        XCTAssertEqual(state.rawLyricLines.map(\.text), ["Hello world"], "Same recording handoff must keep its loaded lyrics")
+        let safariCaptureStarted = await monitorWaitUntil { fakeCapture.startCount == 2 }
+        XCTAssertTrue(safariCaptureStarted, "Browser handoff of the same recording ID must retarget audio capture to the new browser")
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+        XCTAssertEqual(fetchCountBox.withLock { $0 }, 1, "Same recording handoff must not issue a duplicate LRCLIB request")
+        XCTAssertTrue(state.isPlaying)
+    }
+
+    @MainActor
+    func testAppDelegateBrowserHandoffDuringInFlightLyricsFetchUsesLatestBundle() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("BarTuneInFlight118-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let state = LyricsState(userDefaults: ud)
+        state.audioSyncEngine = .appleSpeech
+
+        let fakeCapture = MonitorFakeAudioCapture()
+        let fakeRecognizer = MonitorFakeSpeechRecognizer()
+        let syncDeps = AudioSyncManager.Dependencies(
+            capture: fakeCapture,
+            hasScreenCaptureAccess: { true },
+            requestScreenCaptureAccess: {},
+            speechAuthorizationStatus: { .authorized },
+            requestSpeechAuthorization: { _ in },
+            makeSpeechRecognizer: { _ in fakeRecognizer },
+            makeSpeechRequest: { SFSpeechAudioBufferRecognitionRequest() },
+            locateWhisperServer: { nil },
+            resolveWhisperModelPath: { _ in nil },
+            launchWhisper: { _, _ in nil },
+            whisperChunkDurationSeconds: 12.0
+        )
+        let syncManager = AudioSyncManager(
+            state: state,
+            cache: AudioSyncedLyricsCache(directory: tempDir),
+            dependencies: syncDeps
+        )
+
+        let fetchStarted = expectation(description: "Lyrics fetch in flight")
+        let fetchGate = MonitorAsyncGate()
+        let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            if url.host == "music.163.com" {
+                fetchStarted.fulfill()
+                await fetchGate.wait()
+            }
+            if url.host == "lrclib.net", url.path == "/api/get" {
+                let json = #"{"syncedLyrics":"[00:10.00]Hello world","trackName":"Night Dancer","artistName":"imase","duration":210}"#
+                let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil))
+                return (Data(json.utf8), response)
+            }
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+
+        let delegate = AppDelegate(
+            state: state,
+            spotifyMonitor: SpotifyMonitor(),
+            lyricsFetcher: fetcher,
+            audioSyncManager: syncManager
+        )
+        defer { delegate.stopPlaybackMonitoring() }
+
+        let chromeTrack = TrackInfo(
+            id: "browser:www.youtube.com:Night Dancer|imase|v:sameVideo",
+            title: "Night Dancer",
+            artist: "imase",
+            album: "",
+            duration: 210,
+            artworkURL: nil,
+            sourceBundleId: "com.google.Chrome"
+        )
+        let safariTrack = TrackInfo(
+            id: "browser:www.youtube.com:Night Dancer|imase|v:sameVideo",
+            title: "Night Dancer",
+            artist: "imase",
+            album: "",
+            duration: 210,
+            artworkURL: nil,
+            sourceBundleId: "com.apple.Safari"
+        )
+
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: chromeTrack, position: 10.0))
+        await fulfillment(of: [fetchStarted], timeout: 2.0)
+
+        // Switch browser while lyrics lookup is still pending.
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: safariTrack, position: 11.0))
+        await fetchGate.open()
+        await delegate.waitForPendingFetch()
+
+        let started = await monitorWaitUntil { fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+    }
+
     @MainActor
     func testStalePollReleasedAfterBrowserMusicIsReEnabledPublishesOnlyFreshTrack() async {
         let staleTrack = TrackInfo(
@@ -428,5 +704,41 @@ private final class MonitorLockedBox<Value>: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return body(&value)
+    }
+}
+
+private final class MonitorFakeAudioCapture: AudioCaptureProviding {
+    var onAudioSamples: (([Float], Double) -> Void)?
+    private(set) var startCount = 0
+    private(set) var stopCount = 0
+    private(set) var lastTargetBundleIds: Set<String> = []
+
+    @MainActor
+    func start(targetBundleIds: Set<String>) {
+        startCount += 1
+        lastTargetBundleIds = targetBundleIds
+    }
+
+    @MainActor
+    func stop() {
+        stopCount += 1
+    }
+}
+
+private final class MonitorFakeSpeechTask: SpeechRecognitionTaskHandling {
+    func cancel() {}
+}
+
+private final class MonitorFakeSpeechRecognizer: SpeechRecognizing {
+    var isAvailable: Bool { true }
+    var supportsOnDeviceRecognition: Bool { true }
+    private(set) var resultHandlers: [@Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void] = []
+
+    func startRecognitionTask(
+        with request: SFSpeechAudioBufferRecognitionRequest,
+        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
+    ) -> SpeechRecognitionTaskHandling {
+        resultHandlers.append(resultHandler)
+        return MonitorFakeSpeechTask()
     }
 }

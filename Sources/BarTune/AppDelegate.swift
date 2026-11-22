@@ -312,8 +312,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                       self.lastFetchedTrackId == track.id,
                       !(track.id.hasPrefix("browser:") && !self.state.browserMusicEnabled)
                 else { return }
-                self.state.setTrack(track, lyrics: lyrics)
-                self.audioSyncManager.handleTrackLoaded(track: track, rawLines: lyrics)
+                let resolvedTrack = self.lastLoadedTrack ?? track
+                self.state.setTrack(resolvedTrack, lyrics: lyrics)
+                self.audioSyncManager.handleTrackLoaded(track: resolvedTrack, rawLines: lyrics)
                 if self.state.translateLyrics, !lyrics.isEmpty {
                     self.translateCurrentTrack()
                 }
@@ -327,6 +328,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 else { return }
                 self.state.albumColors = colors
             }
+        } else if track.sourceBundleId != lastLoadedTrack?.sourceBundleId {
+            lastLoadedTrack = track
+            audioSyncManager.updateSourceBundle(for: track)
         }
 
         state.updatePlayback(

@@ -433,6 +433,7 @@ final class AudioSyncManager {
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
+    private var captureTargetGeneration: UInt64 = 0
 
     // Apple Speech state
     private var speechRecognizer: SpeechRecognizing?
@@ -475,6 +476,7 @@ final class AudioSyncManager {
 
     func stop() {
         syncGeneration &+= 1
+        captureTargetGeneration &+= 1
         isLiveSyncActive = false
         capture.onAudioSamples = nil
         capture.stop()
@@ -542,6 +544,51 @@ final class AudioSyncManager {
         }
 
         startLiveSync(for: track, lines: rawLines, engine: engine)
+    }
+
+    /// Updates the captured source bundle ID when the same recording hands off between browsers without resetting live alignment.
+    func updateSourceBundle(for track: TrackInfo) {
+        guard activeTrackId == track.id, activeSourceBundleId != track.sourceBundleId else { return }
+        let previousTargets = Self.targetBundleIdentifiers(for: track.id, sourceBundleId: activeSourceBundleId)
+        activeSourceBundleId = track.sourceBundleId
+        let updatedTargets = Self.targetBundleIdentifiers(for: track.id, sourceBundleId: track.sourceBundleId)
+
+        guard isLiveSyncActive, previousTargets != updatedTargets else { return }
+        capture.stop()
+        // Buffered samples belong to the old capture's timeline; the next sample starts a new chunk.
+        whisperSampleBuffer.removeAll(keepingCapacity: true)
+        whisperChunkStartPos = nil
+        // Deliveries still queued from the old capture must not start the new chunk.
+        whisperSeekBoundary = ProcessInfo.processInfo.systemUptime
+        startCaptureForCurrentTarget(trackId: track.id, engine: state.audioSyncEngine, generation: syncGeneration)
+    }
+
+    private func startCaptureForCurrentTarget(
+        trackId: String,
+        engine: AudioSyncEngine,
+        generation: UInt64
+    ) {
+        captureTargetGeneration &+= 1
+        let captureGeneration = captureTargetGeneration
+        let targetBundles = Self.targetBundleIdentifiers(for: trackId, sourceBundleId: activeSourceBundleId)
+        Task { [weak self] in
+            guard let self,
+                  self.syncGeneration == generation,
+                  self.captureTargetGeneration == captureGeneration,
+                  self.isLiveSyncActive,
+                  self.activeTrackId == trackId,
+                  self.state.audioSyncEngine == engine
+            else { return }
+            do {
+                try await self.capture.start(targetBundleIds: targetBundles)
+            } catch {
+                guard self.syncGeneration == generation,
+                      self.captureTargetGeneration == captureGeneration
+                else { return }
+                self.persistCurrentAlignmentIfReady()
+                self.handleCaptureStartFailure(error, generation: generation)
+            }
+        }
     }
 
     static func hasPreexistingWordSync(_ lines: [LyricLine]) -> Bool {
@@ -846,19 +893,7 @@ final class AudioSyncManager {
         }
 
         isLiveSyncActive = true
-        let targetBundles = Self.targetBundleIdentifiers(for: track)
-        Task { [weak self] in
-            guard let self,
-                  self.syncGeneration == generation,
-                  self.isLiveSyncActive,
-                  self.state.audioSyncEngine == .appleSpeech
-            else { return }
-            do {
-                try await self.capture.start(targetBundleIds: targetBundles)
-            } catch {
-                self.handleCaptureStartFailure(error, generation: generation)
-            }
-        }
+        startCaptureForCurrentTarget(trackId: track.id, engine: .appleSpeech, generation: generation)
     }
 
     private func startWhisperSync(track: TrackInfo, lines: [LyricLine]) {
@@ -956,20 +991,7 @@ final class AudioSyncManager {
             Self.sanitizedPlaybackRate(state.playbackRate),
             state.isPlaying
         )
-        let targetBundles = Self.targetBundleIdentifiers(for: track)
-        Task { [weak self] in
-            guard let self,
-                  self.syncGeneration == generation,
-                  self.isLiveSyncActive,
-                  self.activeTrackId == track.id,
-                  self.state.audioSyncEngine == .whisper
-            else { return }
-            do {
-                try await self.capture.start(targetBundleIds: targetBundles)
-            } catch {
-                self.handleCaptureStartFailure(error, generation: generation)
-            }
-        }
+        startCaptureForCurrentTarget(trackId: track.id, engine: .whisper, generation: generation)
     }
 
     /// Dispatches one `targetFrames` chunk when the worker is idle; called on sample delivery and worker completion.

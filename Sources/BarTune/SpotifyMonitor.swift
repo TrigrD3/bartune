@@ -84,6 +84,7 @@ final class SpotifyMonitor {
     private var pollSequence: UInt64 = 0
     private var activePollToken: UInt64?
     private var needsFollowUpPoll: Bool = false
+    private var lastNativeTrackId: String?
     private var consecutiveIdlePolls: Int = 0
     private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
 
@@ -193,6 +194,7 @@ final class SpotifyMonitor {
         let scriptSource = Self.transportScriptSource(
             for: command,
             activeTrackId: activeTrackId,
+            lastNativeTrackId: lastNativeTrackId,
             runningBundleIds: runningBundleIds
         )
         let executeTransportScript = dependencies.executeTransportScript
@@ -211,6 +213,7 @@ final class SpotifyMonitor {
     nonisolated static func transportScriptSource(
         for command: PlaybackCommand,
         activeTrackId: String,
+        lastNativeTrackId: String? = nil,
         runningBundleIds: Set<String>
     ) -> String? {
         // Browser tabs can't be controlled yet; never fall back to a native player that isn't displayed.
@@ -220,8 +223,21 @@ final class SpotifyMonitor {
         case .nextTrack: "next track"
         case .previousTrack: "previous track"
         }
-        if activeTrackId.hasPrefix("music:")
-            || (!runningBundleIds.contains("com.spotify.client") && runningBundleIds.contains("com.apple.Music")) {
+        if activeTrackId.hasPrefix("music:"), runningBundleIds.contains("com.apple.Music") {
+            return "tell application \"Music\" to \(verb)"
+        }
+        if activeTrackId.hasPrefix("spotify:"), runningBundleIds.contains("com.spotify.client") {
+            return "tell application \"Spotify\" to \(verb)"
+        }
+        if let lastNativeTrackId {
+            if lastNativeTrackId.hasPrefix("music:"), runningBundleIds.contains("com.apple.Music") {
+                return "tell application \"Music\" to \(verb)"
+            }
+            if lastNativeTrackId.hasPrefix("spotify:"), runningBundleIds.contains("com.spotify.client") {
+                return "tell application \"Spotify\" to \(verb)"
+            }
+        }
+        if !runningBundleIds.contains("com.spotify.client") && runningBundleIds.contains("com.apple.Music") {
             return "tell application \"Music\" to \(verb)"
         }
         if runningBundleIds.contains("com.spotify.client") {
@@ -268,6 +284,7 @@ final class SpotifyMonitor {
         needsFollowUpPoll = false
         browserPollGeneration &+= 1
         lastSnapshot = nil
+        lastNativeTrackId = nil
         pollTimer?.invalidate()
         pollTimer = nil
         interpolationTimer?.invalidate()
@@ -459,6 +476,9 @@ final class SpotifyMonitor {
             duration: durationSec,
             artworkURL: artworkURL
         )
+        if trackId.hasPrefix("music:") || trackId.hasPrefix("spotify:") {
+            lastNativeTrackId = trackId
+        }
 
         let snapshot = PlaybackSnapshot(
             isRunning: true,
