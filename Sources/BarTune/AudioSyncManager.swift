@@ -464,6 +464,8 @@ final class AudioSyncManager {
     private var whisperStartupTask: Task<Void, Never>?
     private var whisperProcessingTask: Task<Void, Never>?
     private var whisperEngine: WhisperTranscribing?
+    /// Lyric language passed to Whisper, so it doesn't guess per chunk.
+    private var whisperLanguage: String?
     private var whisperSampleRate: Double = 16000.0
     private var whisperCapturedSeconds: Double = 0
     private var whisperChunkDurationSeconds: Double { dependencies.whisperChunkDurationSeconds }
@@ -958,6 +960,7 @@ final class AudioSyncManager {
         whisperChunkStartPos = nil
         whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
         whisperPendingSeekPos = nil
+        whisperLanguage = LyricsLanguageDetector.detectSpeechLocale(for: lines).language.languageCode?.identifier
         state.audioSyncStatus = .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count)
 
         whisperStartupTask = Task { [weak self] in
@@ -990,7 +993,8 @@ final class AudioSyncManager {
                 return
             }
             self.whisperEngine = engine
-            self.diagnostics.update { $0.localeIdentifier = "auto (Whisper)" }
+            let language = self.whisperLanguage
+            self.diagnostics.update { $0.localeIdentifier = language ?? "auto (Whisper)" }
             self.beginWhisperCapture(track: track, generation: generation)
         }
     }
@@ -1074,7 +1078,8 @@ final class AudioSyncManager {
             sampleRate: Int(sampleRate),
             chunkStartTime: chunkStart,
             playbackRate: whisperChunkPlaybackRate,
-            prompt: promptSnippet(around: chunkStart)
+            prompt: promptSnippet(around: chunkStart),
+            language: whisperLanguage
         )
         whisperProcessingTask = Task { [weak self] in
             let words: [RecognizedAudioWord]
@@ -1205,6 +1210,7 @@ final class AudioSyncManager {
         /// Media seconds per recorded second, used to map in-chunk word offsets to track time.
         let playbackRate: Double
         let prompt: String
+        var language: String?
     }
 
     /// Downloads a GGML Whisper model preset into `~/.cache/whisper/` so other tools on the Mac can reuse it.
