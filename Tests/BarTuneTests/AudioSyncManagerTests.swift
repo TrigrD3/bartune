@@ -492,6 +492,7 @@ final class AudioSyncManagerTests: XCTestCase {
             samples: [Float](repeating: 0.1, count: 160),
             sampleRate: 16000,
             chunkStartTime: 10.0,
+            playbackRate: 1.0,
             prompt: "Hello world"
         )
 
@@ -905,6 +906,313 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count))
 
         releaseB.signal()
+    }
+
+    // MARK: - #115: Seek discards partial Whisper chunk & Speech re-anchors on playback rate changes
+
+    @MainActor
+    func testWhisperDiscardsPartialChunkOnSameTrackSeek() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Post-seek Whisper chunk dispatched")
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Emit half of a 1.0s chunk (50 of 100 frames) at position 10.0.
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100.0)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 50)
+        XCTAssertEqual(manager.currentWhisperChunkStartPos ?? -1, 10.0, accuracy: 0.01)
+
+        // Same-track seek to 90.0 while chunk is half full must discard the pre-seek samples.
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 0)
+        XCTAssertNil(manager.currentWhisperChunkStartPos)
+
+        // Emit 60 post-seek frames: must NOT trigger a mixed chunk immediately (50 + 60 >= 100).
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 60), sampleRate: 100.0)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertTrue(recordedRequests.withLock { $0.isEmpty })
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 60)
+        XCTAssertEqual(manager.currentWhisperChunkStartPos ?? -1, 90.0, accuracy: 0.01)
+
+        // Emit remaining 40 post-seek frames to complete the clean post-seek chunk.
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 40), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+
+        let requests = recordedRequests.withLock { $0 }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
+        XCTAssertEqual(requests.first?.samples.count, 100)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+    }
+
+    @MainActor
+    func testWhisperDropsQueuedPreSeekSamplesDeliveredAfterSeek() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Post-seek Whisper chunk dispatched")
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100.0)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 50)
+
+        // Pre-seek audio captured but still queued for main-actor delivery when the seek lands.
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+
+        let requests = recordedRequests.withLock { $0 }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+    }
+
+    @MainActor
+    func testWhisperDropsQueuedPreSeekSamplesWhenBufferIsEmpty() async {
+        let requests = await runEmptyBufferDiscontinuity { state in
+            state.playbackAnchorPosition = 90.0
+            state.playbackAnchorDate = Date()
+        }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 90.0, accuracy: 0.01)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+    }
+
+    @MainActor
+    func testWhisperDropsQueuedPreRateChangeSamplesWhenBufferIsEmpty() async {
+        let requests = await runEmptyBufferDiscontinuity { state in
+            state.playbackRate = 2.0
+        }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.playbackRate ?? -1, 2.0, accuracy: 0.001)
+        XCTAssertTrue(requests.first?.samples.allSatisfy { abs($0 - 0.9) < 0.001 } ?? false)
+    }
+
+    /// Queues pre-change audio with an empty chunk buffer, applies `change` to live state first (as AppDelegate does), then reports it.
+    @MainActor
+    private func runEmptyBufferDiscontinuity(_ change: (LyricsState) -> Void) async -> [AudioSyncManager.WhisperChunkRequest] {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Post-change Whisper chunk dispatched")
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(manager.bufferedWhisperSampleCount, 0)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
+        change(state)
+        manager.handlePlaybackStateChanged(isPlaying: false, position: state.playbackAnchorPosition)
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+        return recordedRequests.withLock { $0 }
+    }
+
+    @MainActor
+    func testWhisperSecondSeekBeforeNextBufferAnchorsChunkToLatestSeek() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Post-seek Whisper chunk dispatched")
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100.0)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+
+        // Seek to 90 s, then to 140 s before the next buffer; the caller updates live state first.
+        state.playbackAnchorPosition = 90.0
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 90.0)
+        state.playbackAnchorPosition = 140.0
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 140.0)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.9, count: 100), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+
+        let requests = recordedRequests.withLock { $0 }
+        XCTAssertEqual(requests.count, 1)
+        XCTAssertEqual(requests.first?.chunkStartTime ?? -1, 140.0, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testWhisperChunkRequestCarriesPlaybackRate() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .whisper
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        state.playbackRate = 2.0
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recordedRequests = LockedBox<[AudioSyncManager.WhisperChunkRequest]>([])
+        let chunkDispatched = expectation(description: "Whisper chunk dispatched")
+
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            locateWhisperServer: { "/usr/local/bin/whisper-server" },
+            resolveWhisperModelPath: { _ in "/tmp/ggml-tiny.bin" },
+            runWhisperChunk: { request in
+                recordedRequests.withLock { $0.append(request) }
+                chunkDispatched.fulfill()
+                return []
+            },
+            whisperChunkDurationSeconds: 1.0
+        )
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.5, count: 100), sampleRate: 100.0)
+        await fulfillment(of: [chunkDispatched], timeout: 2.0)
+
+        XCTAssertEqual(recordedRequests.withLock { $0.first?.playbackRate } ?? -1, 2.0, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testAppleSpeechReanchorsOnPlaybackRateChangeFrom1xTo2x() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        state.playbackRate = 1.0
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // 2 s of audio at 1x -> media position reaches 12.0.
+        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+
+        // Switch playback rate from 1x to 2x at track position 12.0 without seeking.
+        state.playbackRate = 2.0
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 12.0)
+
+        // 2 s more captured audio at 2x -> media advances by 4 s (12.0 -> 16.0).
+        fakeCapture.emit(samples: [Float](repeating: 0, count: 32000), sampleRate: 16000)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+
+        let segments = [
+            SpeechRecognizedSegment(substring: "oneX", timestamp: 1.0, duration: 0.3, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "switch", timestamp: 2.0, duration: 0.2, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "twoXMid", timestamp: 3.0, duration: 0.3, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "twoXEnd", timestamp: 4.0, duration: 0.2, confidence: 0.9),
+        ]
+        recognizer.resultHandlers.first?(segments, false, nil)
+        guard await waitUntil({ manager.recognizedWords.count == 4 }) else {
+            XCTFail("Expected four recognized words, got \(manager.recognizedWords.count)")
+            return
+        }
+
+        XCTAssertEqual(manager.recognizedWords[0].startTime, 11.0, accuracy: 0.01)
+        XCTAssertEqual(manager.recognizedWords[1].startTime, 12.0, accuracy: 0.01)
+        XCTAssertEqual(manager.recognizedWords[2].startTime, 14.0, accuracy: 0.01)
+        XCTAssertEqual(manager.recognizedWords[3].startTime, 16.0, accuracy: 0.01)
+        XCTAssertEqual(manager.recognizedWords[2].duration, 0.6, accuracy: 0.01)
     }
 
     // MARK: - #114: Final Apple Speech result without error ends capture when below threshold

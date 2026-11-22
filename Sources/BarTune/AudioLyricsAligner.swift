@@ -396,7 +396,7 @@ enum WhisperJSONParser {
     }
 
     /// Parses `whisper-server` `verbose_json` output into track-relative `RecognizedAudioWord` items.
-    static func parse(data: Data, chunkStartTime: Double) -> [RecognizedAudioWord] {
+    static func parse(data: Data, chunkStartTime: Double, playbackRate: Double = 1.0) -> [RecognizedAudioWord] {
         guard let root = try? JSONDecoder().decode(OutputRoot.self, from: data),
               let segments = root.segments
         else { return [] }
@@ -405,14 +405,14 @@ enum WhisperJSONParser {
 
         for segment in segments {
             if let tokens = segment.words, !tokens.isEmpty {
-                words.append(contentsOf: mergeTokens(tokens, chunkStartTime: chunkStartTime))
+                words.append(contentsOf: mergeTokens(tokens, chunkStartTime: chunkStartTime, playbackRate: playbackRate))
             } else if let text = segment.text, let from = segment.start, let to = segment.end {
                 let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty, !trimmed.hasPrefix("[") else { continue }
                 let parts = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
                 guard !parts.isEmpty else { continue }
-                let startSec = chunkStartTime + from
-                let totalDur = max(0.1, to - from)
+                let startSec = chunkStartTime + from * playbackRate
+                let totalDur = max(0.1, to - from) * playbackRate
                 let perWord = totalDur / Double(parts.count)
                 for (i, part) in parts.enumerated() {
                     words.append(
@@ -430,7 +430,7 @@ enum WhisperJSONParser {
         return words
     }
 
-    private static func mergeTokens(_ tokens: [Token], chunkStartTime: Double) -> [RecognizedAudioWord] {
+    private static func mergeTokens(_ tokens: [Token], chunkStartTime: Double, playbackRate: Double) -> [RecognizedAudioWord] {
         var merged: [RecognizedAudioWord] = []
         var currentText = ""
         var currentStart: Double?
@@ -468,8 +468,8 @@ enum WhisperJSONParser {
                 continue
             }
             guard let from = token.start, let to = token.end else { continue }
-            let start = chunkStartTime + from
-            let end = chunkStartTime + max(from + 0.04, to)
+            let start = chunkStartTime + from * playbackRate
+            let end = chunkStartTime + max(from + 0.04, to) * playbackRate
             let startsNewWord = rawText.first?.isWhitespace == true
 
             if startsNewWord && !currentText.isEmpty {
