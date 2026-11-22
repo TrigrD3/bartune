@@ -111,6 +111,21 @@ struct LyricTimingSession: Equatable, Sendable {
         JapaneseRomanizer.containsJapaneseOrCJK(text) || KoreanRomanizer.containsHangul(text)
     }
 
+    static func romanizedPreview(forLine text: String) -> String? {
+        guard JapaneseRomanizer.containsJapaneseOrCJK(text) else { return nil }
+        let romaji = JapaneseRomanizer.romanizeLine(text)
+        return romaji == text ? nil : romaji
+    }
+
+    static func romanizedWordPreviews(for words: [EditableWord]) -> [String] {
+        guard !words.isEmpty else { return [] }
+        let texts = words.map(\.text)
+        guard JapaneseRomanizer.containsJapaneseOrCJK(texts.joined()) else {
+            return Array(repeating: "", count: words.count)
+        }
+        return JapaneseRomanizer.romanizeWords(texts)
+    }
+
     // MARK: - Line Text & Structure Editing
 
     mutating func replaceWithPlainText(_ plainText: String) {

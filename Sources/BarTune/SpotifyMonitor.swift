@@ -46,6 +46,7 @@ final class SpotifyMonitor {
         var executeNativeScript: @Sendable () -> String?
         var pollBrowser: @Sendable (Set<String>, Bool) -> PlaybackSnapshot?
         var executeTransportScript: @Sendable (String) -> Void
+        var executeBrowserCommand: @Sendable (PlaybackCommand, Set<String>) -> Void = { _, _ in }
 
         static func live() -> Dependencies {
             let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
@@ -65,6 +66,9 @@ final class SpotifyMonitor {
                         var error: NSDictionary?
                         script.executeAndReturnError(&error)
                     }
+                },
+                executeBrowserCommand: { command, runningBundleIds in
+                    browserMonitor.sendCommand(command, runningBundleIds: runningBundleIds)
                 }
             )
         }
@@ -86,6 +90,7 @@ final class SpotifyMonitor {
     private var activePollToken: UInt64?
     private var needsFollowUpPoll: Bool = false
     private var lastNativeTrackId: String?
+    private var lastTrackWasBrowser: Bool = false
     private var consecutiveIdlePolls: Int = 0
     private let scriptQueue = DispatchQueue(label: "com.arya.bartune.applescript", qos: .utility)
 
@@ -191,17 +196,23 @@ final class SpotifyMonitor {
     func sendCommand(_ command: PlaybackCommand) {
         let runningBundleIds = dependencies.runningBundleIds()
         let activeTrackId = lastSnapshot?.track?.id ?? ""
+        let routeToBrowser = activeTrackId.hasPrefix("browser:") || (activeTrackId.isEmpty && lastTrackWasBrowser)
 
-        let scriptSource = Self.transportScriptSource(
-            for: command,
-            activeTrackId: activeTrackId,
-            lastNativeTrackId: lastNativeTrackId,
-            runningBundleIds: runningBundleIds
-        )
+        let scriptSource = routeToBrowser
+            ? nil
+            : Self.transportScriptSource(
+                for: command,
+                activeTrackId: activeTrackId,
+                lastNativeTrackId: lastNativeTrackId,
+                runningBundleIds: runningBundleIds
+            )
         let executeTransportScript = dependencies.executeTransportScript
+        let executeBrowserCommand = dependencies.executeBrowserCommand
 
         scriptQueue.async { [weak self] in
-            if let source = scriptSource {
+            if routeToBrowser {
+                executeBrowserCommand(command, runningBundleIds)
+            } else if let source = scriptSource {
                 executeTransportScript(source)
             }
 
@@ -439,6 +450,7 @@ final class SpotifyMonitor {
                 ? browserSnap
                 : nil
             if let validBrowserSnap {
+                lastTrackWasBrowser = true
                 lastSnapshot = validBrowserSnap
                 lastPollDate = browserNow
                 if isStarted {
@@ -484,6 +496,7 @@ final class SpotifyMonitor {
         )
         if trackId.hasPrefix("music:") || trackId.hasPrefix("spotify:") {
             lastNativeTrackId = trackId
+            lastTrackWasBrowser = false
         }
 
         let snapshot = PlaybackSnapshot(
