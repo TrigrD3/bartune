@@ -5,6 +5,7 @@ import NaturalLanguage
 enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     case off = "off"
     case whisper = "whisper"
+    case lyricsAlignment = "lyricsAlignment"
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .off: return "Off"
         case .whisper: return "Local Whisper"
+        case .lyricsAlignment: return "Lyrics Alignment"
         }
     }
 
@@ -21,6 +23,8 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
             return "Uses fetched LRC/YRC timestamps only (no System Audio Recording permission required)."
         case .whisper:
             return "Uses a local whisper-server (whisper.cpp) and shared GGML models for higher accuracy on singing vocals and multiple languages."
+        case .lyricsAlignment:
+            return "Aligns the fetched lyrics to the song's audio on the Neural Engine instead of transcribing it (Apple silicon, alignment model required)."
         }
     }
 }

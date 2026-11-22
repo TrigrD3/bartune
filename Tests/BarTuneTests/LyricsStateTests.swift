@@ -166,7 +166,7 @@ final class LyricsStateTests: XCTestCase {
         ud.set("appleSpeech", forKey: "bartune.audioSyncEngine")
 
         XCTAssertEqual(LyricsState(userDefaults: ud).audioSyncEngine, .off)
-        XCTAssertEqual(AudioSyncEngine.allCases, [.off, .whisper])
+        XCTAssertEqual(AudioSyncEngine.allCases, [.off, .whisper, .lyricsAlignment])
     }
 
     func testPersistedPreferencesWriteOnlyToInjectedUserDefaultsSuite() throws {
