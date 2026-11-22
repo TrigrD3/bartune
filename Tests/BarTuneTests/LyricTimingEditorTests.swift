@@ -527,7 +527,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
 }
 
 private final class NoopAudioCapture: AudioCaptureProviding {
-    var onAudioSamples: (([Float], Double) -> Void)?
+    var onAudioSamples: ((CapturedAudio) -> Void)?
     func start(targetBundleIds: Set<String>) {}
     func stop() {}
 }
