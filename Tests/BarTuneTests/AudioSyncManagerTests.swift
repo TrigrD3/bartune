@@ -455,7 +455,8 @@ final class AudioSyncManagerTests: XCTestCase {
         prefix = args[args.index("--request-path") + 1]
         log_path = sys.argv[0] + ".log"
         with open(log_path, "a") as log:
-            log.write("load " + args[args.index("-m") + 1] + "\n")
+            dtw = " dtw " + args[args.index("-dtw") + 1] if "-dtw" in args else ""
+            log.write("load " + args[args.index("-m") + 1] + dtw + "\n")
 
         RESPONSE = b'{"segments":[{"start":0.0,"end":1.0,"text":" Hello","words":[{"word":" Hello","start":0.1,"end":0.5,"probability":0.95}]}]}'
 
@@ -486,7 +487,7 @@ final class AudioSyncManagerTests: XCTestCase {
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
 
-        let launched = await WhisperServer.launch(serverPath: scriptURL.path, modelPath: "/models/ggml-test.bin", readyTimeout: 10)
+        let launched = await WhisperServer.launch(serverPath: scriptURL.path, modelPath: "/models/ggml-base.bin", readyTimeout: 10)
         let server = try XCTUnwrap(launched)
         let request = AudioSyncManager.WhisperChunkRequest(
             samples: [Float](repeating: 0.1, count: 160),
@@ -504,7 +505,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(second.map(\.text), ["Hello"])
         let log = try String(contentsOf: logURL, encoding: .utf8).split(separator: "\n").map(String.init)
         XCTAssertEqual(log, [
-            "load /models/ggml-test.bin",
+            "load /models/ggml-base.bin dtw base",
             "inference verbose_json=True prompt=True wav=True",
             "inference verbose_json=True prompt=True wav=True",
         ])

@@ -427,6 +427,13 @@ enum WhisperJSONParser {
         let start: Double?
         let end: Double?
         let probability: Double?
+        /// Audio-aligned start in centiseconds when whisper-server runs with `--dtw`; -1 otherwise.
+        let tDTW: Double?
+
+        enum CodingKeys: String, CodingKey {
+            case word, start, end, probability
+            case tDTW = "t_dtw"
+        }
     }
 
     /// Parses `whisper-server` `verbose_json` output into track-relative `RecognizedAudioWord` items.
@@ -503,7 +510,10 @@ enum WhisperJSONParser {
                 flush()
                 continue
             }
-            guard let from = token.start, let to = token.end else { continue }
+            guard let rawFrom = token.start, let rawTo = token.end else { continue }
+            // DTW times follow the audio; the default ones can jump by most of a second.
+            let from = token.tDTW.flatMap { $0 >= 0 ? $0 / 100 : nil } ?? rawFrom
+            let to = from + (rawTo - rawFrom)
             let start = chunkStartTime + from * playbackRate
             let end = chunkStartTime + max(from + 0.04, to) * playbackRate
             // Japanese and Chinese tokens carry no leading space; keep each one (and its timing) separate
