@@ -70,7 +70,7 @@ BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 6-tab nati
 | **Visualizer** | Live Preview, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width, Animation toggle |
 | **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Audio Karaoke Sync (*Off / Apple Speech / Local Whisper*, shared model picker, transcribed-audio overwrite, lyrics-bar sync badge), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
 | **Offline Cache** | Cached song & audio-synced counts, storage usage, cache limit, searchable **Cached Songs** list, Reveal in Finder, Clear Cache |
-| **About** | Installed version, **Check for Updates**, SHA-256-verified DMG download to `~/Downloads` (open it and drag BarTune to Applications), GitHub links. Also reachable from the version label under the sidebar. |
+| **About** | Installed version, **Update Channel** (*Stable* releases or *Latest from main*), **Check for Updates**, SHA-256-verified DMG download to `~/Downloads` (open it and drag BarTune to Applications), GitHub links. Also reachable from the version label under the sidebar. |
 
 ## Permissions
 
