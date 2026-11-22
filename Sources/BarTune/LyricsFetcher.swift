@@ -507,30 +507,75 @@ enum LyricsMatcher {
     ) -> LyricsFetcher.LRCLibRecord? {
         let hasValidDuration = hasValidDuration(track.duration)
         return records
-            .filter { record in
-                guard (record.syncedLyrics ?? "").isEmpty == false else { return false }
+            .compactMap { record -> (record: LyricsFetcher.LRCLibRecord, isAnnotated: Bool)? in
+                guard let synced = record.syncedLyrics, !synced.isEmpty else { return nil }
                 if let trackName = record.trackName {
                     guard !isUnwantedVariant(candidateTitle: trackName, expectedTitle: track.title),
                           titleMatches(candidateTitle: trackName, expectedTitle: track.title)
-                    else { return false }
+                    else { return nil }
                 } else if !normalize(track.title).isEmpty {
-                    return false
+                    return nil
                 }
                 if let artist = record.artistName,
                    !artistMatches(candidateArtists: [artist], expectedArtist: track.artist) {
-                    return false
+                    return nil
                 }
                 if hasValidDuration, let dur = record.duration, abs(dur - track.duration) > 6.0 {
-                    return false
+                    return nil
                 }
-                return true
+                let parsed = LRCParser.parse(synced)
+                guard parsed.contains(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+                    return nil
+                }
+                return (record, AnnotatedLyrics.isAnnotated(parsed))
             }
             .min { lhs, rhs in
+                // Prefer plain lyrics over annotated fan uploads, then the closest duration.
+                if lhs.isAnnotated != rhs.isAnnotated { return !lhs.isAnnotated }
                 guard hasValidDuration else { return false }
-                let d1 = abs((lhs.duration ?? track.duration) - track.duration)
-                let d2 = abs((rhs.duration ?? track.duration) - track.duration)
+                let d1 = abs((lhs.record.duration ?? track.duration) - track.duration)
+                let d2 = abs((rhs.record.duration ?? track.duration) - track.duration)
                 return d1 < d2
-            }
+            }?
+            .record
+    }
+}
+
+/// Fan uploads that annotate each line, e.g. `煩(わずら)い / 와즈라이 / 번역`: the original lyric,
+/// then " / "-separated pronunciation or translation in another script.
+enum AnnotatedLyrics {
+    private static let separator = " / "
+
+    static func isAnnotated(_ lines: [LyricLine]) -> Bool {
+        let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespaces).isEmpty }
+        guard !nonEmpty.isEmpty else { return false }
+        let annotated = nonEmpty.filter { isAnnotated($0.text) }.count
+        return annotated * 2 >= nonEmpty.count
+    }
+
+    /// The lyric segment is Japanese/CJK and some later segment is not.
+    private static func isAnnotated(_ text: String) -> Bool {
+        let segments = text.components(separatedBy: separator)
+        guard segments.count >= 2, JapaneseRomanizer.containsJapaneseOrCJK(segments[0]) else { return false }
+        return segments.dropFirst().contains { !JapaneseRomanizer.containsJapaneseOrCJK($0) }
+    }
+
+    /// Keeps each line's first segment and drops kana readings in brackets after kanji (`頭(あたま)` → `頭`).
+    static func clean(_ lines: [LyricLine]) -> [LyricLine] {
+        lines.map { line in
+            let lyric = isAnnotated(line.text)
+                ? line.text.components(separatedBy: separator)[0]
+                : line.text
+            let text = lyric
+                .replacingOccurrences(
+                    of: "([\\p{Han}々〆ヶ?？])[(（][\\p{Hiragana}\\p{Katakana}ー]+[)）]",
+                    with: "$1",
+                    options: .regularExpression
+                )
+                .trimmingCharacters(in: .whitespaces)
+            guard text != line.text else { return line }
+            return LyricLine(id: line.id, timestamp: line.timestamp, duration: line.duration, text: text)
+        }
     }
 }
 
@@ -607,78 +652,67 @@ actor LyricsFetcher {
             return cached
         }
 
+        var diskFallback: [LyricLine]?
         if let diskEntry = diskCache.loadEntry(trackId: track.id) {
-            // Upgrade legacy cache files with track title/artist metadata on next play.
-            if diskEntry.title == nil || diskEntry.trackId == nil {
-                diskCache.save(
-                    trackId: track.id,
-                    lines: diskEntry.lines,
-                    title: track.title,
-                    artist: track.artist,
-                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-                )
+            if !AnnotatedLyrics.isAnnotated(diskEntry.lines) {
+                // Upgrade legacy cache files with track title/artist metadata on next play.
+                if diskEntry.title == nil || diskEntry.trackId == nil {
+                    diskCache.save(
+                        trackId: track.id,
+                        lines: diskEntry.lines,
+                        title: track.title,
+                        artist: track.artist,
+                        maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                    )
+                }
+                cache[track.id] = diskEntry.lines
+                return diskEntry.lines
             }
-            cache[track.id] = diskEntry.lines
-            return diskEntry.lines
+            diskFallback = diskEntry.lines
         }
 
         var transientFailure = false
+        // An annotated fan upload is kept only in case no plain version turns up.
+        var annotatedFallback: [LyricLine]?
+        func accept(_ lines: [LyricLine]?) -> [LyricLine]? {
+            guard let lines,
+                  lines.contains(where: { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty })
+            else { return nil }
+            if AnnotatedLyrics.isAnnotated(lines) {
+                if annotatedFallback == nil { annotatedFallback = lines }
+                return nil
+            }
+            return lines
+        }
         do {
-            // 1. Try NetEase YRC first for true millisecond word-by-word karaoke sync
+            // 1. NetEase YRC (word-by-word sync), 2. LRCLIB exact, 3. LRCLIB search, 4. NetEase line-level LRC
             try Task.checkCancellation()
             let netEase = try await fetchNetEase(track: track, transientFailure: &transientFailure)
-            if let yrc = netEase.yrc, !yrc.isEmpty {
-                cache[track.id] = yrc
-                diskCache.save(
-                    trackId: track.id,
-                    lines: yrc,
-                    title: track.title,
-                    artist: track.artist,
-                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-                )
-                return yrc
+            var found = accept(netEase.yrc)
+            if found == nil {
+                try Task.checkCancellation()
+                found = try await accept(fetchLRCLibExact(track: track, transientFailure: &transientFailure))
             }
-
-            // 2. Fall back to LRCLIB exact match
-            try Task.checkCancellation()
-            if let exact = try await fetchLRCLibExact(track: track, transientFailure: &transientFailure), !exact.isEmpty {
-                cache[track.id] = exact
-                diskCache.save(
-                    trackId: track.id,
-                    lines: exact,
-                    title: track.title,
-                    artist: track.artist,
-                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-                )
-                return exact
+            if found == nil {
+                try Task.checkCancellation()
+                found = try await accept(fetchLRCLibSearch(track: track, transientFailure: &transientFailure))
             }
-
-            // 3. Fall back to LRCLIB search
-            try Task.checkCancellation()
-            if let searched = try await fetchLRCLibSearch(track: track, transientFailure: &transientFailure), !searched.isEmpty {
-                cache[track.id] = searched
-                diskCache.save(
-                    trackId: track.id,
-                    lines: searched,
-                    title: track.title,
-                    artist: track.artist,
-                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-                )
-                return searched
+            if found == nil {
+                try Task.checkCancellation()
+                found = accept(netEase.lrc)
             }
-
-            // 4. Final fallback: NetEase line-level LRC
-            try Task.checkCancellation()
-            if let lrc = netEase.lrc, !lrc.isEmpty {
-                cache[track.id] = lrc
-                diskCache.save(
-                    trackId: track.id,
-                    lines: lrc,
-                    title: track.title,
-                    artist: track.artist,
-                    maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
-                )
-                return lrc
+            if let lines = found ?? (annotatedFallback ?? diskFallback).map(AnnotatedLyrics.clean) {
+                if found != nil || !transientFailure {
+                    cache[track.id] = lines
+                    diskCache.save(
+                        trackId: track.id,
+                        lines: lines,
+                        title: track.title,
+                        artist: track.artist,
+                        maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
+                    )
+                }
+                return lines
             }
 
             return transientFailure ? nil : []
