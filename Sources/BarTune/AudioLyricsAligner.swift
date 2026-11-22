@@ -748,7 +748,8 @@ enum LyricsAudioAligner {
         lines: [LyricLine],
         recognizedWords: [RecognizedAudioWord],
         searchWindow: Double = 8.0,
-        replaceTextWithTranscription: Bool = false
+        replaceTextWithTranscription: Bool = false,
+        regroupsCJKWords: Bool = true
     ) -> AudioAlignmentResult {
         guard !lines.isEmpty, !recognizedWords.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
@@ -757,8 +758,9 @@ enum LyricsAudioAligner {
         let heardWords = recognizedWords
             .filter { !normalizeToken($0.text).isEmpty }
             .sorted { $0.startTime < $1.startTime }
-        // Transcription mode writes the heard words into the lyrics, so it keeps their own boundaries.
-        let sortedRecognized = replaceTextWithTranscription ? heardWords : regroupCJKWords(heardWords)
+        // Transcription mode writes the heard words into the lyrics, so it keeps their own boundaries;
+        // so do lyric tokens from Lyrics Alignment, which joining across lines would break.
+        let sortedRecognized = replaceTextWithTranscription || !regroupsCJKWords ? heardWords : regroupCJKWords(heardWords)
 
         guard !sortedRecognized.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
