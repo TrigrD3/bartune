@@ -906,6 +906,47 @@ final class AudioSyncManagerTests: XCTestCase {
         releaseB.signal()
     }
 
+    // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
+
+    @MainActor
+    func testTranscriptionOverwriteSingleCommonWordAbsentFromDisplayedAndCachedLyrics() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.replaceLyricsWithTranscription = true
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let track = sampleTrack()
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "We are the champions"),
+        ]
+        state.setTrack(track, lyrics: lines)
+        manager.handleTrackLoaded(track: track, rawLines: lines)
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // One common word ("the") with unrelated speech on either side.
+        let mixedSegments = [
+            SpeechRecognizedSegment(substring: "unrelated", timestamp: 0.0, duration: 0.2, confidence: 0.95),
+            SpeechRecognizedSegment(substring: "the", timestamp: 0.4, duration: 0.2, confidence: 0.95),
+            SpeechRecognizedSegment(substring: "chatter", timestamp: 0.8, duration: 0.2, confidence: 0.95),
+        ]
+        recognizer.resultHandlers.first?(mixedSegments, nil)
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        let displayedText = state.rawLyricLines.map(\.text).joined(separator: " ")
+        XCTAssertFalse(displayedText.contains("unrelated"))
+        XCTAssertFalse(displayedText.contains("chatter"))
+        XCTAssertNil(cache.load(trackId: track.id))
+    }
+
     // MARK: - Helpers
 
     @MainActor
