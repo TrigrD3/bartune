@@ -32,4 +32,14 @@ final class WhisperTimingTests: XCTestCase {
         XCTAssertNil(WhisperServer.dtwPreset(forModelPath: "/m/ggml-kotoba-whisper.bin"))
         XCTAssertNil(WhisperServer.dtwPreset(forModelPath: "/m/model.bin"))
     }
+
+    func testOnlyOrphanedBarTuneServersAreSelected() {
+        let ps = """
+          57961     1 /opt/homebrew/bin/whisper-server -m /m/ggml-base.bin --host 127.0.0.1 --port 63769 --request-path /2C408753-5FCC-4CAA-B5F4-72B4E8CA5EA9 -l auto -t 4
+          63088 62554 /opt/homebrew/bin/whisper-server -m /m/ggml-base.bin --host 127.0.0.1 --port 64418 --request-path /0A1B2C3D-5FCC-4CAA-B5F4-72B4E8CA5EA9 -l auto -t 4
+          70000     1 /opt/homebrew/bin/whisper-server -m /m/ggml-base.bin --host 127.0.0.1 --port 8080
+          70001     1 /usr/bin/python3 fake --request-path /2C408753-5FCC-4CAA-B5F4-72B4E8CA5EA9
+        """
+        XCTAssertEqual(WhisperServer.orphanedServerPIDs(psOutput: ps), [57961])
+    }
 }
