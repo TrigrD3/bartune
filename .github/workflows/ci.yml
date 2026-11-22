@@ -57,6 +57,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          # build.sh versions the app by commits since the last stable tag.
+          fetch-depth: 0
+          fetch-tags: true
       - name: Cache SwiftPM build
         uses: actions/cache@v6
         with:
