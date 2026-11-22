@@ -1276,6 +1276,43 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(spyRequest.appendCount, 1)
     }
 
+    // MARK: - #137: Diagnostics record recognizer output even when no line matches
+
+    @MainActor
+    func testDiagnosticsRecordUnmatchedSpeechResult() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let deps = makeDependencies(capture: fakeCapture, makeSpeechRecognizer: { _ in recognizer })
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        let unrelated = [
+            SpeechRecognizedSegment(substring: "banana", timestamp: 0.1, duration: 0.2, confidence: 0.4),
+            SpeechRecognizedSegment(substring: "orange", timestamp: 0.5, duration: 0.2, confidence: 0.3),
+        ]
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 40000), sampleRate: 16000)
+        let audioCounted = await waitUntil { manager.diagnostics.snapshot?.audioSeconds == 2 }
+        XCTAssertTrue(audioCounted, "2.5 s of captured audio should read as 2 whole seconds")
+        recognizer.resultHandlers.first?(unrelated, false, nil)
+        let recorded = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+
+        XCTAssertTrue(recorded)
+        let snapshot = manager.diagnostics.snapshot
+        XCTAssertEqual(snapshot?.engine, .appleSpeech)
+        XCTAssertEqual(snapshot?.localeIdentifier, "en-US")
+        XCTAssertEqual(snapshot?.recentWords.map(\.text), ["banana", "orange"])
+        XCTAssertEqual(snapshot?.matchedLineCount, 0)
+        XCTAssertEqual(snapshot?.totalLines, 2)
+        XCTAssertEqual(snapshot?.lineResults.map(\.matched), [false, false])
+    }
+
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
     @MainActor

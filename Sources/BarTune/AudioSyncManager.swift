@@ -425,6 +425,7 @@ final class AudioSyncManager {
     private let state: LyricsState
     private let cache: AudioSyncedLyricsCache
     private let dependencies: Dependencies
+    let diagnostics: AudioSyncDiagnosticsModel
     private var capture: AudioCaptureProviding { dependencies.capture }
 
     private var activeTrackId: String?
@@ -458,6 +459,7 @@ final class AudioSyncManager {
     private var whisperProcessingTask: Task<Void, Never>?
     private var whisperEngine: WhisperTranscribing?
     private var whisperSampleRate: Double = 16000.0
+    private var whisperCapturedSeconds: Double = 0
     private var whisperChunkDurationSeconds: Double { dependencies.whisperChunkDurationSeconds }
 
     var bufferedWhisperSampleCount: Int { whisperSampleBuffer.count }
@@ -467,11 +469,13 @@ final class AudioSyncManager {
     init(
         state: LyricsState,
         cache: AudioSyncedLyricsCache = .default,
-        dependencies: Dependencies = .live()
+        dependencies: Dependencies = .live(),
+        diagnostics: AudioSyncDiagnosticsModel? = nil
     ) {
         self.state = state
         self.cache = cache
         self.dependencies = dependencies
+        self.diagnostics = diagnostics ?? AudioSyncDiagnosticsModel()
     }
 
     func stop() {
@@ -498,6 +502,7 @@ final class AudioSyncManager {
         whisperChunkPlaybackRate = 1.0
         whisperPendingSeekPos = nil
         whisperLastPlayback = nil
+        whisperCapturedSeconds = 0
     }
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
@@ -730,6 +735,7 @@ final class AudioSyncManager {
             return
         }
 
+        diagnostics.begin(engine: engine, track: track, totalLines: lines.count)
         switch engine {
         case .off:
             state.audioSyncStatus = .idle
@@ -786,21 +792,27 @@ final class AudioSyncManager {
         else { return }
 
         let detectedLocale = LyricsLanguageDetector.detectSpeechLocale(for: lines)
-        let selectedRecognizer: SpeechRecognizing? = if let preferred = dependencies.makeSpeechRecognizer(detectedLocale),
+        var usesFallback = false
+        var selectedRecognizer: SpeechRecognizing?
+        if let preferred = dependencies.makeSpeechRecognizer(detectedLocale),
            preferred.isAvailable,
            preferred.supportsOnDeviceRecognition {
-            preferred
+            selectedRecognizer = preferred
         } else if let fallback = dependencies.makeSpeechRecognizer(nil),
                   fallback.isAvailable,
                   fallback.supportsOnDeviceRecognition {
-            fallback
-        } else {
-            nil
+            selectedRecognizer = fallback
+            usesFallback = true
         }
 
         guard let recognizer = selectedRecognizer else {
+            diagnostics.note("No on-device Apple Speech recognizer for \(detectedLocale.identifier) or the system locale")
             state.audioSyncStatus = .unavailable("On-device Apple Speech recognition is unavailable for this locale")
             return
+        }
+        diagnostics.update { $0.localeIdentifier = detectedLocale.identifier }
+        if usesFallback {
+            diagnostics.note("\(detectedLocale.identifier) has no on-device recognizer; using the system default locale")
         }
 
         let request = dependencies.makeSpeechRequest()
@@ -836,6 +848,7 @@ final class AudioSyncManager {
                         )
                     }
                     self.recognizedWords = words
+                    self.diagnostics.update { $0.record(words: words, replacing: true) }
                     self.applyAlignment(engine: .appleSpeech)
                 }
                 if error != nil || isFinal, self.isLiveSyncActive {
@@ -846,6 +859,7 @@ final class AudioSyncManager {
                     self.stop()
                     let message = error.map { "Apple Speech recognition stopped: \($0.localizedDescription)" }
                         ?? "Apple Speech recognition finished before syncing completed"
+                    self.diagnostics.note(message)
                     self.state.audioSyncStatus = .unavailable(message)
                 }
             }
@@ -888,6 +902,7 @@ final class AudioSyncManager {
                 req.append(buffer)
                 if sampleRate > 0 {
                     self.speechStreamDuration += Double(samples.count) / sampleRate
+                    self.diagnostics.recordAudio(totalSeconds: self.speechStreamDuration)
                 }
             }
         }
@@ -942,6 +957,7 @@ final class AudioSyncManager {
                 return
             }
             self.whisperEngine = engine
+            self.diagnostics.update { $0.localeIdentifier = "auto (Whisper)" }
             self.beginWhisperCapture(track: track, generation: generation)
         }
     }
@@ -958,6 +974,10 @@ final class AudioSyncManager {
                       capturedAt > self.whisperSeekBoundary
                 else { return }
                 self.whisperSampleRate = sampleRate
+                if sampleRate > 0 {
+                    self.whisperCapturedSeconds += Double(samples.count) / sampleRate
+                    self.diagnostics.recordAudio(totalSeconds: self.whisperCapturedSeconds)
+                }
                 if self.whisperChunkStartPos == nil {
                     let livePos = self.currentPlaybackPosition()
                     if let pending = self.whisperPendingSeekPos {
@@ -1041,6 +1061,7 @@ final class AudioSyncManager {
                   self.isLiveSyncActive,
                   self.state.audioSyncEngine == .whisper
             else { return }
+            self.diagnostics.update { $0.record(words: words, replacing: false) }
             if !words.isEmpty {
                 self.recognizedWords.append(contentsOf: words)
                 self.applyAlignment(engine: .whisper)
@@ -1068,6 +1089,11 @@ final class AudioSyncManager {
             lines: baseLines,
             recognizedWords: recognizedWords,
             replaceTextWithTranscription: state.replaceLyricsWithTranscription
+        )
+        let lines = baseLines
+        diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
+        AudioSyncDiagnosticsModel.logger.debug(
+            "Alignment: \(result.matchedLineCount, privacy: .public)/\(lines.count, privacy: .public) lines, \(self.recognizedWords.count, privacy: .public) words heard"
         )
         guard result.matchedLineCount > 0 else { return }
 
