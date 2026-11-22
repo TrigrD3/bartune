@@ -415,13 +415,49 @@ final class LyricsCacheTests: XCTestCase {
             syncCache: syncCache
         )
         let track = TrackInfo(id: "spotify:track:wrong-match", title: "Song", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let controlTrack = TrackInfo(id: "spotify:track:control", title: "Control", artist: "Other", album: "", duration: 190, artworkURL: nil)
         let source = [LyricLine(id: 0, timestamp: 1, text: "source")]
+        let controlSource = [LyricLine(id: 0, timestamp: 1, text: "control source")]
         let translationKey = LyricsTranslator.cacheKey(trackId: track.id, targetLanguage: .english, lines: source)
+        let controlTranslationKey = LyricsTranslator.cacheKey(trackId: controlTrack.id, targetLanguage: .english, lines: controlSource)
 
         func seed(_ text: String) {
             diskCache.save(trackId: track.id, lines: [LyricLine(id: 0, timestamp: 1, text: text)], title: track.title, artist: track.artist)
             diskCache.save(trackId: translationKey, lines: [LyricLine(id: 0, timestamp: 1, text: "\(text) en")])
+            syncCache.save(
+                AudioSyncedLyricsRecord(
+                    trackId: track.id,
+                    engine: .appleSpeech,
+                    syncedAt: Date(),
+                    medianOffset: 0,
+                    alignedLineCount: 1,
+                    sourceLineCount: 1,
+                    lines: [LyricLine(id: 0, timestamp: 1, text: text)]
+                )
+            )
         }
+
+        diskCache.save(
+            trackId: controlTrack.id,
+            lines: controlSource,
+            title: controlTrack.title,
+            artist: controlTrack.artist
+        )
+        diskCache.save(
+            trackId: controlTranslationKey,
+            lines: [LyricLine(id: 0, timestamp: 1, text: "control en")]
+        )
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: controlTrack.id,
+                engine: .appleSpeech,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: controlSource
+            )
+        )
 
         // Single-row deletion.
         seed("old")
@@ -429,6 +465,26 @@ final class LyricsCacheTests: XCTestCase {
         _ = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
         let song = try XCTUnwrap(diskCache.listEntries(audioSyncCache: syncCache).first { $0.trackId == track.id })
         await remover.remove(song)
+
+        XCTAssertNil(diskCache.load(trackId: track.id))
+        XCTAssertNil(diskCache.load(trackId: translationKey), "Manual removal must delete derived translation files on disk")
+        XCTAssertNil(syncCache.load(trackId: track.id), "Manual removal must delete audio sync records on disk")
+        let fallbackAfterRemove = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
+        XCTAssertEqual(fallbackAfterRemove, source)
+        XCTAssertNotNil(diskCache.load(trackId: controlTrack.id))
+        XCTAssertNotNil(diskCache.load(trackId: controlTranslationKey))
+        XCTAssertNotNil(syncCache.load(trackId: controlTrack.id))
+
+        // Single-row deletion of legacy song without trackId must keep control song's disk translation.
+        let legacyTrackId = "spotify:track:legacy-single"
+        let legacyKey = LyricsDiskCache.cacheKey(for: legacyTrackId)
+        let legacyData = try JSONEncoder().encode([LyricLine(id: 0, timestamp: 1, text: "legacy")])
+        try legacyData.write(to: diskCache.fileURL(forCacheKey: legacyKey))
+        let legacySummary = try XCTUnwrap(diskCache.listEntries(audioSyncCache: syncCache).first { $0.cacheKey == legacyKey })
+        await remover.remove(legacySummary)
+        XCTAssertNil(diskCache.loadByCacheKey(legacyKey))
+        XCTAssertNotNil(diskCache.load(trackId: controlTranslationKey), "Removing a legacy row must not wipe other songs' translations")
+
         seed("new")
         let afterRemove = await fetcher.fetchLyrics(for: track)
         let translatedAfterRemove = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
@@ -442,6 +498,57 @@ final class LyricsCacheTests: XCTestCase {
         let translatedAfterClear = await translator.translate(lines: source, trackId: track.id, targetLanguage: .english)
         XCTAssertEqual(afterClear.map(\.text), ["newer"])
         XCTAssertEqual(translatedAfterClear.map(\.text), ["newer en"])
+    }
+
+    func testAutomaticEvictionDeletesDerivedTranslationAndPreservesControlSong() {
+        let lyricsDir = tempDir.appendingPathComponent("lyrics", isDirectory: true)
+        let syncDir = tempDir.appendingPathComponent("sync", isDirectory: true)
+        let syncCache = AudioSyncedLyricsCache(directory: syncDir)
+        let diskCache = LyricsDiskCache(directory: lyricsDir, maxEntries: 1, audioSyncCache: syncCache)
+
+        let track1 = TrackInfo(id: "spotify:track:evict-1", title: "Old Song", artist: "Artist 1", album: "", duration: 180, artworkURL: nil)
+        let track2 = TrackInfo(id: "spotify:track:keep-2", title: "New Song", artist: "Artist 2", album: "", duration: 200, artworkURL: nil)
+        let lines1 = [LyricLine(id: 0, timestamp: 1.0, text: "Old line")]
+        let lines2 = [LyricLine(id: 0, timestamp: 1.0, text: "New line")]
+        let trKey1 = LyricsTranslator.cacheKey(trackId: track1.id, targetLanguage: .english, lines: lines1)
+        let trKey2 = LyricsTranslator.cacheKey(trackId: track2.id, targetLanguage: .english, lines: lines2)
+
+        diskCache.save(trackId: track1.id, lines: lines1, title: track1.title, artist: track1.artist)
+        diskCache.save(trackId: trKey1, lines: [LyricLine(id: 0, timestamp: 1.0, text: "Old translated")])
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: track1.id,
+                engine: .appleSpeech,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: lines1
+            )
+        )
+        Thread.sleep(forTimeInterval: 0.02)
+        diskCache.save(trackId: track2.id, lines: lines2, title: track2.title, artist: track2.artist)
+        diskCache.save(trackId: trKey2, lines: [LyricLine(id: 0, timestamp: 1.0, text: "New translated")])
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: track2.id,
+                engine: .appleSpeech,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: lines2
+            )
+        )
+
+        XCTAssertNil(diskCache.load(trackId: track1.id), "Oldest song raw lyrics should be evicted")
+        XCTAssertNil(diskCache.load(trackId: trKey1), "Evicted song translation must also be removed")
+        XCTAssertNil(syncCache.load(trackId: track1.id), "Evicted song audio sync record must also be removed")
+        XCTAssertNotNil(diskCache.load(trackId: track2.id), "Control song raw lyrics must remain")
+        XCTAssertNotNil(diskCache.load(trackId: trKey2), "Control song translation must remain")
+        XCTAssertNotNil(syncCache.load(trackId: track2.id), "Control song audio sync record must remain")
+        XCTAssertEqual(diskCache.stats().count, 1)
+        XCTAssertEqual(diskCache.listEntries(audioSyncCache: syncCache).map(\.trackId), [track2.id])
     }
 
     func testMemoryCachesEvictOldEntries() async {
