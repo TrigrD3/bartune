@@ -45,3 +45,22 @@ final class RomanizerTests: XCTestCase {
         XCTAssertFalse(ChineseRomanizer.isChineseTrack(japaneseLines))
     }
 }
+
+final class JapaneseWordRomanizerTests: XCTestCase {
+    func testTimedWordsKeepTheWholeLineReading() {
+        let words = ["舵取り", "粘土", "に", "固まっ", "て", "いく", "越し", "が", "曇っ", "て"]
+        let romanized = JapaneseRomanizer.romanizeWords(words)
+
+        XCTAssertEqual(romanized.count, words.count)
+        XCTAssertEqual(
+            romanized.filter { !$0.isEmpty }.joined(separator: " "),
+            JapaneseRomanizer.romanizeLine(words.joined())
+        )
+        XCTAssertTrue(romanized.joined(separator: " ").contains("katamatte"), "\(romanized)")
+        XCTAssertFalse(romanized.contains("katama"))
+    }
+
+    func testLatinWordsPassThrough() {
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["hello ", "world"]), ["hello ", "world"])
+    }
+}

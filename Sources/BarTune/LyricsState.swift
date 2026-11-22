@@ -725,7 +725,7 @@ final class LyricsState: ObservableObject {
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
         if isJapaneseSong {
-            romanizedLines = Self.romanizeLines(lyrics, using: JapaneseRomanizer.romanizeLine)
+            romanizedLines = Self.romanizeLines(lyrics, using: JapaneseRomanizer.romanizeLine, words: JapaneseRomanizer.romanizeWords)
         } else {
             romanizedLines = []
         }
@@ -757,14 +757,20 @@ final class LyricsState: ObservableObject {
         if lineProgress != 0.0 { lineProgress = 0.0 }
     }
 
-    private static func romanizeLines(_ lyrics: [LyricLine], using transform: (String) -> String) -> [LyricLine] {
+    /// `wordsTransform` romanizes a timed line's words in context; without it each word is romanized alone.
+    private static func romanizeLines(
+        _ lyrics: [LyricLine],
+        using transform: (String) -> String,
+        words wordsTransform: (([String]) -> [String])? = nil
+    ) -> [LyricLine] {
         lyrics.map { line in
             if !line.words.isEmpty {
-                let romWords = line.words.map { w in
+                let romanized = wordsTransform?(line.words.map(\.text)) ?? line.words.map { transform($0.text) }
+                let romWords = zip(line.words, romanized).map { w, text in
                     WordTimestamp(
                         timestamp: w.timestamp,
                         duration: w.duration,
-                        text: transform(w.text) + " "
+                        text: text.isEmpty ? "" : text + " "
                     )
                 }
                 let joined = romWords.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -842,7 +848,7 @@ final class LyricsState: ObservableObject {
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lines)
         isChineseSong = ChineseRomanizer.isChineseTrack(lines)
         romanizedLines = isJapaneseSong
-            ? Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine)
+            ? Self.romanizeLines(lines, using: JapaneseRomanizer.romanizeLine, words: JapaneseRomanizer.romanizeWords)
             : []
         koreanRomanizedLines = isKoreanSong
             ? Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
