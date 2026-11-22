@@ -136,6 +136,19 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         max(1, Int((Double(lineCount) * completeLineFraction).rounded(.up)))
     }
 
+    /// False when the lyrics changed since this record was aligned (e.g. a different version was fetched).
+    /// Transcription records rewrite line text, so only their line count is compared.
+    func matchesSource(_ sourceLines: [LyricLine], comparingText: Bool) -> Bool {
+        func texts(_ lines: [LyricLine]) -> [String] {
+            lines.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+        }
+        let source = texts(sourceLines)
+        if let sourceLineCount, sourceLineCount != source.count {
+            return false
+        }
+        return !comparingText || texts(lines) == source
+    }
+
     /// A reliable record that matched enough lines to skip listening again on the next play.
     func isComplete(expectedSourceLineCount: Int?) -> Bool {
         guard isReliable(expectedSourceLineCount: expectedSourceLineCount) else { return false }
