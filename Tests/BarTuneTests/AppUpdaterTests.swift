@@ -742,6 +742,105 @@ final class AppUpdaterTests: XCTestCase {
         XCTAssertEqual(requests.withLock { $0 }, 0)
     }
 
+    @MainActor
+    func testInstallsDownloadedUpdateAndRelaunchesInstalledApp() async throws {
+        let tempRoot = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "com.bartune.tests.install.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let bundleID = "com.bartune.tests.app"
+        let applications = tempRoot.appendingPathComponent("Applications", isDirectory: true)
+        let installed = try makeTestAppBundle(in: applications, identifier: bundleID, version: "0.4.0")
+        let dmg = try makeTestDiskImage(in: tempRoot, identifier: bundleID, version: "0.5.0")
+        let json = try makeReleaseJSON(version: "v0.5.0", sha256Digest: AppUpdateService.sha256Hex(ofFileAt: dmg))
+
+        let service = AppUpdateService(
+            dataLoader: { request in
+                try (Data(json.utf8), self.httpResponse(url: XCTUnwrap(request.url), statusCode: 200))
+            },
+            fileDownloader: { request in
+                let tmp = tempRoot.appendingPathComponent("download-\(UUID().uuidString).tmp")
+                try FileManager.default.copyItem(at: dmg, to: tmp)
+                return try (tmp, self.httpResponse(url: XCTUnwrap(request.url), statusCode: 200))
+            },
+            destinationDirectory: { tempRoot.appendingPathComponent("downloads", isDirectory: true) }
+        )
+        var relaunchedURL: URL?
+        let model = AppUpdaterModel(
+            currentVersion: AppVersionInfo(shortVersion: "0.4.0", buildNumber: "1"),
+            service: service,
+            installer: AppInstaller(installedAppURL: installed, bundleIdentifier: bundleID, caskroomDirectories: []),
+            relaunch: { relaunchedURL = $0 },
+            isAppleSilicon: true,
+            defaults: defaults
+        )
+
+        XCTAssertNil(model.installDownloadedUpdate(), "Nothing to install before a verified download")
+        await model.checkForUpdates()?.value
+        await model.downloadLatestUpdate()?.value
+        guard case .downloaded = model.state else {
+            XCTFail("Expected .downloaded, got \(model.state)")
+            return
+        }
+        XCTAssertNil(model.installBlocker)
+
+        await model.installDownloadedUpdate()?.value
+        XCTAssertEqual(installedTestAppVersion(at: installed), "0.5.0")
+        XCTAssertEqual(relaunchedURL, installed)
+    }
+
+    @MainActor
+    func testFailedInstallKeepsReleaseOfferedAndDoesNotRelaunch() async throws {
+        let tempRoot = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+        let suiteName = "com.bartune.tests.installfail.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let caskroom = tempRoot.appendingPathComponent("Caskroom/bartune", isDirectory: true)
+        try FileManager.default.createDirectory(at: caskroom, withIntermediateDirectories: true)
+        let installed = try makeTestAppBundle(in: tempRoot.appendingPathComponent("Applications"), identifier: "com.bartune.tests.app", version: "0.4.0")
+        let payload = Data("dmg".utf8)
+        let json = makeReleaseJSON(version: "v0.5.0", sha256Digest: SHA256.hash(data: payload).map { String(format: "%02x", $0) }.joined())
+
+        let service = AppUpdateService(
+            dataLoader: { request in
+                try (Data(json.utf8), self.httpResponse(url: XCTUnwrap(request.url), statusCode: 200))
+            },
+            fileDownloader: { request in
+                let tmp = tempRoot.appendingPathComponent("download-\(UUID().uuidString).tmp")
+                try payload.write(to: tmp)
+                return try (tmp, self.httpResponse(url: XCTUnwrap(request.url), statusCode: 200))
+            },
+            destinationDirectory: { tempRoot.appendingPathComponent("downloads", isDirectory: true) }
+        )
+        var relaunched = false
+        let model = AppUpdaterModel(
+            currentVersion: AppVersionInfo(shortVersion: "0.4.0", buildNumber: "1"),
+            service: service,
+            installer: AppInstaller(installedAppURL: installed, bundleIdentifier: "com.bartune.tests.app", caskroomDirectories: [caskroom]),
+            relaunch: { _ in relaunched = true },
+            isAppleSilicon: true,
+            defaults: defaults
+        )
+
+        await model.checkForUpdates()?.value
+        await model.downloadLatestUpdate()?.value
+        XCTAssertEqual(model.installBlocker, .managedByHomebrew)
+        await model.installDownloadedUpdate()?.value
+
+        guard case let .failed(message, release) = model.state else {
+            XCTFail("Expected .failed, got \(model.state)")
+            return
+        }
+        XCTAssertEqual(message, AppInstallError.managedByHomebrew.localizedDescription)
+        XCTAssertEqual(release?.version, AppVersion("0.5.0"))
+        XCTAssertFalse(relaunched)
+        XCTAssertEqual(installedTestAppVersion(at: installed), "0.4.0")
+    }
+
     private func makeTemporaryDirectory() -> URL {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("BarTuneAppUpdaterTests-\(UUID().uuidString)", isDirectory: true)

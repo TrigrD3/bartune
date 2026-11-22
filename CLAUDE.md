@@ -20,6 +20,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   Romanizer.swift          # Offline Japanese → Romaji conversion via CFStringTokenizer
   SettingsView.swift       # SwiftUI Settings window
   AppUpdater.swift         # GitHub Releases update check & SHA-256-verified DMG download (About tab)
+  AppInstaller.swift       # Install & Relaunch: mounts the verified DMG, swaps BarTune.app in place (not for Homebrew installs)
 Tests/BarTuneTests/        # XCTest unit tests (LRCParserTests, BrowserMediaParserTests, etc.)
 Casks/
   bartune.rb               # Homebrew Cask template synced to TrigrD3/homebrew-tap on v* tags

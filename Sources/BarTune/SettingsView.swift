@@ -115,6 +115,7 @@ struct SettingsView: View {
     @State private var selectedDownloadPreset: WhisperModelPreset = .base
     @State private var metricsTracker = ResourceMetricsTracker()
     @State private var permissions = AppPermissionsSnapshot.empty
+    @State private var showInstallConfirmation: Bool = false
     private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
@@ -943,6 +944,20 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .alert(
+            "Install \(updater.latestRelease?.version.tagFormatted ?? "Update") and Relaunch?",
+            isPresented: $showInstallConfirmation
+        ) {
+            Button("Install & Relaunch") {
+                updater.installDownloadedUpdate()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "\(updater.installedAppURL.path) will be replaced and BarTune will restart. "
+                    + "macOS may ask again for Screen Recording, Speech Recognition, and Automation access."
+            )
+        }
     }
 
     @ViewBuilder
@@ -989,10 +1004,20 @@ struct SettingsView: View {
 
                 Text(
                     "Saved to \(fileURL.deletingLastPathComponent().lastPathComponent). "
-                        + "Open the disk image and drag BarTune to Applications."
+                        + (updater.installBlocker.map {
+                            "\($0.localizedDescription) Open the disk image and drag BarTune to Applications."
+                        } ?? "Install & Relaunch replaces BarTune and restarts it.")
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            }
+        case let .installing(release):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Installing \(release.version.tagFormatted)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         case let .failed(message, _):
             Text(message)
@@ -1018,13 +1043,20 @@ struct SettingsView: View {
                     : "This release has no checksum, so BarTune can't verify a download.")
             }
         case let .downloaded(_, fileURL):
-            Button("Reveal in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+            if updater.installBlocker == nil {
+                Button("Install & Relaunch") {
+                    showInstallConfirmation = true
+                }
+                .keyboardShortcut(.defaultAction)
+            } else {
+                Button("Reveal in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                }
+                Button("Open DMG") {
+                    NSWorkspace.shared.open(fileURL)
+                }
             }
-            Button("Open DMG") {
-                NSWorkspace.shared.open(fileURL)
-            }
-        case .idle, .checking, .upToDate, .downloading, .failed(_, nil):
+        case .idle, .checking, .upToDate, .downloading, .installing, .failed(_, nil):
             EmptyView()
         }
     }
