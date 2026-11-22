@@ -439,6 +439,7 @@ enum WhisperJSONParser {
         var currentEnd: Double = 0
         var confSum = 0.0
         var confCount = 0
+        var currentIsCJK = false
 
         func flush() {
             let trimmed = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -459,6 +460,7 @@ enum WhisperJSONParser {
             currentEnd = 0
             confSum = 0
             confCount = 0
+            currentIsCJK = false
         }
 
         for token in tokens {
@@ -472,11 +474,15 @@ enum WhisperJSONParser {
             guard let from = token.start, let to = token.end else { continue }
             let start = chunkStartTime + from * playbackRate
             let end = chunkStartTime + max(from + 0.04, to) * playbackRate
-            let startsNewWord = rawText.first?.isWhitespace == true
+            // Japanese and Chinese tokens carry no leading space; keep each one (and its timing) separate
+            // so the aligner can regroup them into lyric words.
+            let isCJK = LyricsAudioAligner.containsCJK(trimmedCheck)
+            let startsNewWord = rawText.first?.isWhitespace == true || isCJK || currentIsCJK
 
             if startsNewWord && !currentText.isEmpty {
                 flush()
             }
+            currentIsCJK = isCJK
 
             if currentStart == nil {
                 currentStart = start
@@ -543,6 +549,65 @@ enum LyricsAudioAligner {
         let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         let scalars = folded.unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
         return String(String.UnicodeScalarView(scalars))
+    }
+
+    static func containsCJK(_ text: String) -> Bool {
+        text.unicodeScalars.contains { scalar in
+            let v = scalar.value
+            return (0x3040...0x30FF).contains(v) || (0x4E00...0x9FFF).contains(v)
+        }
+    }
+
+    /// Recognizers return Japanese and Chinese as single characters (Whisper) or whole phrases (Apple Speech).
+    /// Each unspaced CJK run is re-split with the lyric tokenizer, timing each character by interpolation
+    /// inside its recognized word, so recognized words line up with lyric tokens.
+    static func regroupCJKWords(_ words: [RecognizedAudioWord], maxGap: Double = 1.0) -> [RecognizedAudioWord] {
+        var out: [RecognizedAudioWord] = []
+        var run: [RecognizedAudioWord] = []
+
+        func flushRun() {
+            defer { run.removeAll() }
+            guard !run.isEmpty else { return }
+            var chars: [(char: Character, start: Double, end: Double, confidence: Double)] = []
+            for word in run {
+                let wordChars = Array(word.text)
+                let step = max(0.04, word.duration) / Double(wordChars.count)
+                for (idx, char) in wordChars.enumerated() {
+                    let start = word.startTime + Double(idx) * step
+                    chars.append((char, start, start + step, word.confidence))
+                }
+            }
+            var cursor = 0
+            for token in tokenizeLine(String(chars.map(\.char))) {
+                let count = token.display.count
+                guard count > 0, cursor + count <= chars.count else { break }
+                let slice = chars[cursor..<(cursor + count)]
+                cursor += count
+                guard let first = slice.first, let last = slice.last else { continue }
+                out.append(
+                    RecognizedAudioWord(
+                        text: token.display,
+                        startTime: first.start,
+                        duration: last.end - first.start,
+                        confidence: slice.map(\.confidence).reduce(0, +) / Double(count)
+                    )
+                )
+            }
+        }
+
+        for word in words {
+            if containsCJK(word.text), !word.text.contains(where: \.isWhitespace) {
+                if let previous = run.last, word.startTime - previous.endTime > maxGap {
+                    flushRun()
+                }
+                run.append(word)
+            } else {
+                flushRun()
+                out.append(word)
+            }
+        }
+        flushRun()
+        return out
     }
 
     private static func containsCJKWithoutSpaces(_ text: String) -> Bool {
@@ -644,9 +709,11 @@ enum LyricsAudioAligner {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
         }
 
-        let sortedRecognized = recognizedWords
+        let heardWords = recognizedWords
             .filter { !normalizeToken($0.text).isEmpty }
             .sorted { $0.startTime < $1.startTime }
+        // Transcription mode writes the heard words into the lyrics, so it keeps their own boundaries.
+        let sortedRecognized = replaceTextWithTranscription ? heardWords : regroupCJKWords(heardWords)
 
         guard !sortedRecognized.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)

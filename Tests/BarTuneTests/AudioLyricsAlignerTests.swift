@@ -357,6 +357,60 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(LyricsLanguageDetector.detectSpeechLocale(for: enLines).identifier, "en-US")
     }
 
+    // MARK: - #139: Japanese recognizer output arrives as characters or whole phrases
+
+    /// Per-character tokens as whisper-server returned them for synthesized Japanese speech.
+    private let japaneseWhisperTokens: [(String, Double, Double)] = [
+        ("見", 0.00, 0.18), ("つ", 0.18, 0.31), ("け", 0.31, 0.39), ("出", 0.39, 0.52), ("して", 0.52, 0.86),
+        ("く", 0.86, 0.92), ("れた", 0.92, 1.19), ("忘", 2.38, 2.51), ("れる", 2.51, 2.92), ("こと", 2.92, 3.18),
+        ("ない", 3.18, 3.44), ("君", 3.44, 3.64), ("の", 3.64, 3.84), ("笑", 3.84, 3.97), ("顔", 3.97, 4.30),
+    ]
+
+    func testWhisperParserKeepsJapaneseTokensSeparate() throws {
+        let tokens = japaneseWhisperTokens.map { ["word": $0.0, "start": $0.1, "end": $0.2, "probability": 0.9] as [String: Any] }
+        let json: [String: Any] = ["segments": [["start": 0.0, "end": 4.3, "text": "見つけ出してくれた忘れることない君の笑顔", "words": tokens]]]
+        let data = try JSONSerialization.data(withJSONObject: json)
+
+        let words = WhisperJSONParser.parse(data: data, chunkStartTime: 20.0)
+
+        XCTAssertEqual(words.count, japaneseWhisperTokens.count)
+        XCTAssertEqual(words.first?.text, "見")
+        XCTAssertEqual(words.last?.startTime ?? 0, 23.97, accuracy: 0.001)
+    }
+
+    func testAlignsJapaneseLinesFromPerCharacterWhisperWords() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 20.3, text: "見つけ出してくれた"),
+            LyricLine(id: 1, timestamp: 22.6, text: "忘れることない 君の笑顔"),
+        ]
+        let recognized = japaneseWhisperTokens.map {
+            RecognizedAudioWord(text: $0.0, startTime: 20.0 + $0.1, duration: $0.2 - $0.1, confidence: 0.9)
+        }
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[0].timestamp, 20.0, accuracy: 0.01)
+        XCTAssertEqual(result.lines[1].timestamp, 22.38, accuracy: 0.01)
+        XCTAssertEqual(result.lines[1].words.first(where: { $0.text.hasPrefix("君") })?.timestamp ?? 0, 23.44, accuracy: 0.01)
+    }
+
+    func testAlignsJapaneseLineFromOneApplePhraseSegment() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "楽しいことばかり"),
+            LyricLine(id: 1, timestamp: 14.0, text: "溢れ出す涙"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "楽しいことばかり", startTime: 10.4, duration: 2.0, confidence: 0.6),
+            RecognizedAudioWord(text: "溢れ出す涙", startTime: 14.3, duration: 1.5, confidence: 0.6),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[0].timestamp, 10.4, accuracy: 0.01)
+    }
+
     func testSpeechLocaleFollowsTheMajorityLanguageOfMixedLyrics() {
         let mostlyEnglish = [
             "\"Do you believe a world of happy endings?\"",
