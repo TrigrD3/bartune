@@ -792,7 +792,7 @@ final class AudioSyncManagerTests: XCTestCase {
             SpeechRecognizedSegment(substring: "before", timestamp: 1.0, duration: 0.3, confidence: 0.9),
             SpeechRecognizedSegment(substring: "after", timestamp: 3.0, duration: 0.3, confidence: 0.9),
         ]
-        recognizer.resultHandlers.first?(segments, nil)
+        recognizer.resultHandlers.first?(segments, false, nil)
         let delivered = await waitUntil { manager.recognizedWords.count == 2 }
         XCTAssertTrue(delivered)
 
@@ -819,7 +819,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let error = NSError(domain: "kAFAssistantErrorDomain", code: 1110, userInfo: [
             NSLocalizedDescriptionKey: "No speech detected",
         ])
-        recognizer.resultHandlers.first?(nil, error)
+        recognizer.resultHandlers.first?(nil, false, error)
         let ended = await waitUntil { !manager.isLiveSyncActive }
 
         XCTAssertTrue(ended)
@@ -907,6 +907,67 @@ final class AudioSyncManagerTests: XCTestCase {
         releaseB.signal()
     }
 
+    // MARK: - #114: Final Apple Speech result without error ends capture when below threshold
+
+    @MainActor
+    func testFinalSpeechResultBelowThresholdWithoutErrorStopsCaptureAndUpdatesStatus() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .appleSpeech
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let recognizer = FakeSpeechRecognizer(isAvailable: true, supportsOnDeviceRecognition: true)
+        let spyRequest = SpySpeechRequest()
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            makeSpeechRecognizer: { _ in recognizer },
+            makeSpeechRequest: { spyRequest }
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Feed audio before completion and confirm the request received it.
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 1600), sampleRate: 16000)
+        let firstAppend = await waitUntil { spyRequest.appendCount == 1 }
+        XCTAssertTrue(firstAppend)
+        let capturedClosureBeforeFinal = fakeCapture.onAudioSamples
+        let stopsBeforeFinal = fakeCapture.stopCount
+
+        // Deliver a final result matching only 1 of 2 lines (below confidentThreshold = 2) with nil error.
+        let partialSegments = [
+            SpeechRecognizedSegment(substring: "hello", timestamp: 0.1, duration: 0.2, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "world", timestamp: 0.4, duration: 0.2, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "from", timestamp: 0.7, duration: 0.2, confidence: 0.9),
+            SpeechRecognizedSegment(substring: "test", timestamp: 1.0, duration: 0.2, confidence: 0.9),
+        ]
+        recognizer.resultHandlers.first?(partialSegments, true, nil)
+        let ended = await waitUntil { !manager.isLiveSyncActive }
+
+        XCTAssertTrue(ended)
+        XCTAssertEqual(fakeCapture.stopCount, stopsBeforeFinal + 1)
+        XCTAssertNil(fakeCapture.onAudioSamples)
+        XCTAssertEqual(recognizer.createdTasks.first?.isCancelled, true)
+        XCTAssertGreaterThanOrEqual(spyRequest.endAudioCount, 1)
+        XCTAssertNil(state.audioSyncStatus.overlayBadge, "Visible overlay badge must not stay on Syncing/Listening after capture stops")
+        if case .unavailable = state.audioSyncStatus {
+            // Expected
+        } else {
+            XCTFail("Expected .unavailable status after final result below threshold, got \(state.audioSyncStatus)")
+        }
+
+        // Subsequent audio callbacks (even through a retained closure) must not reach the old request.
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 1600), sampleRate: 16000)
+        capturedClosureBeforeFinal?([Float](repeating: 0.2, count: 1600), 16000)
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(spyRequest.appendCount, 1)
+    }
+
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
     @MainActor
@@ -937,7 +998,7 @@ final class AudioSyncManagerTests: XCTestCase {
             SpeechRecognizedSegment(substring: "the", timestamp: 0.4, duration: 0.2, confidence: 0.95),
             SpeechRecognizedSegment(substring: "chatter", timestamp: 0.8, duration: 0.2, confidence: 0.95),
         ]
-        recognizer.resultHandlers.first?(mixedSegments, nil)
+        recognizer.resultHandlers.first?(mixedSegments, true, nil)
         for _ in 0..<20 {
             await Task.yield()
         }
@@ -1068,6 +1129,7 @@ final class AudioSyncManagerTests: XCTestCase {
         speechAuthStatus: SFSpeechRecognizerAuthorizationStatus = .authorized,
         requestSpeechAuth: @escaping (@escaping @Sendable (SFSpeechRecognizerAuthorizationStatus) -> Void) -> Void = { _ in },
         makeSpeechRecognizer: @escaping (Locale?) -> SpeechRecognizing? = { _ in nil },
+        makeSpeechRequest: @escaping () -> SFSpeechAudioBufferRecognitionRequest = { SFSpeechAudioBufferRecognitionRequest() },
         locateWhisperServer: @escaping () -> String? = { nil },
         resolveWhisperModelPath: @escaping @Sendable (String) -> String? = { _ in nil },
         runWhisperChunk: @escaping @Sendable (AudioSyncManager.WhisperChunkRequest) -> [RecognizedAudioWord] = { _ in [] },
@@ -1081,6 +1143,7 @@ final class AudioSyncManagerTests: XCTestCase {
             speechAuthorizationStatus: { speechAuthStatus },
             requestSpeechAuthorization: requestSpeechAuth,
             makeSpeechRecognizer: makeSpeechRecognizer,
+            makeSpeechRequest: makeSpeechRequest,
             locateWhisperServer: locateWhisperServer,
             resolveWhisperModelPath: resolveWhisperModelPath,
             launchWhisper: launchWhisper ?? { _, _ in FakeWhisperEngine(transcribe: runWhisperChunk) },
@@ -1124,7 +1187,7 @@ private final class FakeSpeechRecognizer: SpeechRecognizing {
     let supportsOnDeviceRecognition: Bool
     private(set) var startedRequests: [SFSpeechAudioBufferRecognitionRequest] = []
     private(set) var createdTasks: [FakeSpeechTask] = []
-    private(set) var resultHandlers: [@Sendable ([SpeechRecognizedSegment]?, Error?) -> Void] = []
+    private(set) var resultHandlers: [@Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void] = []
 
     init(isAvailable: Bool, supportsOnDeviceRecognition: Bool) {
         self.isAvailable = isAvailable
@@ -1133,7 +1196,7 @@ private final class FakeSpeechRecognizer: SpeechRecognizing {
 
     func startRecognitionTask(
         with request: SFSpeechAudioBufferRecognitionRequest,
-        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Error?) -> Void
+        resultHandler: @escaping @Sendable ([SpeechRecognizedSegment]?, Bool, Error?) -> Void
     ) -> SpeechRecognitionTaskHandling {
         startedRequests.append(request)
         resultHandlers.append(resultHandler)
@@ -1160,6 +1223,38 @@ private final class FakeWhisperEngine: WhisperTranscribing, @unchecked Sendable 
 
     func shutdown() {
         shutdowns.withLock { $0 += 1 }
+    }
+}
+
+private final class SpySpeechRequest: SFSpeechAudioBufferRecognitionRequest, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _appendCount = 0
+    private var _endAudioCount = 0
+
+    var appendCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _appendCount
+    }
+
+    var endAudioCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return _endAudioCount
+    }
+
+    override func append(_ audioPCMBuffer: AVAudioPCMBuffer) {
+        lock.lock()
+        _appendCount += 1
+        lock.unlock()
+        super.append(audioPCMBuffer)
+    }
+
+    override func endAudio() {
+        lock.lock()
+        _endAudioCount += 1
+        lock.unlock()
+        super.endAudio()
     }
 }
 
