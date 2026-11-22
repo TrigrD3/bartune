@@ -10,10 +10,9 @@ reviews:
   review_status: true
   collapse_walkthrough: true
   auto_review:
-    enabled: true
+    # Reviews run only on request: comment "@coderabbitai review" on the PR.
+    enabled: false
     drafts: false
-    # 0 disables the pause threshold; drafts are still skipped (drafts: false).
-    auto_pause_after_reviewed_commits: 0
     base_branches:
       - main
   path_instructions:
