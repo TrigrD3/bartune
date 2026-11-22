@@ -59,7 +59,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         settingsController = SettingsWindowController(
             state: state,
             cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator),
-            appUpdater: appUpdater
+            appUpdater: appUpdater,
+            diagnostics: audioSyncManager.diagnostics
         )
 
         startPlaybackMonitoring()

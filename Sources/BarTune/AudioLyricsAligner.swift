@@ -90,6 +90,8 @@ struct AudioAlignmentResult: Equatable, Sendable {
     let matchedLineCount: Int
     let matchedWordCount: Int
     let medianOffset: Double?
+    /// IDs of the lines whose timing came from recognized audio, in line order.
+    var matchedLineIDs: [Int] = []
 }
 
 struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
@@ -686,6 +688,7 @@ enum LyricsAudioAligner {
         var alignedLines: [LyricLine] = []
         alignedLines.reserveCapacity(lines.count)
         var matchedLineCount = 0
+        var matchedLineIDs: [Int] = []
         var matchedWordCount = 0
         var lastConsumedWordEnd: Double = 0.0
         var previousLineEnd: Double = 0.0
@@ -736,6 +739,7 @@ enum LyricsAudioAligner {
                     acceptsStart: startIsEligible
                 ), let startTs = matchedSpan.first?.startTime {
                     matchedLineCount += 1
+                    matchedLineIDs.append(line.id)
                     matchedWordCount += matchedSpan.count
                     let transcribedWords: [WordTimestamp] = matchedSpan.enumerated().map { idx, word in
                         let suffix = (idx + 1 < matchedSpan.count) ? " " : ""
@@ -781,6 +785,7 @@ enum LyricsAudioAligner {
                     let newDuration = max(0.3, clampedEnd - newLineStart)
                     let actualMatchedEnd = matches.map(\.word.endTime).max() ?? clampedEnd
                     matchedLineCount += 1
+                    matchedLineIDs.append(line.id)
                     matchedWordCount += matches.count
                     lastConsumedWordEnd = max(lastConsumedWordEnd, actualMatchedEnd + 0.01)
                     previousLineEnd = max(previousLineEnd, newLineStart + newDuration)
@@ -841,7 +846,8 @@ enum LyricsAudioAligner {
             lines: alignedLines,
             matchedLineCount: matchedLineCount,
             matchedWordCount: matchedWordCount,
-            medianOffset: medianOffset
+            medianOffset: medianOffset,
+            matchedLineIDs: matchedLineIDs
         )
     }
 

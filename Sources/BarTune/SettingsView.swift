@@ -102,6 +102,7 @@ struct SettingsView: View {
     @ObservedObject var state: LyricsState
     let cacheRemover: OfflineCacheRemover
     @ObservedObject var updater: AppUpdaterModel
+    let diagnostics: AudioSyncDiagnosticsModel
     @State private var selectedTab: SettingsTab = .general
     @StateObject private var cacheStats = OfflineCacheStatsModel()
     @State private var cacheSearchQuery: String = ""
@@ -596,6 +597,10 @@ struct SettingsView: View {
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                }
+
+                if state.audioSyncEngine != .off {
+                    AudioSyncDiagnosticsSection(model: diagnostics, statusLabel: state.audioSyncStatus.label)
                 }
             }
 
@@ -1282,6 +1287,79 @@ private enum AppPermissionsChecker {
     }
 }
 
+/// Live view of the current audio sync session; observes only the diagnostics model so updates don't redraw the rest of Settings.
+private struct AudioSyncDiagnosticsSection: View {
+    @ObservedObject var model: AudioSyncDiagnosticsModel
+    let statusLabel: String
+    @State private var isExpanded = false
+    private static let visibleWordCount = 30
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            if let snapshot = model.snapshot {
+                diagnosticRow("Track", snapshot.trackDescription)
+                diagnosticRow("Engine", snapshot.engine.title)
+                diagnosticRow("Speech Locale", snapshot.localeIdentifier ?? "—")
+                diagnosticRow("Audio Received", "\(snapshot.audioSeconds)s")
+                diagnosticRow("Recognizer Results", "\(snapshot.resultCount)")
+                diagnosticRow("Words Heard", "\(snapshot.totalRecognizedWords)")
+                diagnosticRow("Lines Matched", "\(snapshot.matchedLineCount)/\(snapshot.totalLines)")
+                diagnosticRow("Words Matched", "\(snapshot.matchedWordCount)")
+                diagnosticRow("Timing Offset", AudioSyncDiagnostics.formatOffset(snapshot.medianOffset))
+                if let note = snapshot.note {
+                    Text(note)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+
+                Text("Recent Words")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text(recentWordsText(snapshot))
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                HStack {
+                    Spacer()
+                    Button("Copy Diagnostics") {
+                        let report = "Status: \(statusLabel)\n" + snapshot.report()
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(report, forType: .string)
+                    }
+                }
+            } else {
+                Text("No live sync has run since BarTune started. Play a track without cached sync, or press Re-sync Current Track.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        } label: {
+            // A button label, because the bare disclosure triangle exposes no accessibility action.
+            Button("Advanced Diagnostics") { isExpanded.toggle() }
+                .buttonStyle(.plain)
+        }
+    }
+
+    private func diagnosticRow(_ title: String, _ value: String) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private func recentWordsText(_ snapshot: AudioSyncDiagnostics) -> String {
+        let words = snapshot.recentWords.suffix(Self.visibleWordCount)
+        guard !words.isEmpty else { return "Nothing recognized yet." }
+        return words
+            .map { "\(AudioSyncDiagnostics.formatTime($0.startTime))  \($0.text)" }
+            .joined(separator: "\n")
+    }
+}
+
 private struct CachedSongFileSheet: View {
     let song: CachedSongSummary
     @Environment(\.dismiss) private var dismiss
@@ -1545,12 +1623,19 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private let state: LyricsState
     private let cacheRemover: OfflineCacheRemover
     private let appUpdater: AppUpdaterModel
+    private let diagnostics: AudioSyncDiagnosticsModel
     private var window: NSWindow?
 
-    init(state: LyricsState, cacheRemover: OfflineCacheRemover, appUpdater: AppUpdaterModel) {
+    init(
+        state: LyricsState,
+        cacheRemover: OfflineCacheRemover,
+        appUpdater: AppUpdaterModel,
+        diagnostics: AudioSyncDiagnosticsModel
+    ) {
         self.state = state
         self.cacheRemover = cacheRemover
         self.appUpdater = appUpdater
+        self.diagnostics = diagnostics
         super.init()
     }
 
@@ -1562,7 +1647,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         }
 
         let hosting = NSHostingController(
-            rootView: SettingsView(state: state, cacheRemover: cacheRemover, updater: appUpdater)
+            rootView: SettingsView(state: state, cacheRemover: cacheRemover, updater: appUpdater, diagnostics: diagnostics)
         )
         let win = NSWindow(contentViewController: hosting)
         win.title = "BarTune Settings"
