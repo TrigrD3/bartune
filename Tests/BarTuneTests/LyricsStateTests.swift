@@ -159,4 +159,128 @@ final class LyricsStateTests: XCTestCase {
 
         XCTAssertEqual(changeCount, 0, "Repeated ticks on an instrumental track must not trigger SwiftUI redraws")
     }
+
+    func testPersistedPreferencesWriteOnlyToInjectedUserDefaultsSuite() throws {
+        let standard = UserDefaults.standard
+        let trackedKeys = [
+            "bartune.hoverMode",
+            "bartune.spotlightWidth",
+            "bartune.themeMode",
+            "bartune.fontOption",
+            "bartune.fontWeight",
+            "bartune.karaokeEnabled",
+            "bartune.showEqualizer",
+            "bartune.animateVisualizer",
+            "bartune.visualizerStyle",
+            "bartune.visualizerColorTheme",
+            "bartune.visualizerWidth",
+            "bartune.fontSize",
+            "bartune.backgroundOpacity",
+            "bartune.romanizeJapanese",
+            "bartune.romanizeKorean",
+            "bartune.romanizeChinese",
+            "bartune.translateLyrics",
+            "bartune.translationLanguage",
+            "bartune.lowCPUMode",
+            "bartune.browserMusicEnabled",
+            "bartune.audioSyncEngine",
+            "bartune.whisperModelPath",
+            "bartune.replaceLyricsWithTranscription",
+            "bartune.showSyncBadge",
+            "bartune.lyricsColorPreset",
+            "bartune.customLyricsColorHex",
+            "bartune.karaokeGlowEnabled",
+            "bartune.barCornerRadius",
+            "bartune.showTrackTitle",
+        ]
+        let sentinel = "__bartune_test_sentinel__"
+        var originalStandard: [String: Any] = [:]
+        for key in trackedKeys {
+            if let existing = standard.object(forKey: key) {
+                originalStandard[key] = existing
+            }
+            standard.set(sentinel, forKey: key)
+        }
+        defer {
+            for key in trackedKeys {
+                if let previous = originalStandard[key] {
+                    standard.set(previous, forKey: key)
+                } else {
+                    standard.removeObject(forKey: key)
+                }
+            }
+        }
+
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        state.hoverMode = .hideAll
+        state.spotlightWidth = 112.0
+        state.themeMode = .albumTint
+        state.fontOption = .sfMono
+        state.fontWeight = .bold
+        state.karaokeAnimationEnabled = false
+        state.showEqualizer = false
+        state.animateVisualizer = false
+        state.visualizerStyle = .wave
+        state.visualizerColorTheme = .sunset
+        state.visualizerWidth = 34.0
+        state.fontSize = 14.5
+        state.backgroundOpacity = 0.82
+        state.romanizeJapanese = false
+        state.romanizeKorean = false
+        state.romanizeChinese = false
+        state.translateLyrics = true
+        state.translationLanguage = .spanish
+        state.lowCPUMode = false
+        state.browserMusicEnabled = false
+        state.audioSyncEngine = .appleSpeech
+        state.whisperModelPath = "/tmp/model.bin"
+        state.replaceLyricsWithTranscription = true
+        state.showSyncBadge = false
+        state.lyricsColorPreset = .electricCyan
+        state.customLyricsColorHex = "#123456"
+        state.karaokeGlowEnabled = true
+        state.barCornerRadius = 11.0
+        state.showTrackTitle = false
+
+        for key in trackedKeys {
+            XCTAssertEqual(
+                standard.string(forKey: key),
+                sentinel,
+                "Setting \(key) must not write to UserDefaults.standard when an isolated suite is injected"
+            )
+        }
+
+        let reloaded = LyricsState(userDefaults: ud)
+        XCTAssertEqual(reloaded.hoverMode, .hideAll)
+        XCTAssertEqual(reloaded.spotlightWidth, 112.0, accuracy: 0.01)
+        XCTAssertEqual(reloaded.themeMode, .albumTint)
+        XCTAssertEqual(reloaded.fontOption, .sfMono)
+        XCTAssertEqual(reloaded.fontWeight, .bold)
+        XCTAssertFalse(reloaded.karaokeAnimationEnabled)
+        XCTAssertFalse(reloaded.showEqualizer)
+        XCTAssertFalse(reloaded.animateVisualizer)
+        XCTAssertEqual(reloaded.visualizerStyle, .wave)
+        XCTAssertEqual(reloaded.visualizerColorTheme, .sunset)
+        XCTAssertEqual(reloaded.visualizerWidth, 34.0, accuracy: 0.01)
+        XCTAssertEqual(reloaded.fontSize, 14.5, accuracy: 0.01)
+        XCTAssertEqual(reloaded.backgroundOpacity, 0.82, accuracy: 0.01)
+        XCTAssertFalse(reloaded.romanizeJapanese)
+        XCTAssertFalse(reloaded.romanizeKorean)
+        XCTAssertFalse(reloaded.romanizeChinese)
+        XCTAssertTrue(reloaded.translateLyrics)
+        XCTAssertEqual(reloaded.translationLanguage, .spanish)
+        XCTAssertFalse(reloaded.lowCPUMode)
+        XCTAssertFalse(reloaded.browserMusicEnabled)
+        XCTAssertEqual(reloaded.audioSyncEngine, .appleSpeech)
+        XCTAssertEqual(reloaded.whisperModelPath, "/tmp/model.bin")
+        XCTAssertTrue(reloaded.replaceLyricsWithTranscription)
+        XCTAssertFalse(reloaded.showSyncBadge)
+        XCTAssertEqual(reloaded.lyricsColorPreset, .electricCyan)
+        XCTAssertEqual(reloaded.customLyricsColorHex, "#123456")
+        XCTAssertTrue(reloaded.karaokeGlowEnabled)
+        XCTAssertEqual(reloaded.barCornerRadius, 11.0, accuracy: 0.01)
+        XCTAssertFalse(reloaded.showTrackTitle)
+    }
 }

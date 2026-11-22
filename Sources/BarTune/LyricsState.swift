@@ -325,7 +325,7 @@ final class LyricsState: ObservableObject {
     // Persisted user settings
     @Published var hoverMode: HoverMode {
         didSet {
-            UserDefaults.standard.set(hoverMode.rawValue, forKey: Keys.hoverMode)
+            userDefaults.set(hoverMode.rawValue, forKey: Keys.hoverMode)
             if hoverMode == .hideAll {
                 cursorLocalX = nil
             }
@@ -333,23 +333,23 @@ final class LyricsState: ObservableObject {
     }
 
     @Published var spotlightWidth: Double {
-        didSet { UserDefaults.standard.set(spotlightWidth, forKey: Keys.spotlightWidth) }
+        didSet { userDefaults.set(spotlightWidth, forKey: Keys.spotlightWidth) }
     }
 
     @Published var themeMode: ThemeMode {
-        didSet { UserDefaults.standard.set(themeMode.rawValue, forKey: Keys.themeMode) }
+        didSet { userDefaults.set(themeMode.rawValue, forKey: Keys.themeMode) }
     }
 
     @Published var fontOption: FontOption {
-        didSet { UserDefaults.standard.set(fontOption.rawValue, forKey: Keys.fontOption) }
+        didSet { userDefaults.set(fontOption.rawValue, forKey: Keys.fontOption) }
     }
 
     @Published var fontWeight: FontWeightOption {
-        didSet { UserDefaults.standard.set(fontWeight.rawValue, forKey: Keys.fontWeight) }
+        didSet { userDefaults.set(fontWeight.rawValue, forKey: Keys.fontWeight) }
     }
 
     @Published var karaokeAnimationEnabled: Bool {
-        didSet { UserDefaults.standard.set(karaokeAnimationEnabled, forKey: Keys.karaokeEnabled) }
+        didSet { userDefaults.set(karaokeAnimationEnabled, forKey: Keys.karaokeEnabled) }
     }
 
     @Published var showEqualizer: Bool {
@@ -369,20 +369,20 @@ final class LyricsState: ObservableObject {
     }
 
     @Published var visualizerWidth: Double {
-        didSet { UserDefaults.standard.set(visualizerWidth, forKey: Keys.visualizerWidth) }
+        didSet { userDefaults.set(visualizerWidth, forKey: Keys.visualizerWidth) }
     }
 
     @Published var fontSize: Double {
-        didSet { UserDefaults.standard.set(fontSize, forKey: Keys.fontSize) }
+        didSet { userDefaults.set(fontSize, forKey: Keys.fontSize) }
     }
 
     @Published var backgroundOpacity: Double {
-        didSet { UserDefaults.standard.set(backgroundOpacity, forKey: Keys.backgroundOpacity) }
+        didSet { userDefaults.set(backgroundOpacity, forKey: Keys.backgroundOpacity) }
     }
 
     @Published var romanizeJapanese: Bool {
         didSet {
-            UserDefaults.standard.set(romanizeJapanese, forKey: Keys.romanizeJapanese)
+            userDefaults.set(romanizeJapanese, forKey: Keys.romanizeJapanese)
             refreshCurrentLineText()
         }
     }
