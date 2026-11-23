@@ -533,6 +533,14 @@ struct SettingsView: View {
                 if state.audioSyncEngine != .off {
                     Toggle("Show Sync Badge in Lyrics Bar", isOn: $state.showSyncBadge)
 
+                    Toggle("Syllable Timing", isOn: $state.syllableTiming)
+
+                    Text(
+                        "Sweeps each syllable on its own note instead of whole words (Korean, Chinese and Latin-script lyrics; Japanese stays word by word). Applies to songs synced from now on; resync a song to update it."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
                     Toggle("Replace Lyrics with Transcribed Audio", isOn: $state.replaceLyricsWithTranscription)
 
                     Text(

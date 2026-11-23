@@ -110,9 +110,173 @@ enum ForcedAlignmentText {
         case .latin: displays
         }
         return zip(displays, readings).compactMap { display, reading in
-            let folded = (reading.applyingTransform(.stripDiacritics, reverse: false) ?? reading).lowercased()
-            let letters = String(folded.filter { vocabulary[$0] != nil })
+            let letters = letters(of: reading)
             return letters.isEmpty ? nil : Word(display: display, reading: letters)
+        }
+    }
+
+    /// The model's letters in `reading`, with diacritics stripped.
+    private static func letters(of reading: String) -> String {
+        let folded = (reading.applyingTransform(.stripDiacritics, reverse: false) ?? reading).lowercased()
+        return String(folded.filter { vocabulary[$0] != nil })
+    }
+
+    struct Syllable: Equatable {
+        let display: String
+        /// How many letters of the word's reading this syllable spans.
+        let letterCount: Int
+    }
+
+    /// `word` split into sung syllables whose letters spell its reading in order: one per Hangul block,
+    /// one per hanzi in a Chinese song, vowel groups for Latin text. Empty for a one-syllable word, for
+    /// Japanese (a kanji's reading spans several morae), or when the pieces don't spell the reading.
+    static func syllables(of word: Word, script: Script, latinRules: LatinSyllabifier.Rules = .standard) -> [Syllable] {
+        let characters = Array(word.display)
+        let pieces: [String]
+        if characters.contains(where: isHangulSyllable) {
+            pieces = split(characters, startingAt: isHangulSyllable)
+        } else if characters.contains(where: { ChineseRomanizer.containsHan(String($0)) }) {
+            guard script == .chinese else { return [] }
+            pieces = split(characters) { ChineseRomanizer.containsHan(String($0)) }
+        } else if JapaneseRomanizer.containsKana(word.display) {
+            return []
+        } else {
+            pieces = LatinSyllabifier.split(word.display, rules: latinRules)
+        }
+
+        var syllables: [(display: String, letters: String)] = []
+        var pendingDisplay = ""
+        for piece in pieces {
+            let reading = switch script {
+            case .korean: KoreanRomanizer.romanizeLine(piece)
+            case .chinese: ChineseRomanizer.romanizeLine(piece)
+            case .latin, .japanese: piece
+            }
+            let pieceLetters = letters(of: reading)
+            if pieceLetters.isEmpty {
+                // Letterless pieces (punctuation) ride along with a neighbouring syllable.
+                if syllables.isEmpty { pendingDisplay += piece } else { syllables[syllables.count - 1].display += piece }
+            } else {
+                syllables.append((pendingDisplay + piece, pieceLetters))
+                pendingDisplay = ""
+            }
+        }
+        guard syllables.count > 1, syllables.map(\.letters).joined() == word.reading else { return [] }
+        return syllables.map { Syllable(display: $0.display, letterCount: $0.letters.count) }
+    }
+
+    private static func isHangulSyllable(_ character: Character) -> Bool {
+        character.unicodeScalars.contains { (0xAC00...0xD7A3).contains($0.value) }
+    }
+
+    /// Starts a new piece at every character matching `isStart`; other characters join the current piece.
+    private static func split(_ characters: [Character], startingAt isStart: (Character) -> Bool) -> [String] {
+        var pieces: [String] = []
+        for character in characters {
+            if isStart(character) || pieces.isEmpty {
+                pieces.append(String(character))
+            } else {
+                pieces[pieces.count - 1].append(character)
+            }
+        }
+        return pieces
+    }
+}
+
+/// Splits a Latin-script word at its vowel groups (`to·night`, `se·la·ma·nya`), which is where sung
+/// notes change. A rule of thumb, not a dictionary: it works for any Latin language but splits some
+/// English words differently from a dictionary (`fo·re·ver`).
+enum LatinSyllabifier {
+    enum Rules: Equatable {
+        case standard
+        /// Indonesian and Malay: every vowel is sounded (no silent e, `su·a·ra`, `di·a`) except in the
+        /// diphthongs ai, au, oi and ei, "y" is a consonant, and "ng" is one consonant (`de·ngar`).
+        case indonesian
+
+        static func detect(in lines: [LyricLine]) -> Rules {
+            let identifier = LyricsLanguageDetector.detectSpeechLocale(for: lines).identifier
+            return identifier.hasPrefix("id") || identifier.hasPrefix("ms") ? .indonesian : .standard
+        }
+    }
+
+    /// Consonant pairs that start a syllable together, so a split goes before them (`mo·ther`, `hun·dred`).
+    private static let onsets: Set<String> = [
+        "ch", "sh", "th", "ph", "wh", "kh", "ny", "sy",
+        "bl", "br", "cl", "cr", "dr", "fl", "fr", "gl", "gr", "pl", "pr", "tr",
+    ]
+    private static let indonesianDiphthongs: Set<String> = ["ai", "au", "oi", "ei"]
+
+    static func split(_ word: String, rules: Rules = .standard) -> [String] {
+        let characters = Array(word)
+        let bases = characters.map { character -> Character? in
+            let folded = String(character).applyingTransform(.stripDiacritics, reverse: false) ?? String(character)
+            return folded.lowercased().first.flatMap { $0.isLetter && $0.isASCII ? $0 : nil }
+        }
+        func isVowel(_ index: Int) -> Bool {
+            guard let base = bases[index] else { return false }
+            if "aeiou".contains(base) { return true }
+            // "y" is a vowel after a consonant (my, lyrics) and a consonant otherwise (you, beyond).
+            guard rules == .standard, base == "y", index > 0, let previous = bases[index - 1] else { return false }
+            return !"aeiouy".contains(previous)
+        }
+
+        func extends(_ nucleus: (start: Int, end: Int), with index: Int) -> Bool {
+            guard nucleus.end == index else { return false }
+            guard rules == .indonesian else { return true }
+            guard nucleus.end - nucleus.start == 1, let first = bases[nucleus.start], let second = bases[index] else { return false }
+            return indonesianDiphthongs.contains(String([first, second]))
+        }
+
+        // Each nucleus is a run of vowels: (first index, index after its last vowel).
+        var nuclei: [(start: Int, end: Int)] = []
+        for index in characters.indices where isVowel(index) {
+            if let last = nuclei.last, extends(last, with: index) {
+                nuclei[nuclei.count - 1].end = index + 1
+            } else {
+                nuclei.append((index, index + 1))
+            }
+        }
+        if rules == .standard, nuclei.count > 1, let last = nuclei.last, isSilentFinalE(last, bases: bases) {
+            nuclei.removeLast()
+        }
+        guard nuclei.count > 1 else { return [word] }
+
+        var cuts: [Int] = []
+        for (left, right) in zip(nuclei, nuclei.dropFirst()) {
+            let gap = right.start - left.end
+            let pair = { (index: Int) in bases[index].flatMap { first in bases[index + 1].map { String([first, $0]) } } }
+            var cut: Int = if gap <= 1 {
+                left.end
+            } else if let last = pair(right.start - 2), onsets.contains(last) || (rules == .indonesian && last == "ng") {
+                right.start - 2
+            } else if gap > 2, pair(left.end) == "ng" {
+                // "ng" before another consonant closes the syllable (mang·gil, ang·ka).
+                left.end + 2
+            } else {
+                left.end + 1
+            }
+            // "ck" stays with the syllable before it (pick·ing).
+            if cut < right.start, bases[cut - 1] == "c", bases[cut] == "k" { cut += 1 }
+            cuts.append(cut)
+        }
+        let bounds = [0] + cuts + [characters.count]
+        return zip(bounds, bounds.dropFirst()).map { String(characters[$0..<$1]) }
+    }
+
+    /// English's silent final e (love, smile, loved, times), but not a sounded "-le" (lit·tle),
+    /// "-ted"/"-ded" (wan·ted) or "-ses"-like (ro·ses) ending.
+    private static func isSilentFinalE(_ nucleus: (start: Int, end: Int), bases: [Character?]) -> Bool {
+        guard nucleus.end - nucleus.start == 1, bases[nucleus.start] == "e", nucleus.start > 0,
+              let before = bases[nucleus.start - 1]
+        else { return false }
+        let after = bases[nucleus.end...].compactMap { $0 }
+        switch after {
+        case []:
+            guard before == "l", nucleus.start > 1, let consonant = bases[nucleus.start - 2] else { return true }
+            return "aeiouy".contains(consonant)
+        case ["d"]: return !"td".contains(before)
+        case ["s"]: return !"sxzcgh".contains(before)
+        default: return false
         }
     }
 }
@@ -139,6 +303,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let start: Double
         let end: Double
         let words: [ForcedAlignmentText.Word]
+        /// Each word's syllables, empty for a word of one.
+        let syllables: [[ForcedAlignmentText.Syllable]]
         /// Track-time limits from the nearest lines already aligned before and after this one.
         var lowerBound = -Double.infinity
         var upperBound = Double.infinity
@@ -185,6 +351,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         self.lineWindow = lineWindow
         holdBackSamples = Int(holdBack * Double(Self.sampleRate))
         let script = ForcedAlignmentText.Script.detect(in: lines)
+        let latinRules = LatinSyllabifier.Rules.detect(in: lines)
         let timed = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         var prepared: [PreparedLine] = []
         var spans: [ClosedRange<Double>?] = []
@@ -192,7 +359,13 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let words = ForcedAlignmentText.words(for: line.text, script: script)
             guard !words.isEmpty else { continue }
             let end = index + 1 < timed.count ? timed[index + 1].timestamp : line.timestamp + 5
-            prepared.append(PreparedLine(id: line.id, start: line.timestamp, end: end, words: words))
+            prepared.append(PreparedLine(
+                id: line.id,
+                start: line.timestamp,
+                end: end,
+                words: words,
+                syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
+            ))
             spans.append(anchors[line.id])
         }
         var anchored = Set<Int>()
@@ -370,7 +543,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 text: lines[owner.line].words[owner.word].display,
                 startTime: start,
                 duration: finish - start,
-                confidence: Double(exp(logProbability / Float(max(1, frameCount))))
+                confidence: Double(exp(logProbability / Float(max(1, frameCount)))),
+                syllables: syllables(lines[owner.line].syllables[owner.word], spans: spans[cursor...end], from: lowFrame)
             ))
             wordLines.append(owner.line)
             keptUntilFrame = lowFrame + spans[end].lastFrame + 1
@@ -378,6 +552,20 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         }
         if let keptUntilFrame { alignedUntilFrame = keptUntilFrame }
         return dropUnreliableLines(words, lineOf: wordLines)
+    }
+
+    /// Each syllable starts where the first of its letters was aligned.
+    private func syllables(
+        _ pieces: [ForcedAlignmentText.Syllable],
+        spans: ArraySlice<CTCForcedAlignment.TokenSpan>,
+        from lowFrame: Int
+    ) -> [RecognizedAudioWord.Syllable]? {
+        guard !pieces.isEmpty, pieces.reduce(0, { $0 + $1.letterCount }) == spans.count else { return nil }
+        var index = spans.startIndex
+        return pieces.map { piece in
+            defer { index += piece.letterCount }
+            return RecognizedAudioWord.Syllable(text: piece.display, startTime: trackTime(ofRunFrame: lowFrame + spans[index].firstFrame))
+        }
     }
 
     private func windowStart(of line: PreparedLine) -> Double {

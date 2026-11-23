@@ -994,7 +994,8 @@ final class AudioSyncManager {
             lines: baseLines,
             recognizedWords: refinedHeardWords(),
             replaceTextWithTranscription: state.replaceLyricsWithTranscription,
-            regroupsCJKWords: false
+            regroupsCJKWords: false,
+            splitsSyllables: state.syllableTiming
         )
         let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !preserved.isEmpty else { return result }
@@ -1051,14 +1052,19 @@ final class AudioSyncManager {
         return first.timestamp...max(first.timestamp, last.timestamp + (last.duration ?? 0))
     }
 
+    /// Words of aligned lines, with a word timed by syllable regrouped so it carries its syllables again.
     nonisolated static func recognizedWords(of lines: [LyricLine]) -> [RecognizedAudioWord] {
         lines.flatMap { line in
-            line.words.map {
-                RecognizedAudioWord(
-                    text: $0.text.trimmingCharacters(in: .whitespaces),
-                    startTime: $0.timestamp,
-                    duration: $0.duration ?? 0.2,
-                    confidence: 1
+            (LyricsAudioAligner.tokenGroups(of: line) ?? line.words.map { [$0] }).compactMap { group in
+                guard let first = group.first, let last = group.last else { return nil }
+                return RecognizedAudioWord(
+                    text: group.map(\.text).joined().trimmingCharacters(in: .whitespaces),
+                    startTime: first.timestamp,
+                    duration: last.timestamp + (last.duration ?? 0.2) - first.timestamp,
+                    confidence: 1,
+                    syllables: group.count > 1
+                        ? group.map { RecognizedAudioWord.Syllable(text: $0.text, startTime: $0.timestamp) }
+                        : nil
                 )
             }
         }

@@ -206,6 +206,116 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(Set(model.windows[1].prefix(half)).count, 1, "the new run's window is padded, not filled with pre-seek audio")
     }
 
+    func testLatinWordsSplitAtTheirVowelGroups() {
+        let cases: [String: [String]] = [
+            "tonight": ["to", "night"],
+            "away": ["a", "way"],
+            "singing": ["sin", "ging"],
+            "beautiful": ["beau", "ti", "ful"],
+            "mother": ["mo", "ther"],
+            "children": ["chil", "dren"],
+            "picking": ["pick", "ing"],
+            "little": ["lit", "tle"],
+            "lyrics": ["ly", "rics"],
+            "beyond": ["be", "yond"],
+            "selamanya": ["se", "la", "ma", "nya"],
+            "bernyanyi": ["ber", "nya", "nyi"],
+            "Forever,": ["Fo", "re", "ver,"],
+        ]
+        for (word, syllables) in cases {
+            XCTAssertEqual(LatinSyllabifier.split(word), syllables, word)
+        }
+    }
+
+    func testNgBeforeAConsonantClosesTheSyllable() {
+        XCTAssertEqual(LatinSyllabifier.split("memanggil"), ["me", "mang", "gil"])
+        XCTAssertEqual(LatinSyllabifier.split("hungry"), ["hun", "gry"], "an onset pair still wins")
+    }
+
+    func testIndonesianRulesSoundEveryVowelAndKeepNgTogether() {
+        let cases: [String: [String]] = [
+            "Suara": ["Su", "a", "ra"],
+            "dia": ["di", "a"],
+            "biasa": ["bi", "a", "sa"],
+            "kau": ["kau"],
+            "pulau": ["pu", "lau"],
+            "dengar": ["de", "ngar"],
+            "ingin": ["i", "ngin"],
+            "memanggil": ["me", "mang", "gil"],
+            "bernyanyi": ["ber", "nya", "nyi"],
+            "sate": ["sa", "te"],
+            "saya": ["sa", "ya"],
+        ]
+        for (word, syllables) in cases {
+            XCTAssertEqual(LatinSyllabifier.split(word, rules: .indonesian), syllables, word)
+        }
+        XCTAssertEqual(LatinSyllabifier.split("Suara"), ["Sua", "ra"], "standard rules keep a vowel run together")
+    }
+
+    func testIndonesianLyricsUseIndonesianRules() {
+        let indonesian = ["Dan terjadi lagi", "Kisah lama yang terulang kembali", "Kau terluka lagi", "Dari cinta rumit yang kau jalani"]
+        let english = ["And it happened again", "An old story that repeats itself", "You are hurt again"]
+        XCTAssertEqual(LatinSyllabifier.Rules.detect(in: indonesian.enumerated().map { LyricLine(id: $0, timestamp: 0, text: $1) }), .indonesian)
+        XCTAssertEqual(LatinSyllabifier.Rules.detect(in: english.enumerated().map { LyricLine(id: $0, timestamp: 0, text: $1) }), .standard)
+    }
+
+    func testSilentFinalEKeepsAWordWhole() {
+        for word in ["love", "smile", "loved", "times", "the", "don't", "strong"] {
+            XCTAssertEqual(LatinSyllabifier.split(word), [word], word)
+        }
+        XCTAssertEqual(LatinSyllabifier.split("wanted"), ["wan", "ted"], "-ted is sounded")
+        XCTAssertEqual(LatinSyllabifier.split("roses"), ["ro", "ses"], "-ses is sounded")
+    }
+
+    func testSyllablesSpellTheWordsReadingInEachScript() {
+        func syllables(_ text: String, _ script: ForcedAlignmentText.Script) -> [String] {
+            ForcedAlignmentText.words(for: text, script: script).flatMap {
+                ForcedAlignmentText.syllables(of: $0, script: script).map(\.display)
+            }
+        }
+        XCTAssertEqual(syllables("사랑해", .korean), ["사", "랑", "해"])
+        XCTAssertEqual(syllables("你好，", .chinese), ["你", "好，"])
+        XCTAssertEqual(syllables("(tonight", .latin), ["(to", "night"], "punctuation rides with a syllable")
+        XCTAssertTrue(syllables("大好き", .japanese).isEmpty, "a kanji's reading spans several morae")
+        XCTAssertTrue(syllables("love", .latin).isEmpty, "one syllable needs no split")
+
+        let word = ForcedAlignmentText.words(for: "beautiful", script: .latin)[0]
+        let pieces = ForcedAlignmentText.syllables(of: word, script: .latin)
+        XCTAssertEqual(pieces.map(\.letterCount), [4, 2, 3])
+        XCTAssertEqual(pieces.map(\.letterCount).reduce(0, +), word.reading.count)
+    }
+
+    func testEngineStartsEachSyllableAtItsFirstAlignedLetter() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let aligner = LyricsForcedAligner(lines: [LyricLine(id: 0, timestamp: 12.0, text: "kaka")], model: model)
+        // Frame f is track 10 + 0.24 (f - 50): "ka" at 13.12 s, then "ka" at 13.84 s.
+        model.peaksForCall = [[63: 14, 64: 4, 66: 14, 67: 4]]
+
+        let words = try await aligner.transcribe(chunk(start: 10.0))
+
+        let syllables = try XCTUnwrap(words.first?.syllables)
+        XCTAssertEqual(syllables.map(\.text), ["ka", "ka"])
+        XCTAssertEqual(syllables[0].startTime, words[0].startTime)
+        XCTAssertEqual(syllables[1].startTime, 13.84, accuracy: 0.01)
+    }
+
+    func testEngineSplitsIndonesianLyricsByIndonesianRules() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        // Earlier lines (sung before this run's audio) only tell the aligner the song is Indonesian.
+        let context = ["Dan terjadi lagi", "Kisah lama yang terulang kembali", "Kau terluka lagi", "Dari cinta rumit yang kau jalani"]
+        let lines = context.enumerated().map { LyricLine(id: $0, timestamp: Double($0 + 1), text: $1) }
+            + [LyricLine(id: 9, timestamp: 12.0, text: "dia")]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+        // "d" "i" at 13.12 s, "a" at 13.84 s.
+        model.peaksForCall = [[63: 16, 64: 5, 66: 4]]
+
+        let words = try await aligner.transcribe(chunk(start: 10.0))
+
+        XCTAssertEqual(words.map(\.text), ["dia"])
+        XCTAssertEqual(words.first?.syllables?.map(\.text), ["di", "a"])
+        XCTAssertEqual(words.first?.syllables?.last?.startTime ?? 0, 13.84, accuracy: 0.01)
+    }
+
     func testEngineIgnoresAudioAtAnotherSampleRate() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
         let aligner = LyricsForcedAligner(lines: [LyricLine(id: 0, timestamp: 1, text: "ka")], model: model)
