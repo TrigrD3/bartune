@@ -1056,6 +1056,12 @@ final class LyricsState: ObservableObject {
         return playbackAnchorPosition + elapsed * playbackRate
     }
 
+    /// How far ahead of the player the overlay's clock was when the player reported `reportedPosition`;
+    /// nil while paused.
+    func clockError(reportedPosition: Double, at date: Date) -> Double? {
+        isPlaying ? extrapolatedPlaybackPosition(at: date) - reportedPosition : nil
+    }
+
     func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0) {
         let now = Date()
         let predicted = extrapolatedPlaybackPosition(at: now)

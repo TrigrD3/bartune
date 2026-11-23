@@ -32,6 +32,10 @@ struct PlaybackSnapshot {
     let track: TrackInfo?
     let position: Double
     var playbackRate: Double = 1.0
+    /// When the player reported `position` (the poll's midpoint), and how long the poll took;
+    /// nil for interpolated snapshots.
+    var sampledAt: Date?
+    var roundTrip: TimeInterval?
 
     func position(after elapsed: TimeInterval) -> Double {
         guard isPlaying else { return position }
@@ -458,7 +462,7 @@ final class SpotifyMonitor {
                 )
                 self.handlePollResult(
                     raw: raw,
-                    now: now,
+                    native: (sampledAt: now, roundTrip: pollEnd.timeIntervalSince(pollStart)),
                     browserSnap: filteredBrowserSnap,
                     browserNow: browserNow,
                     browserPollGeneration: requestBrowserGeneration
@@ -486,11 +490,12 @@ final class SpotifyMonitor {
 
     private func handlePollResult(
         raw: String?,
-        now: Date,
+        native: (sampledAt: Date, roundTrip: TimeInterval),
         browserSnap: PlaybackSnapshot?,
         browserNow: Date,
         browserPollGeneration: UInt64
     ) {
+        let now = native.sampledAt
         guard let raw, raw != "IDLE" else {
             let validBrowserSnap = (browserMusicEnabled && browserPollGeneration == self.browserPollGeneration)
                 ? browserSnap
@@ -550,7 +555,9 @@ final class SpotifyMonitor {
             isRunning: true,
             isPlaying: isPlaying,
             track: track,
-            position: positionSec
+            position: positionSec,
+            sampledAt: now,
+            roundTrip: native.roundTrip
         )
         lastSnapshot = snapshot
         lastPollDate = now

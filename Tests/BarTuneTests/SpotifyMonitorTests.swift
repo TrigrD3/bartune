@@ -644,6 +644,39 @@ final class SpotifyMonitorTests: XCTestCase {
     }
 
     @MainActor
+    func testPollSnapshotCarriesWhenThePlayerReportedItsPosition() async throws {
+        let playing = ["SPOTIFY", "playing", "spotify:track:1", "Song", "Artist", "Album", "200000", "15", ""].joined(separator: "\u{1F}")
+        let deps = SpotifyMonitor.Dependencies(
+            runningBundleIds: { ["com.spotify.client"] },
+            executeNativeScript: {
+                Thread.sleep(forTimeInterval: 0.1)
+                return playing
+            },
+            pollBrowser: { _, _ in nil },
+            executeTransportScript: { _ in }
+        )
+        let monitor = SpotifyMonitor(dependencies: deps)
+        let published = expectation(description: "Poll snapshot published")
+        var snapshot: PlaybackSnapshot?
+        monitor.onUpdate = { snap in
+            snapshot = snap
+            published.fulfill()
+        }
+
+        let before = Date()
+        monitor.poll()
+        await fulfillment(of: [published], timeout: 2.0)
+        let after = Date()
+
+        let snap = try XCTUnwrap(snapshot)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(snap.roundTrip), 0.1)
+        // The midpoint of the 0.1 s script run, not its start.
+        let sampledAt = try XCTUnwrap(snap.sampledAt)
+        XCTAssertGreaterThan(sampledAt, before.addingTimeInterval(0.04))
+        XCTAssertLessThan(sampledAt, after)
+    }
+
+    @MainActor
     private func monitorWaitUntil(timeout: TimeInterval = 2.0, _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while !condition() {

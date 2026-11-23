@@ -10,6 +10,20 @@ final class LyricsStateTests: XCTestCase {
         return (LyricsState(userDefaults: ud), ud, suiteName)
     }
 
+    func testClockErrorIsTheOverlayClockMinusThePositionReportedAtTheSampleTime() throws {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        state.updatePlayback(isPlaying: true, position: 42.0, playbackRate: 1.5)
+        let anchor = state.playbackAnchorDate
+        // 2 s after the anchor the clock reads 45.0; the player reported 44.94 at that moment.
+        let error = try XCTUnwrap(state.clockError(reportedPosition: 44.94, at: anchor.addingTimeInterval(2)))
+        XCTAssertEqual(error, 0.06, accuracy: 1e-9)
+
+        state.updatePlayback(isPlaying: false, position: 45.0)
+        XCTAssertNil(state.clockError(reportedPosition: 45.0, at: Date()))
+    }
+
     func testDirectTrackSwitchToEmptyLyricsClearsPreviousLyric() throws {
         let (state, ud, suiteName) = try makeIsolatedState()
         defer { ud.removePersistentDomain(forName: suiteName) }
