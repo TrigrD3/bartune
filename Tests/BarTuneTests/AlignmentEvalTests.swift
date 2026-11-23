@@ -3,7 +3,8 @@ import AVFoundation
 import XCTest
 
 /// Scores Lyrics Alignment against JamendoLyrics word annotations: how far from each sung word start
-/// the overlay's sweep enters that word. Opt-in, since it needs the dataset and the installed model:
+/// the overlay's sweep enters that word, and how far from each aligned line's sung end its sweep
+/// finishes (negative: the sweep rushes ahead of a held last note). Opt-in, since it needs the dataset and the installed model:
 ///
 ///     scripts/fetch-jamendolyrics.sh <dir> English
 ///     BARTUNE_EVAL_DIR=<dir> swift test --filter AlignmentEvalTests
@@ -19,6 +20,7 @@ final class AlignmentEvalTests: XCTestCase {
         let name: String
         let lines: [String]
         let lineStarts: [Double]
+        let lineEnds: [Double]
         /// Annotated start of each word of each line.
         let wordStarts: [[Double]]
         let mid: [Float]
@@ -40,13 +42,13 @@ final class AlignmentEvalTests: XCTestCase {
         }
 
         var summary: String {
-            guard !values.isEmpty else { return "no words" }
+            guard !values.isEmpty else { return "none" }
             let absolute = values.map(abs).sorted()
             let mean = absolute.reduce(0, +) / Double(absolute.count)
             let bias = values.reduce(0, +) / Double(values.count)
             let within = { (limit: Double) in Double(absolute.filter { $0 <= limit }.count) / Double(absolute.count) * 100 }
             return String(
-                format: "mean %4.0f ms  median %4.0f ms  bias %+5.0f ms  ≤100 ms %5.1f%%  ≤300 ms %5.1f%%  (%d words)",
+                format: "mean %4.0f ms  median %4.0f ms  bias %+5.0f ms  ≤100 ms %5.1f%%  ≤300 ms %5.1f%%  (%d)",
                 mean * 1000, absolute[absolute.count / 2] * 1000, bias * 1000, within(0.1), within(0.3), values.count
             )
         }
@@ -63,7 +65,7 @@ final class AlignmentEvalTests: XCTestCase {
             .sorted()
         XCTAssertFalse(stems.isEmpty, "No songs in \(path)/wav")
 
-        var totals = (lrc: Errors(), firstPlay: Errors(), replay: Errors())
+        var totals = (lrc: Errors(), firstPlay: Errors(), replay: Errors(), lineEnds: Errors())
         var alignedLines = 0
         var totalLines = 0
         for stem in stems {
@@ -76,20 +78,24 @@ final class AlignmentEvalTests: XCTestCase {
             let lrc = await Self.errors(song, snapshots: [Snapshot(availableAt: 0, lines: lrcLines)])
             let firstPlay = await Self.errors(song, snapshots: snapshots)
             let replay = await Self.errors(song, snapshots: [Snapshot(availableAt: 0, lines: final)])
+            let lineEnds = await Self.lineEndErrors(song, lines: final)
             totals.lrc.add(lrc)
             totals.firstPlay.add(firstPlay)
             totals.replay.add(replay)
+            totals.lineEnds.add(lineEnds)
             alignedLines += aligned
             totalLines += song.lines.count
             print("EVAL \(stem): aligned \(aligned)/\(song.lines.count) lines")
             print("EVAL   LRC only    \(lrc.summary)")
             print("EVAL   first play  \(firstPlay.summary)")
             print("EVAL   replay      \(replay.summary)")
+            print("EVAL   line ends   \(lineEnds.summary)")
         }
         print("EVAL ALL \(stems.count) songs: aligned \(alignedLines)/\(totalLines) lines")
         print("EVAL   LRC only    \(totals.lrc.summary)")
         print("EVAL   first play  \(totals.firstPlay.summary)")
         print("EVAL   replay      \(totals.replay.summary)")
+        print("EVAL   line ends   \(totals.lineEnds.summary)")
     }
 
     // MARK: - Session
@@ -158,6 +164,17 @@ final class AlignmentEvalTests: XCTestCase {
         return errors
     }
 
+    /// For each line aligned on replay, when its sweep finishes minus when its last word is sung out.
+    @MainActor
+    private static func lineEndErrors(_ song: Song, lines: [LyricLine]) -> Errors {
+        var errors = Errors()
+        let aligned = AudioSyncManager.alignedLineIDs(in: lines)
+        for (index, line) in lines.enumerated() where aligned.contains(line.id) {
+            errors.values.append(sweepEntry(line: index, fraction: 0.999, in: lines, songEnd: song.duration) - song.lineEnds[index])
+        }
+        return errors
+    }
+
     /// When the sweep of `lines[line]` first passes `fraction` of its text, or the next line's start
     /// if it never does while the line is on screen.
     @MainActor
@@ -216,6 +233,7 @@ final class AlignmentEvalTests: XCTestCase {
             name: stem,
             lines: lines,
             lineStarts: lineRows.compactMap { Double($0[0]) },
+            lineEnds: lineRows.compactMap { Double($0[1]) },
             wordStarts: wordStarts,
             mid: mid,
             side: side
