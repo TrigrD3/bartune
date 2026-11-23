@@ -104,6 +104,17 @@ enum ResolvedLyricAction: Equatable, Sendable {
     case useDefault([LyricLine])
     case useCustom([LyricLine])
     case useAutomatic([LyricLine])
+
+    /// Status to show when this action skips audio sync; nil when it runs sync.
+    func skippedSyncStatus(audioSyncEngine: AudioSyncEngine) -> AudioSyncStatus? {
+        let source: TrackLyricSource
+        switch self {
+        case .useDefault: source = .defaultSource
+        case .useCustom: source = .custom
+        case .useAutomatic: return nil
+        }
+        return audioSyncEngine == .off ? .idle : .offForTrack(source)
+    }
 }
 
 /// Pure source-resolution rules shared by AppDelegate and the Lyric Timing Editor.

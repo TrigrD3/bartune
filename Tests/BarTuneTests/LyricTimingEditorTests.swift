@@ -296,6 +296,28 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         )
     }
 
+    func testSkippedSyncStatusExplainsPerSongOverride() {
+        let lines = [LyricLine(id: 0, timestamp: 5.0, text: "Line")]
+
+        XCTAssertEqual(
+            ResolvedLyricAction.useDefault(lines).skippedSyncStatus(audioSyncEngine: .lyricsAlignment),
+            .offForTrack(.defaultSource)
+        )
+        XCTAssertEqual(
+            ResolvedLyricAction.useCustom(lines).skippedSyncStatus(audioSyncEngine: .whisper),
+            .offForTrack(.custom)
+        )
+        XCTAssertNil(ResolvedLyricAction.useAutomatic(lines).skippedSyncStatus(audioSyncEngine: .lyricsAlignment))
+        // With the engine off globally, nothing is overridden.
+        XCTAssertEqual(ResolvedLyricAction.useDefault(lines).skippedSyncStatus(audioSyncEngine: .off), .idle)
+
+        let status = AudioSyncStatus.offForTrack(.defaultSource)
+        XCTAssertEqual(status.label, "Off for this song (Default lyrics selected)")
+        XCTAssertFalse(status.allowsResync)
+        XCTAssertNil(status.overlayBadge)
+        XCTAssertTrue(AudioSyncStatus.idle.allowsResync)
+    }
+
     func testCustomStoreRoundTripAndIsolationFromCacheClearPruneAndRemover() async throws {
         let customDir = tempDir.appendingPathComponent("custom-lyrics", isDirectory: true)
         let lyricsCacheDir = tempDir.appendingPathComponent("lyrics-cache", isDirectory: true)
@@ -560,13 +582,15 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         try appDelegate.saveCustomLyrics(customLines, for: track)
         XCTAssertEqual(state.lyricSourceChoice(for: track.id), .custom)
         XCTAssertEqual(state.rawLyricLines, customLines)
-        XCTAssertEqual(state.audioSyncStatus, .idle)
+        XCTAssertEqual(state.audioSyncStatus, .offForTrack(.custom))
 
-        // Switching to Default restores fetched lines and keeps audio sync idle.
+        // Switching to Default restores fetched lines and keeps audio sync off for this song, even on re-sync.
         appDelegate.selectLyricSource(.defaultSource, for: track)
         XCTAssertEqual(state.lyricSourceChoice(for: track.id), .defaultSource)
         XCTAssertEqual(state.rawLyricLines, fetchedLines)
-        XCTAssertEqual(state.audioSyncStatus, .idle)
+        XCTAssertEqual(state.audioSyncStatus, .offForTrack(.defaultSource))
+        state.onResyncCurrentTrack?()
+        XCTAssertEqual(state.audioSyncStatus, .offForTrack(.defaultSource))
 
         // Switching back to Custom and deleting Custom falls back to fetched lyrics.
         appDelegate.selectLyricSource(.custom, for: track)
