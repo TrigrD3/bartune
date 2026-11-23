@@ -27,6 +27,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   AppUpdater.swift         # GitHub Releases update check & SHA-256-verified DMG download (About tab)
   AppInstaller.swift       # Install & Relaunch: mounts the verified DMG, swaps BarTune.app in place (not for Homebrew installs)
 Tests/BarTuneTests/        # XCTest unit tests (LRCParserTests, BrowserMediaParserTests, etc.)
+docs/research/             # Primary-source research notes (e.g. lyrics-alignment-coverage.md for Lyrics Alignment work)
 Casks/
   bartune.rb               # Homebrew Cask template synced to TrigrD3/homebrew-tap on v* tags
 scripts/
