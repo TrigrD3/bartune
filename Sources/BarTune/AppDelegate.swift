@@ -362,7 +362,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.updatePlayback(
             isPlaying: snapshot.isPlaying,
             position: snapshot.position,
-            playbackRate: snapshot.playbackRate
+            playbackRate: snapshot.playbackRate,
+            sampledAt: snapshot.sampledAt
         )
         if let clockError, snapshot.isPlaying {
             let roundTrip = (snapshot.roundTrip ?? 0) * 1000

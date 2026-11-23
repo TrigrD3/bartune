@@ -24,6 +24,22 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertNil(state.clockError(reportedPosition: 45.0, at: Date()))
     }
 
+    func testPlaybackClockAnchorsAtWhenThePlayerReportedThePosition() throws {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        // Spotify reported 30.0 s at a poll's midpoint 0.06 s ago; the clock must already read ~30.06.
+        let sampledAt = Date().addingTimeInterval(-0.06)
+        state.updatePlayback(isPlaying: true, position: 30.0, sampledAt: sampledAt)
+        XCTAssertEqual(state.playbackAnchorDate, sampledAt)
+        XCTAssertEqual(try XCTUnwrap(state.clockError(reportedPosition: 30.0, at: sampledAt)), 0, accuracy: 1e-9)
+
+        // A later poll that agrees with the clock leaves it running.
+        let nextSample = sampledAt.addingTimeInterval(3)
+        state.updatePlayback(isPlaying: true, position: 33.01, sampledAt: nextSample)
+        XCTAssertEqual(state.playbackAnchorDate, sampledAt)
+    }
+
     func testDirectTrackSwitchToEmptyLyricsClearsPreviousLyric() throws {
         let (state, ud, suiteName) = try makeIsolatedState()
         defer { ud.removePersistentDomain(forName: suiteName) }
