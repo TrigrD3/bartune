@@ -115,8 +115,11 @@ struct KaraokeLineView: View {
     let lowCPUMode: Bool
     var glowEnabled: Bool = false
     var wordPopEnabled: Bool = false
+    var typingCaretEnabled: Bool = false
 
     @State private var textWidth: CGFloat = 0
+
+    static let caretWidth: CGFloat = 1.5
 
     /// Mask stops for the sweep's soft edge; the fade ends at `progress` so unsung glyphs stay unlit.
     static func sweepFeather(progress: Double, textWidth: CGFloat) -> (solidEnd: Double, clearStart: Double) {
@@ -148,9 +151,10 @@ struct KaraokeLineView: View {
     static func scrollOffset(
         progress: Double,
         textWidth: CGFloat,
-        availableWidth: CGFloat
+        availableWidth: CGFloat,
+        trailingInset: CGFloat = 0
     ) -> CGFloat {
-        let overflow = max(0, textWidth - availableWidth)
+        let overflow = max(0, textWidth + trailingInset - availableWidth)
         return overflow > 0
             ? -min(overflow, max(0, CGFloat(progress) * textWidth - availableWidth * 0.45))
             : 0
@@ -176,7 +180,8 @@ struct KaraokeLineView: View {
                 let scrollOffset = Self.scrollOffset(
                     progress: progress,
                     textWidth: textWidth,
-                    availableWidth: availableWidth
+                    availableWidth: availableWidth,
+                    trailingInset: typingCaretEnabled && karaokeEnabled ? Self.caretWidth : 0
                 )
 
                 let pop = wordPopEnabled && karaokeEnabled
@@ -197,6 +202,11 @@ struct KaraokeLineView: View {
                         }
                     } else {
                         sweptText(progress: progress, measuring: true)
+                    }
+                }
+                .overlay(alignment: .leading) {
+                    if typingCaretEnabled, karaokeEnabled, textWidth > 0 {
+                        typingCaret(progress: progress, waiting: state.liveIsWaitingForWord(at: timeline.date), at: timeline.date)
                     }
                 }
                 .offset(x: scrollOffset)
@@ -249,6 +259,18 @@ struct KaraokeLineView: View {
                     )
             }
         }
+    }
+
+    /// Thin caret at the sweep edge: solid while a word is sung, blinking while waiting for the next one.
+    private func typingCaret(progress: Double, waiting: Bool, at date: Date) -> some View {
+        let phase = date.timeIntervalSinceReferenceDate * 2 * .pi
+        let height = (measureFont?.pointSize ?? 13) * 1.15
+        return Capsule()
+            .fill(sungColor)
+            .frame(width: Self.caretWidth, height: height)
+            .opacity(waiting ? 0.55 + 0.45 * cos(phase) : 1)
+            .offset(x: CGFloat(max(0, min(1, progress))) * textWidth)
+            .allowsHitTesting(false)
     }
 
     private var widthReader: some View {
@@ -399,7 +421,8 @@ struct LyricsOverlayView: View {
                     isPlaying: state.isEnabled && state.isPlaying,
                     lowCPUMode: state.lowCPUMode,
                     glowEnabled: state.karaokeGlowEnabled,
-                    wordPopEnabled: state.wordPopEnabled
+                    wordPopEnabled: state.wordPopEnabled,
+                    typingCaretEnabled: state.typingCaretEnabled
                 )
                 .id(
                     "\(state.currentLineId)-\(state.romanizeJapanese)-\(state.romanizeKorean)-\(state.romanizeChinese)-\(state.translateLyrics)-\(state.translationLanguage.rawValue)"

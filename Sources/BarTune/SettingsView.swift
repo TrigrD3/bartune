@@ -405,6 +405,8 @@ struct SettingsView: View {
                 Toggle("Sung Text Glow", isOn: $state.karaokeGlowEnabled)
                 Toggle("Word Pop", isOn: $state.wordPopEnabled)
                     .help("Each word lifts and brightens as the sweep reaches it (word-timed lyrics only).")
+                Toggle("Typing Caret", isOn: $state.typingCaretEnabled)
+                    .help("A caret rides the sweep edge: solid while a word is sung, blinking while waiting for the next.")
                 Toggle("Show Track Title in Bar", isOn: $state.showTrackTitle)
             }
 

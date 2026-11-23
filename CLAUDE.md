@@ -9,7 +9,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   main.swift               # App entry point
   AppDelegate.swift        # Menu bar status item, Settings shortcut (⌘,), app lifecycle
   OverlayWindowController.swift # Left-of-notch overlay window (auxiliaryTopLeftArea) & hover/spotlight mask
-  LyricsOverlayView.swift  # GPU-interpolated karaoke sweep, word pop, line transitions, auto-scroll, animated equalizer
+  LyricsOverlayView.swift  # GPU-interpolated karaoke sweep, word pop, typing caret, line transitions, auto-scroll, animated equalizer
   LyricsState.swift        # Observable state & persisted user preferences
   SpotifyMonitor.swift     # Event-driven AppleScript playback monitor (Spotify, Apple Music, browser fallback)
   BrowserMediaMonitor.swift # Browser tab music monitor (YouTube Music, YouTube, Spotify Web, SoundCloud, Apple Music Web)
