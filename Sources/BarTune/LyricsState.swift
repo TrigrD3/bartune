@@ -1328,20 +1328,61 @@ final class LyricsState: ObservableObject {
             return (Double(charsBefore) + Double(words[index].text.count) * fraction) / Double(totalChars)
         }
 
+        // The sweep passes each word's start and end at their times; between them it follows a
+        // monotone curve, so it eases out of pauses and keeps its speed from one word into the next.
+        var times: [Double] = []
+        var shares: [Double] = []
+        func addKnot(_ time: Double, _ share: Double) {
+            // A word starting where the one before ended shares its knot, so the speed carries over.
+            if let lastTime = times.last, let lastShare = shares.last, time <= lastTime + 0.001, share <= lastShare { return }
+            times.append(max(time, (times.last ?? -.infinity) + 0.001))
+            shares.append(max(share, shares.last ?? 0))
+        }
         for (i, word) in words.enumerated() {
-            let wordStart = word.timestamp
-            let fallbackEnd = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
-            let wordEnd = word.duration.map { wordStart + $0 } ?? fallbackEnd
-
-            if position < wordStart {
-                return edge(word: i, fraction: 0)
-            } else if position < wordEnd {
-                let wordDur = max(0.04, wordEnd - wordStart)
-                let frac = min(1.0, max(0.0, (position - wordStart) / wordDur))
-                return edge(word: i, fraction: frac)
-            }
+            let nextStart = (i + 1 < words.count) ? words[i + 1].timestamp : lineEnd
+            let wordEnd = word.duration.map { word.timestamp + $0 } ?? nextStart
+            addKnot(word.timestamp, edge(word: i, fraction: 0))
+            addKnot(max(word.timestamp + 0.04, min(wordEnd, nextStart)), edge(word: i, fraction: 1))
             charsBefore += word.text.count
         }
-        return 1.0
+
+        guard let lastTime = times.last, position < lastTime else { return 1.0 }
+        guard position > times[0] else { return shares[0] }
+        let tangents = monotoneTangents(times: times, values: shares)
+        let k = times.lastIndex { $0 <= position } ?? 0
+        let h = times[k + 1] - times[k]
+        let s = (position - times[k]) / h
+        let s2 = s * s
+        let s3 = s2 * s
+        let h00 = 2 * s3 - 3 * s2 + 1
+        let h10 = s3 - 2 * s2 + s
+        let h01 = -2 * s3 + 3 * s2
+        let h11 = s3 - s2
+        return h00 * shares[k] + h10 * h * tangents[k] + h01 * shares[k + 1] + h11 * h * tangents[k + 1]
+    }
+
+    /// Fritsch–Carlson slopes for a monotone cubic through non-decreasing `values`: zero at both ends
+    /// and beside every flat stretch, so the curve never overshoots or runs backwards.
+    private static func monotoneTangents(times: [Double], values: [Double]) -> [Double] {
+        let count = times.count
+        let secants: [Double] = (0..<(count - 1)).map { index in
+            let deltaValue = values[index + 1] - values[index]
+            let deltaTime = times[index + 1] - times[index]
+            return deltaValue / deltaTime
+        }
+        var tangents = [Double](repeating: 0, count: count)
+        for k in 1..<max(1, count - 1) where secants[k - 1] > 0 && secants[k] > 0 {
+            tangents[k] = (secants[k - 1] + secants[k]) / 2
+        }
+        for k in secants.indices where secants[k] > 0 {
+            let a: Double = tangents[k] / secants[k]
+            let b: Double = tangents[k + 1] / secants[k]
+            let length = (a * a + b * b).squareRoot()
+            if length > 3 {
+                tangents[k] = 3 / length * a * secants[k]
+                tangents[k + 1] = 3 / length * b * secants[k]
+            }
+        }
+        return tangents
     }
 }
