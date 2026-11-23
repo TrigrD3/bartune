@@ -4,7 +4,6 @@ import Combine
 import CoreGraphics
 import Darwin
 import SwiftUI
-import UniformTypeIdentifiers
 
 private enum SettingsTab: String, CaseIterable, Identifiable, Hashable {
     case general
@@ -109,14 +108,9 @@ struct SettingsView: View {
     @State private var inspectingSong: CachedSongSummary?
     @State private var songPendingDeletion: CachedSongSummary?
     @State private var showClearCacheConfirmation: Bool = false
-    @State private var discoveredModels: [DiscoveredWhisperModel] = []
-    @State private var whisperServerFound: Bool = false
     @State private var lyricsAlignerInstalled: Bool = false
     @State private var isDownloadingAligner: Bool = false
     @State private var alignerDownloadError: String?
-    @State private var isDownloadingModel: Bool = false
-    @State private var modelDownloadError: String?
-    @State private var selectedDownloadPreset: WhisperModelPreset = .base
     @State private var metricsTracker = ResourceMetricsTracker()
     @State private var permissions = AppPermissionsSnapshot.empty
     @State private var showInstallConfirmation: Bool = false
@@ -604,73 +598,6 @@ struct SettingsView: View {
                     }
                 }
 
-                if state.audioSyncEngine == .whisper {
-                    HStack {
-                        Text("whisper-server")
-                        Spacer()
-                        Text(whisperServerFound ? "Installed" : "Not found (brew install whisper-cpp)")
-                            .font(.caption)
-                            .foregroundStyle(whisperServerFound ? Color.secondary : Color.orange)
-                    }
-
-                    if !discoveredModels.isEmpty {
-                        Picker("Shared Model", selection: $state.whisperModelPath) {
-                            Text("Auto (\(discoveredModels.first?.name ?? "None"))").tag("")
-                            ForEach(discoveredModels) { model in
-                                Text("\(model.name) (\(model.formattedSize) · \(model.sourceLabel))")
-                                    .tag(model.path)
-                            }
-                        }
-                    } else {
-                        HStack {
-                            Text("Shared Model")
-                            Spacer()
-                            Text("None found")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-
-                    Picker("Download Model", selection: $selectedDownloadPreset) {
-                        ForEach(WhisperModelPreset.allCases) { preset in
-                            Text(preset.title).tag(preset)
-                        }
-                    }
-
-                    HStack {
-                        Button("Choose Existing…") {
-                            chooseExistingWhisperModel()
-                        }
-                        Button("Rescan") {
-                            refreshWhisperDiscovery()
-                        }
-                        Spacer()
-                        if isDownloadingModel {
-                            ProgressView()
-                                .controlSize(.small)
-                            Text("Downloading…")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Button("Download Selected") {
-                                downloadSelectedWhisperModel()
-                            }
-                        }
-                    }
-
-                    if let err = modelDownloadError {
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                    }
-
-                    Text(
-                        "Automatically reuses existing GGML models from ~/.cache/whisper, ~/.cache/huggingface, and Homebrew. "
-                            + "Downloads are saved to ~/.cache/whisper so other apps can share them."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                }
-
                 if state.audioSyncEngine != .off {
                     AudioSyncDiagnosticsSection(model: diagnostics, statusLabel: state.audioSyncStatus.label)
                 }
@@ -711,7 +638,7 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .onAppear {
-            refreshWhisperDiscovery()
+            refreshLyricsAlignerStatus()
         }
     }
 
@@ -1203,22 +1130,8 @@ struct SettingsView: View {
         cacheStats.refresh()
     }
 
-    private func refreshWhisperDiscovery() {
-        whisperServerFound = WhisperModelLocator.locateWhisperServer() != nil
+    private func refreshLyricsAlignerStatus() {
         lyricsAlignerInstalled = LyricsAlignerModel.isInstalled()
-        discoveredModels = WhisperModelLocator.discoverModels(customPath: state.whisperModelPath)
-    }
-
-    private func chooseExistingWhisperModel() {
-        let panel = NSOpenPanel()
-        panel.title = "Choose Existing Whisper GGML Model"
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data]
-        if panel.runModal() == .OK, let url = panel.url {
-            state.whisperModelPath = url.path
-            refreshWhisperDiscovery()
-        }
     }
 
     private func downloadLyricsAligner() {
@@ -1229,34 +1142,13 @@ struct SettingsView: View {
                 try await LyricsAlignerModel.download()
                 await MainActor.run {
                     isDownloadingAligner = false
-                    refreshWhisperDiscovery()
+                    refreshLyricsAlignerStatus()
                     state.onResyncCurrentTrack?()
                 }
             } catch {
                 await MainActor.run {
                     isDownloadingAligner = false
                     alignerDownloadError = error.localizedDescription
-                }
-            }
-        }
-    }
-
-    private func downloadSelectedWhisperModel() {
-        let preset = selectedDownloadPreset
-        isDownloadingModel = true
-        modelDownloadError = nil
-        Task {
-            do {
-                let url = try await AudioSyncManager.downloadSharedModel(preset)
-                await MainActor.run {
-                    isDownloadingModel = false
-                    state.whisperModelPath = url.path
-                    refreshWhisperDiscovery()
-                }
-            } catch {
-                await MainActor.run {
-                    isDownloadingModel = false
-                    modelDownloadError = error.localizedDescription
                 }
             }
         }

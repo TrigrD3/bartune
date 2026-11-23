@@ -4,7 +4,6 @@ import NaturalLanguage
 
 enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     case off = "off"
-    case whisper = "whisper"
     case lyricsAlignment = "lyricsAlignment"
 
     var id: String { rawValue }
@@ -12,7 +11,6 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
     var title: String {
         switch self {
         case .off: return "Off"
-        case .whisper: return "Local Whisper"
         case .lyricsAlignment: return "Lyrics Alignment"
         }
     }
@@ -21,8 +19,6 @@ enum AudioSyncEngine: String, CaseIterable, Identifiable, Codable, Sendable {
         switch self {
         case .off:
             return "Uses fetched LRC/YRC timestamps only (no System Audio Recording permission required)."
-        case .whisper:
-            return "Uses a local whisper-server (whisper.cpp) and shared GGML models for higher accuracy on singing vocals and multiple languages."
         case .lyricsAlignment:
             return "Aligns the fetched lyrics to the song's audio on the Neural Engine instead of transcribing it (Apple silicon, alignment model required)."
         }
@@ -283,282 +279,8 @@ struct AudioSyncedLyricsCache: Sendable {
     }
 }
 
-struct DiscoveredWhisperModel: Identifiable, Equatable, Hashable, Sendable {
-    let path: String
-    let name: String
-    let sizeBytes: Int64
-    let sourceLabel: String
-
-    var id: String { path }
-
-    var formattedSize: String {
-        ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file)
-    }
-}
-
-enum WhisperModelPreset: String, CaseIterable, Identifiable, Sendable {
-    case tiny = "ggml-tiny.bin"
-    case base = "ggml-base.bin"
-    case small = "ggml-small.bin"
-    case medium = "ggml-medium.bin"
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .tiny: return "Tiny (~75 MB · Fastest)"
-        case .base: return "Base (~142 MB · Balanced)"
-        case .small: return "Small (~466 MB · Accurate)"
-        case .medium: return "Medium (~1.5 GB · Best Vocals)"
-        }
-    }
-
-    var downloadURL: URL {
-        guard let url = URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/\(rawValue)") else {
-            preconditionFailure("Invalid Whisper model download URL for \(rawValue)")
-        }
-        return url
-    }
-}
-
-enum WhisperModelLocator {
-    static let defaultModelDownloadURL = WhisperModelPreset.tiny.downloadURL
-    static let defaultModelFilename = "ggml-tiny.bin"
-
-    /// Shared directory used when BarTune downloads a model so other tools on the Mac can reuse it.
-    static func sharedCacheDirectory(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
-        homeDirectory.appendingPathComponent(".cache/whisper", isDirectory: true)
-    }
-
-    /// Searches standard shared ML model locations without copying or duplicating files.
-    static func discoverModels(
-        customPath: String? = nil,
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
-        extraSearchDirectories: [(url: URL, label: String)] = []
-    ) -> [DiscoveredWhisperModel] {
-        let fm = FileManager.default
-        var seenCanonicalPaths = Set<String>()
-        var results: [DiscoveredWhisperModel] = []
-
-        func registerIfValid(fileURL: URL, sourceLabel: String) {
-            var isDir: ObjCBool = false
-            guard fm.fileExists(atPath: fileURL.path, isDirectory: &isDir), !isDir.boolValue else { return }
-            let lower = fileURL.lastPathComponent.lowercased()
-            guard lower.hasSuffix(".bin"), lower.contains("ggml") || sourceLabel == "Custom" else { return }
-            let canonical = fileURL.resolvingSymlinksInPath().standardizedFileURL.path
-            guard seenCanonicalPaths.insert(canonical).inserted else { return }
-            let size = (try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0
-            results.append(
-                DiscoveredWhisperModel(
-                    path: fileURL.path,
-                    name: fileURL.lastPathComponent,
-                    sizeBytes: size,
-                    sourceLabel: sourceLabel
-                )
-            )
-        }
-
-        if let custom = customPath?.trimmingCharacters(in: .whitespacesAndNewlines), !custom.isEmpty {
-            registerIfValid(fileURL: URL(fileURLWithPath: custom), sourceLabel: "Custom")
-        }
-
-        if let envModel = environment["WHISPER_MODEL_PATH"], !envModel.isEmpty {
-            registerIfValid(fileURL: URL(fileURLWithPath: envModel), sourceLabel: "WHISPER_MODEL_PATH")
-        }
-
-        var searchDirs: [(URL, String)] = []
-        if let envDir = environment["WHISPER_MODELS_DIR"], !envDir.isEmpty {
-            searchDirs.append((URL(fileURLWithPath: envDir, isDirectory: true), "WHISPER_MODELS_DIR"))
-        }
-        searchDirs.append((homeDirectory.appendingPathComponent(".cache/whisper", isDirectory: true), "~/.cache/whisper"))
-        let hfHome = environment["HF_HOME"].map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? homeDirectory.appendingPathComponent(".cache/huggingface", isDirectory: true)
-        searchDirs.append((hfHome.appendingPathComponent("hub", isDirectory: true), "HuggingFace Cache"))
-        searchDirs.append((URL(fileURLWithPath: "/opt/homebrew/share/whisper-cpp", isDirectory: true), "Homebrew"))
-        searchDirs.append((URL(fileURLWithPath: "/usr/local/share/whisper-cpp", isDirectory: true), "Homebrew"))
-        searchDirs.append((homeDirectory.appendingPathComponent(".local/share/whisper", isDirectory: true), "~/.local/share/whisper"))
-        searchDirs.append((
-            homeDirectory.appendingPathComponent("Library/Application Support/whisper", isDirectory: true),
-            "Application Support"
-        ))
-        searchDirs.append(contentsOf: extraSearchDirectories)
-
-        for (dir, label) in searchDirs {
-            guard fm.fileExists(atPath: dir.path) else { continue }
-            guard let enumerator = fm.enumerator(
-                at: dir,
-                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey],
-                options: [.skipsPackageDescendants]
-            ) else { continue }
-
-            let baseDepth = dir.standardizedFileURL.pathComponents.count
-            for case let fileURL as URL in enumerator {
-                let depth = fileURL.standardizedFileURL.pathComponents.count - baseDepth
-                if depth > 4 {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                registerIfValid(fileURL: fileURL, sourceLabel: label)
-            }
-        }
-
-        return results
-    }
-
-    static func locateWhisperServer(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> String? {
-        let fm = FileManager.default
-        var candidates = [
-            "/opt/homebrew/bin/whisper-server",
-            "/usr/local/bin/whisper-server",
-        ]
-        if let pathEnv = environment["PATH"] {
-            for dir in pathEnv.split(separator: ":") {
-                candidates.append("\(dir)/whisper-server")
-            }
-        }
-        for candidate in candidates where fm.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-        return nil
-    }
-}
-
-enum WhisperJSONParser {
-    private struct OutputRoot: Decodable {
-        let segments: [Segment]?
-    }
-
-    private struct Segment: Decodable {
-        let start: Double?
-        let end: Double?
-        let text: String?
-        let words: [Token]?
-    }
-
-    private struct Token: Decodable {
-        let word: String?
-        let start: Double?
-        let end: Double?
-        let probability: Double?
-        /// Audio-aligned start in centiseconds when whisper-server runs with `--dtw`; -1 otherwise.
-        let tDTW: Double?
-
-        enum CodingKeys: String, CodingKey {
-            case word, start, end, probability
-            case tDTW = "t_dtw"
-        }
-    }
-
-    /// Parses `whisper-server` `verbose_json` output into track-relative `RecognizedAudioWord` items.
-    static func parse(data: Data, chunkStartTime: Double, playbackRate: Double = 1.0) -> [RecognizedAudioWord] {
-        guard let root = try? JSONDecoder().decode(OutputRoot.self, from: data),
-              let segments = root.segments
-        else { return [] }
-
-        var words: [RecognizedAudioWord] = []
-
-        for segment in segments {
-            if let tokens = segment.words, !tokens.isEmpty {
-                words.append(contentsOf: mergeTokens(tokens, chunkStartTime: chunkStartTime, playbackRate: playbackRate))
-            } else if let text = segment.text, let from = segment.start, let to = segment.end {
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, !trimmed.hasPrefix("[") else { continue }
-                let parts = trimmed.split(whereSeparator: \.isWhitespace).map(String.init)
-                guard !parts.isEmpty else { continue }
-                let startSec = chunkStartTime + from * playbackRate
-                let totalDur = max(0.1, to - from) * playbackRate
-                let perWord = totalDur / Double(parts.count)
-                for (i, part) in parts.enumerated() {
-                    words.append(
-                        RecognizedAudioWord(
-                            text: part,
-                            startTime: startSec + Double(i) * perWord,
-                            duration: perWord,
-                            confidence: 0.75
-                        )
-                    )
-                }
-            }
-        }
-
-        return words
-    }
-
-    private static func mergeTokens(_ tokens: [Token], chunkStartTime: Double, playbackRate: Double) -> [RecognizedAudioWord] {
-        var merged: [RecognizedAudioWord] = []
-        var currentText = ""
-        var currentStart: Double?
-        var currentEnd: Double = 0
-        var confSum = 0.0
-        var confCount = 0
-        var currentIsCJK = false
-
-        func flush() {
-            let trimmed = currentText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty, let start = currentStart {
-                let dur = max(0.05, currentEnd - start)
-                let conf = confCount > 0 ? confSum / Double(confCount) : 0.7
-                merged.append(
-                    RecognizedAudioWord(
-                        text: trimmed,
-                        startTime: start,
-                        duration: dur,
-                        confidence: conf
-                    )
-                )
-            }
-            currentText = ""
-            currentStart = nil
-            currentEnd = 0
-            confSum = 0
-            confCount = 0
-            currentIsCJK = false
-        }
-
-        for token in tokens {
-            guard let rawText = token.word else { continue }
-            let trimmedCheck = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if trimmedCheck.isEmpty { continue }
-            if trimmedCheck.hasPrefix("[") && trimmedCheck.hasSuffix("]") {
-                flush()
-                continue
-            }
-            guard let rawFrom = token.start, let rawTo = token.end else { continue }
-            // DTW times follow the audio; the default ones can jump by most of a second.
-            let from = token.tDTW.flatMap { $0 >= 0 ? $0 / 100 : nil } ?? rawFrom
-            let to = from + (rawTo - rawFrom)
-            let start = chunkStartTime + from * playbackRate
-            let end = chunkStartTime + max(from + 0.04, to) * playbackRate
-            // Japanese and Chinese tokens carry no leading space; keep each one (and its timing) separate
-            // so the aligner can regroup them into lyric words.
-            let isCJK = LyricsAudioAligner.containsCJK(trimmedCheck)
-            let startsNewWord = rawText.first?.isWhitespace == true || isCJK || currentIsCJK
-
-            if startsNewWord && !currentText.isEmpty {
-                flush()
-            }
-            currentIsCJK = isCJK
-
-            if currentStart == nil {
-                currentStart = start
-            }
-            currentText += rawText
-            currentEnd = max(currentEnd, end)
-            confSum += token.probability ?? 0.7
-            confCount += 1
-        }
-        flush()
-
-        return merged
-    }
-}
-
 enum LyricsLanguageDetector {
-    /// Detects the lyric language from fetched lyrics so Whisper
-    /// doesn't guess it on Japanese, Korean, Chinese, or other non-English songs.
+    /// Detects the lyric language from fetched lyrics for Japanese, Korean, Chinese, or other non-English songs.
     static func detectSpeechLocale(for lines: [LyricLine]) -> Locale {
         guard !lines.isEmpty else { return .current }
         let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -616,7 +338,7 @@ enum LyricsAudioAligner {
         }
     }
 
-    /// Whisper returns Japanese and Chinese as single characters or, at times, whole phrases.
+    /// Recognizers can return Japanese and Chinese as single characters or whole phrases.
     /// Each unspaced CJK run is re-split with the lyric tokenizer, timing each character by interpolation
     /// inside its recognized word, so recognized words line up with lyric tokens.
     static func regroupCJKWords(_ words: [RecognizedAudioWord], maxGap: Double = 1.0) -> [RecognizedAudioWord] {

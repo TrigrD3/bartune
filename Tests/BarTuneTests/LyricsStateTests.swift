@@ -160,13 +160,15 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertEqual(changeCount, 0, "Repeated ticks on an instrumental track must not trigger SwiftUI redraws")
     }
 
-    func testRemovedAppleSpeechEngineReadsAsOff() throws {
+    func testRemovedEnginesReadAsOff() throws {
         let (_, ud, suiteName) = try makeIsolatedState()
         defer { ud.removePersistentDomain(forName: suiteName) }
         ud.set("appleSpeech", forKey: "bartune.audioSyncEngine")
-
         XCTAssertEqual(LyricsState(userDefaults: ud).audioSyncEngine, .off)
-        XCTAssertEqual(AudioSyncEngine.allCases, [.off, .whisper, .lyricsAlignment])
+
+        ud.set("whisper", forKey: "bartune.audioSyncEngine")
+        XCTAssertEqual(LyricsState(userDefaults: ud).audioSyncEngine, .off)
+        XCTAssertEqual(AudioSyncEngine.allCases, [.off, .lyricsAlignment])
     }
 
     func testPersistedPreferencesWriteOnlyToInjectedUserDefaultsSuite() throws {
@@ -194,7 +196,6 @@ final class LyricsStateTests: XCTestCase {
             "bartune.browserMusicEnabled",
             "bartune.browserYouTubeVideosEnabled",
             "bartune.audioSyncEngine",
-            "bartune.whisperModelPath",
             "bartune.replaceLyricsWithTranscription",
             "bartune.showSyncBadge",
             "bartune.lyricsColorPreset",
@@ -248,8 +249,7 @@ final class LyricsStateTests: XCTestCase {
         state.lowCPUMode = false
         state.browserMusicEnabled = false
         state.browserYouTubeVideosEnabled = true
-        state.audioSyncEngine = .whisper
-        state.whisperModelPath = "/tmp/model.bin"
+        state.audioSyncEngine = .lyricsAlignment
         state.replaceLyricsWithTranscription = true
         state.showSyncBadge = false
         state.lyricsColorPreset = .electricCyan
@@ -288,8 +288,7 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertFalse(reloaded.lowCPUMode)
         XCTAssertFalse(reloaded.browserMusicEnabled)
         XCTAssertTrue(reloaded.browserYouTubeVideosEnabled)
-        XCTAssertEqual(reloaded.audioSyncEngine, .whisper)
-        XCTAssertEqual(reloaded.whisperModelPath, "/tmp/model.bin")
+        XCTAssertEqual(reloaded.audioSyncEngine, .lyricsAlignment)
         XCTAssertTrue(reloaded.replaceLyricsWithTranscription)
         XCTAssertFalse(reloaded.showSyncBadge)
         XCTAssertEqual(reloaded.lyricsColorPreset, .electricCyan)

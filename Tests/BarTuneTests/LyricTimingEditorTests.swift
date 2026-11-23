@@ -263,25 +263,21 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
             .useAutomatic(fetched)
         )
         XCTAssertEqual(
-            LyricSourceResolver.resolve(choice: nil, customLines: custom, fetchedLines: fetched, audioSyncEngine: .whisper),
-            .useAutomatic(fetched)
-        )
-        XCTAssertEqual(
             LyricSourceResolver.resolve(choice: nil, customLines: custom, fetchedLines: fetched, audioSyncEngine: .off),
             .useDefault(fetched)
         )
 
         // Explicit choices are respected.
         XCTAssertEqual(
-            LyricSourceResolver.resolve(choice: .defaultSource, customLines: custom, fetchedLines: fetched, audioSyncEngine: .whisper),
+            LyricSourceResolver.resolve(choice: .defaultSource, customLines: custom, fetchedLines: fetched, audioSyncEngine: .lyricsAlignment),
             .useDefault(fetched)
         )
         XCTAssertEqual(
-            LyricSourceResolver.resolve(choice: .custom, customLines: custom, fetchedLines: fetched, audioSyncEngine: .whisper),
+            LyricSourceResolver.resolve(choice: .custom, customLines: custom, fetchedLines: fetched, audioSyncEngine: .lyricsAlignment),
             .useCustom(custom)
         )
         XCTAssertEqual(
-            LyricSourceResolver.resolve(choice: .automatic, customLines: custom, fetchedLines: fetched, audioSyncEngine: .whisper),
+            LyricSourceResolver.resolve(choice: .automatic, customLines: custom, fetchedLines: fetched, audioSyncEngine: .lyricsAlignment),
             .useAutomatic(fetched)
         )
 
@@ -304,7 +300,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
             .offForTrack(.defaultSource)
         )
         XCTAssertEqual(
-            ResolvedLyricAction.useCustom(lines).skippedSyncStatus(audioSyncEngine: .whisper),
+            ResolvedLyricAction.useCustom(lines).skippedSyncStatus(audioSyncEngine: .lyricsAlignment),
             .offForTrack(.custom)
         )
         XCTAssertNil(ResolvedLyricAction.useAutomatic(lines).skippedSyncStatus(audioSyncEngine: .lyricsAlignment))
@@ -353,7 +349,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         try customStore.save(customRecord)
         lyricsCache.save(trackId: track.id, lines: fetchedLines)
         syncCache.save(AudioSyncedLyricsRecord(
-            trackId: track.id, engine: .whisper, syncedAt: savedDate, medianOffset: 0.1,
+            trackId: track.id, engine: .lyricsAlignment, syncedAt: savedDate, medianOffset: 0.1,
             alignedLineCount: 1, sourceLineCount: 1, lines: fetchedLines
         ))
 
@@ -542,7 +538,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
 
         let customStore = CustomLyricsStore(directory: tempDir.appendingPathComponent("custom", isDirectory: true))
         let lyricsCache = LyricsDiskCache(directory: tempDir.appendingPathComponent("lyrics", isDirectory: true))
@@ -559,10 +555,8 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
                 capture: NoopAudioCapture(),
                 hasScreenCaptureAccess: { false },
                 requestScreenCaptureAccess: {},
-                locateWhisperServer: { nil },
-                resolveWhisperModelPath: { _ in nil },
-                launchWhisper: { _, _ in nil },
-                whisperChunkDurationSeconds: 12.0
+                chunkDurationSeconds: 12.0,
+                launchLyricsAligner: { _, _ in nil }
             )
         )
         let appDelegate = AppDelegate(

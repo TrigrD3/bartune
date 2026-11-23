@@ -133,7 +133,7 @@ protocol LineAttemptReporting: AnyObject {
     var attemptedLineIDs: Set<Int> { get }
 }
 
-final class LyricsForcedAligner: WhisperTranscribing, LineAttemptReporting, @unchecked Sendable {
+final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
     private struct PreparedLine {
         let id: Int
         let start: Double
@@ -226,12 +226,12 @@ final class LyricsForcedAligner: WhisperTranscribing, LineAttemptReporting, @unc
     }
 
     // swiftlint:disable:next async_without_await
-    func transcribe(_ request: AudioSyncManager.WhisperChunkRequest) async throws -> [RecognizedAudioWord] {
+    func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async throws -> [RecognizedAudioWord] {
         guard request.sampleRate == Self.sampleRate, !request.samples.isEmpty else { return [] }
         return try process(request)
     }
 
-    private func process(_ request: AudioSyncManager.WhisperChunkRequest) throws -> [RecognizedAudioWord] {
+    private func process(_ request: AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord] {
         lock.lock()
         defer { lock.unlock() }
         startNewRunIfNeeded(for: request)
@@ -253,7 +253,7 @@ final class LyricsForcedAligner: WhisperTranscribing, LineAttemptReporting, @unc
         Int(((time - runStartTime) / runRate / secondsPerFrame).rounded())
     }
 
-    private func startNewRunIfNeeded(for request: AudioSyncManager.WhisperChunkRequest) {
+    private func startNewRunIfNeeded(for request: AudioSyncManager.AudioChunkRequest) {
         let contiguous = expectedNextChunkStart.map { abs($0 - request.chunkStartTime) <= 0.5 } ?? false
         if !contiguous || abs(request.playbackRate - runRate) > 0.001 {
             runStartTime = request.chunkStartTime
@@ -543,7 +543,7 @@ enum LyricsAlignerModel {
         lines: [LyricLine],
         anchors: [Int: ClosedRange<Double>] = [:],
         directory: URL = directory
-    ) async -> WhisperTranscribing? {
+    ) async -> AudioChunkTranscribing? {
         #if arch(arm64)
             let compiled = directory.appendingPathComponent(compiledName)
             let package = directory.appendingPathComponent(packageName)
