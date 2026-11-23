@@ -567,7 +567,7 @@ struct SettingsView: View {
                         Button("Re-sync Current Track") {
                             state.onResyncCurrentTrack?()
                         }
-                        .disabled(!state.hasLyrics)
+                        .disabled(!state.hasLyrics || !state.audioSyncStatus.allowsResync)
                     }
                 }
 

@@ -430,16 +430,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyResolvedLyricSource(for track: TrackInfo, fetchedLines: [LyricLine]) {
-        switch resolvedAction(for: track, fetchedLines: fetchedLines) {
-        case let .useDefault(lines):
+        let action = resolvedAction(for: track, fetchedLines: fetchedLines)
+        switch action {
+        case let .useDefault(lines), let .useCustom(lines):
             state.setTrack(track, lyrics: lines)
-            audioSyncManager.stop()
-            state.audioSyncStatus = .idle
-            state.refreshActiveLineForCurrentPosition()
-        case let .useCustom(lines):
-            state.setTrack(track, lyrics: lines)
-            audioSyncManager.stop()
-            state.audioSyncStatus = .idle
+            stopAudioSync(skippedBy: action)
             state.refreshActiveLineForCurrentPosition()
         case let .useAutomatic(lines):
             state.setTrack(track, lyrics: lines)
@@ -517,9 +512,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func resyncCurrentTrackIfAutomatic() {
         guard let track = lastLoadedTrack else { return }
-        guard case let .useAutomatic(lines) = resolvedAction(for: track, fetchedLines: lastFetchedLines) else {
-            audioSyncManager.stop()
-            state.audioSyncStatus = .idle
+        let action = resolvedAction(for: track, fetchedLines: lastFetchedLines)
+        guard case let .useAutomatic(lines) = action else {
+            stopAudioSync(skippedBy: action)
             return
         }
         guard !lines.isEmpty else { return }
@@ -532,7 +527,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.audioSyncStatus = .idle
             return
         }
-        switch resolvedAction(for: track, fetchedLines: lastFetchedLines) {
+        let action = resolvedAction(for: track, fetchedLines: lastFetchedLines)
+        switch action {
         case let .useAutomatic(lines):
             guard !lines.isEmpty else {
                 audioSyncManager.stop()
@@ -542,13 +538,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             audioSyncManager.handleTrackLoaded(track: track, rawLines: lines)
         case let .useDefault(lines):
             state.setTrack(track, lyrics: lines)
-            audioSyncManager.stop()
-            state.audioSyncStatus = .idle
+            stopAudioSync(skippedBy: action)
             state.refreshActiveLineForCurrentPosition()
         case .useCustom:
-            audioSyncManager.stop()
-            state.audioSyncStatus = .idle
+            stopAudioSync(skippedBy: action)
         }
+    }
+
+    private func stopAudioSync(skippedBy action: ResolvedLyricAction) {
+        audioSyncManager.stop()
+        state.audioSyncStatus = action.skippedSyncStatus(audioSyncEngine: state.audioSyncEngine) ?? .idle
     }
 
     private func translateCurrentTrack() {

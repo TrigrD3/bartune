@@ -41,6 +41,13 @@ enum AudioSyncStatus: Equatable, Sendable {
     case syncing(engine: AudioSyncEngine, alignedLines: Int, totalLines: Int)
     case permissionRequired(String)
     case unavailable(String)
+    /// The song's lyric source overrides the enabled engine.
+    case offForTrack(TrackLyricSource)
+
+    var allowsResync: Bool {
+        if case .offForTrack = self { return false }
+        return true
+    }
 
     var overlayBadge: OverlaySyncBadge? {
         switch self {
@@ -52,7 +59,7 @@ enum AudioSyncStatus: Equatable, Sendable {
                 text: aligned > 0 ? "Syncing" : "Listening",
                 isSynced: false
             )
-        case .idle, .permissionRequired, .unavailable:
+        case .idle, .permissionRequired, .unavailable, .offForTrack:
             return nil
         }
     }
@@ -72,6 +79,8 @@ enum AudioSyncStatus: Equatable, Sendable {
             return detail
         case let .unavailable(detail):
             return detail
+        case let .offForTrack(source):
+            return "Off for this song (\(source.title) lyrics selected)"
         }
     }
 }
