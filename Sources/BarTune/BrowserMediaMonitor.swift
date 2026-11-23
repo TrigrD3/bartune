@@ -266,6 +266,18 @@ enum BrowserMediaParser {
         sourceBundleId: String? = nil,
         includeYouTubeVideos: Bool = true
     ) -> PlaybackSnapshot? {
+        parsePayloadWithChapterStart(
+            raw,
+            sourceBundleId: sourceBundleId,
+            includeYouTubeVideos: includeYouTubeVideos
+        )?.snapshot
+    }
+
+    static func parsePayloadWithChapterStart(
+        _ raw: String,
+        sourceBundleId: String? = nil,
+        includeYouTubeVideos: Bool = true
+    ) -> (snapshot: PlaybackSnapshot, chapterStart: Double)? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "IDLE" else { return nil }
 
@@ -299,6 +311,7 @@ enum BrowserMediaParser {
         let isStandardYouTube = isStandardYouTubeTrackId(trackId)
         let mediaId = parts.count >= 12 ? parts[11] : ""
         trackId = recordingTrackId(baseId: trackId, mediaId: mediaId, duration: durationSec)
+        var chapterStart = 0.0
 
         if isStandardYouTube,
            parts.count >= 10,
@@ -315,6 +328,7 @@ enum BrowserMediaParser {
                 title = split.title
                 durationSec = resolved.duration
                 positionSec = resolved.position
+                chapterStart = resolved.chapter.start
                 trackId = "\(trackId):ch:\(chapterSecond)"
             }
         } else if isStandardYouTube {
@@ -333,13 +347,14 @@ enum BrowserMediaParser {
             sourceBundleId: sourceBundleId
         )
 
-        return PlaybackSnapshot(
+        let snapshot = PlaybackSnapshot(
             isRunning: true,
             isPlaying: true,
             track: track,
             position: positionSec,
             playbackRate: playbackRate
         )
+        return (snapshot, chapterStart)
     }
 }
 
@@ -369,7 +384,7 @@ final class BrowserMediaMonitor: @unchecked Sendable {
             ? "if((h==='www.youtube.com'||h==='youtube.com')&&m.duration>=600){var vid=new URLSearchParams(location.search).get('v');if(vid){var gs=String.fromCharCode(29);var rs=String.fromCharCode(30);ch=Array.from(document.querySelectorAll('ytd-macro-markers-list-item-renderer')).map(function(el){var lk=el.querySelector('a[href]');var hr=lk?lk.getAttribute('href'):'';if(hr.indexOf('v='+vid)===-1)return '';var ti=el.querySelector('h4, #details h4');var tm=el.querySelector('#time');var tt=ti?ti.textContent.trim():'';var ts=tm?tm.textContent.trim():'';return (tt&&ts)?(ts+rs+tt):'';}).filter(Boolean).join(gs);}}"
             : ""
         return """
-        (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})\(youtubeOriginClause);if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';\(youtubeChaptersBlock)var id='browser:'+h+':'+t+'|'+a;var rid=new URLSearchParams(location.search).get('v')||'';var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate),rid].join(s);}catch(e){return 'IDLE';}})()
+        (function(){try{var p=location.protocol;if(p!=='https:'&&p!=='http:')return 'IDLE';var h=(location.hostname||'').toLowerCase();var sup=['music.youtube.com','open.spotify.com','soundcloud.com','music.apple.com'];var ok=sup.some(function(d){return h===d||h.endsWith('.'+d);})\(youtubeOriginClause);if(!ok)return 'IDLE';var els=Array.from(document.querySelectorAll('video,audio'));var m=els.find(function(e){return !e.paused&&isFinite(e.duration)&&e.duration>0;});if(!m)return 'IDLE';window.__barTuneActiveMedia=m;var md=(navigator.mediaSession&&navigator.mediaSession.metadata)?navigator.mediaSession.metadata:null;var t=(md&&md.title)||document.title||'';var a=(md&&md.artist)||'';var al=(md&&md.album)||'';var art='';if(md&&md.artwork&&md.artwork.length){art=md.artwork[md.artwork.length-1].src||'';}var ch='';\(youtubeChaptersBlock)var id='browser:'+h+':'+t+'|'+a;var rid=new URLSearchParams(location.search).get('v')||'';var s=String.fromCharCode(31);return ['BROWSER','playing',id,t,a,al,String(m.duration),String(m.currentTime),art,ch,String(m.playbackRate),rid].join(s);}catch(e){return 'IDLE';}})()
         """
     }
 
@@ -385,10 +400,18 @@ final class BrowserMediaMonitor: @unchecked Sendable {
     private static let escapedJSWithYouTube: String = escapeForAppleScript(jsProbeSource(includeYouTubeVideos: true))
     private static let escapedJSWithoutYouTube: String = escapeForAppleScript(jsProbeSource(includeYouTubeVideos: false))
 
+    struct ActiveBrowserTarget: Equatable {
+        let browser: BrowserTarget
+        let tab: BrowserTabDescriptor
+        let trackId: String
+        let expectedURL: String
+        let chapterStart: Double
+    }
+
     // Compiled AppleScripts cached per browser bundle ID (accessed serially on SpotifyMonitor's scriptQueue).
     private var compiledListScripts: [String: NSAppleScript] = [:]
     private var compiledProbeScripts: [String: (windowIndex: Int, tabIndex: Int, includeYouTubeVideos: Bool, script: NSAppleScript)] = [:]
-    private(set) var lastActiveTab: (browser: BrowserTarget, tab: BrowserTabDescriptor)?
+    private(set) var lastActiveTab: ActiveBrowserTarget?
 
     private let listTabsHandler: ((BrowserTarget) -> [BrowserTabDescriptor])?
     private let probeTabHandler: ((BrowserTarget, BrowserTabDescriptor) -> String?)?
@@ -414,13 +437,19 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         let tabs = listTabs(for: browser)
         for tab in tabs where BrowserMediaParser.isSupportedMusicURL(tab.url, includeYouTubeVideos: includeYouTubeVideos) {
             if let raw = probeTab(tab, in: browser, includeYouTubeVideos: includeYouTubeVideos),
-               let snapshot = BrowserMediaParser.parsePayload(
+               let parsed = BrowserMediaParser.parsePayloadWithChapterStart(
                    raw,
                    sourceBundleId: browser.bundleId,
                    includeYouTubeVideos: includeYouTubeVideos
                ) {
-                lastActiveTab = (browser, tab)
-                return snapshot
+                lastActiveTab = ActiveBrowserTarget(
+                    browser: browser,
+                    tab: tab,
+                    trackId: parsed.snapshot.track?.id ?? "",
+                    expectedURL: tab.url,
+                    chapterStart: parsed.chapterStart
+                )
+                return parsed.snapshot
             }
         }
         return nil
@@ -480,22 +509,41 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         """
     }
 
+    private static func escapeForJSString(_ value: String) -> String {
+        value.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "'", with: "\\'")
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+    }
+
     static func commandScriptSource(
         for command: PlaybackCommand,
         browser: BrowserTarget,
-        tab: BrowserTabDescriptor
+        tab: BrowserTabDescriptor,
+        expectedURL: String? = nil,
+        chapterStart: Double = 0.0
     ) -> String? {
-        let js: String
+        let actionJS: String
         switch command {
         case .playPause:
-            js = "(() => { const m = document.querySelector('video, audio'); if (m) { m.paused ? m.play() : m.pause(); } })()"
+            actionJS = "m.paused ? m.play() : m.pause();"
         case let .seek(seconds):
             let clamped = (seconds.isFinite && seconds > 0) ? seconds : 0.0
-            let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), clamped)
-            js = "(() => { const m = document.querySelector('video, audio'); if (m) { m.currentTime = \(formatted); } })()"
+            let offset = (chapterStart.isFinite && chapterStart > 0) ? chapterStart : 0.0
+            let absolute = max(0.0, clamped + offset)
+            let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), absolute)
+            actionJS = "m.currentTime = \(formatted);"
         case .nextTrack, .previousTrack:
             return nil
         }
+        let urlGuard: String
+        if let expectedURL, !expectedURL.isEmpty {
+            let escapedURL = escapeForJSString(expectedURL)
+            urlGuard = "if (location.href !== '\(escapedURL)') return;"
+        } else {
+            urlGuard = ""
+        }
+        let js = "(() => { \(urlGuard) const m = (window.__barTuneActiveMedia && window.__barTuneActiveMedia.isConnected) ? window.__barTuneActiveMedia : document.querySelector('video, audio'); if (m) { \(actionJS) } })()"
         let escapedJS = escapeForAppleScript(js)
         if browser.isSafari {
             return """
@@ -515,11 +563,21 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         """
     }
 
-    func sendCommand(_ command: PlaybackCommand, runningBundleIds: Set<String>) {
+    func sendCommand(_ command: PlaybackCommand, runningBundleIds: Set<String>, expectedTrackId: String? = nil) {
         guard let active = lastActiveTab,
-              runningBundleIds.contains(active.browser.bundleId),
-              let source = Self.commandScriptSource(for: command, browser: active.browser, tab: active.tab),
-              let script = NSAppleScript(source: source)
+              runningBundleIds.contains(active.browser.bundleId)
+        else { return }
+        if let expectedTrackId, active.trackId != expectedTrackId {
+            return
+        }
+        guard let source = Self.commandScriptSource(
+            for: command,
+            browser: active.browser,
+            tab: active.tab,
+            expectedURL: active.expectedURL,
+            chapterStart: active.chapterStart
+        ),
+            let script = NSAppleScript(source: source)
         else { return }
         var error: NSDictionary?
         script.executeAndReturnError(&error)
