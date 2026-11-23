@@ -337,6 +337,11 @@ struct OfflineCacheRemover: Sendable {
         await fetcher.invalidateMemoryCache(trackId: nil)
         await translator.clearCache()
     }
+
+    /// Deletes only audio-sync timings; fetched lyrics and translations stay for offline plays.
+    func removeAllAudioSync() {
+        syncCache.clear()
+    }
 }
 
 struct NetEaseSongCandidate: Equatable {

@@ -108,6 +108,7 @@ struct SettingsView: View {
     @State private var inspectingSong: CachedSongSummary?
     @State private var songPendingDeletion: CachedSongSummary?
     @State private var showClearCacheConfirmation: Bool = false
+    @State private var showClearAudioSyncConfirmation: Bool = false
     @State private var lyricsAlignerInstalled: Bool = false
     @State private var isDownloadingAligner: Bool = false
     @State private var alignerDownloadError: String?
@@ -698,6 +699,13 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(cachedSongCount == 0 && syncedSongCount == 0)
+                    Button("Clear Audio Sync", role: .destructive) {
+                        refreshCacheStats()
+                        if syncedSongCount > 0 {
+                            showClearAudioSyncConfirmation = true
+                        }
+                    }
+                    .disabled(syncedSongCount == 0)
                 }
 
                 Text(cacheFooterText)
@@ -804,6 +812,23 @@ struct SettingsView: View {
                 "This will permanently delete \(cachedSongCount) cached "
                     + "\(cachedSongCount == 1 ? "song" : "songs") and \(syncedSongCount) audio-synced "
                     + "\(syncedSongCount == 1 ? "track" : "tracks") from disk."
+            )
+        }
+        .alert("Clear Audio Sync Cache?", isPresented: $showClearAudioSyncConfirmation) {
+            Button("Clear Audio Sync", role: .destructive) {
+                let remover = cacheRemover
+                Task {
+                    // Deleting files off the main thread keeps Settings responsive on a large cache.
+                    await Task.detached { remover.removeAllAudioSync() }.value
+                    refreshCacheStats()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This will permanently delete \(syncedSongCount) audio-synced "
+                    + "\(syncedSongCount == 1 ? "track" : "tracks") from disk. "
+                    + "Fetched lyrics, translations and custom lyrics are kept."
             )
         }
         .alert(
