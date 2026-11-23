@@ -169,8 +169,11 @@ enum WaveformTimingRefiner {
     static let silenceMargin: Float = 6
     /// Gating needs this much range between the quiet and loud frames, so a song with no quiet parts keeps every word.
     static let minimumDynamicRange: Float = 15
-    /// A held note continues while the level stays within this many dB of the word's peak.
+    /// A held note continues while the level stays within this many dB of where it starts.
     static let sustainDrop: Float = 8
+    /// Seconds around a word's end whose peak is the held note's level: the final vowel starts there,
+    /// and a louder earlier syllable must not end its hold.
+    static let holdReach = 0.1
     /// A word peaking below this heard digital silence, so it holds no note to extend.
     static let minimumSignalLevel: Float = -80
     static let maxExtension = 1.5
@@ -209,7 +212,7 @@ enum WaveformTimingRefiner {
             let word = refined[index]
             let end = word.startTime + word.duration
             guard let segment = envelope.segment(covering: word.startTime...end),
-                  let peak = maxLevel(in: segment, from: word.startTime, to: end),
+                  let peak = maxLevel(in: segment, from: max(word.startTime, end - holdReach), to: end + holdReach),
                   peak >= minimumSignalLevel
             else { continue }
             let nextStart = index + 1 < refined.count ? refined[index + 1].startTime : .infinity
