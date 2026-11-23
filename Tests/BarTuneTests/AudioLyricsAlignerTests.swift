@@ -241,7 +241,8 @@ final class AudioLyricsAlignerTests: XCTestCase {
                 syncedAt: Date(),
                 medianOffset: 0.4,
                 alignedLineCount: 1,
-                lines: cachedLines
+                lines: cachedLines,
+                lockedLineIDs: [0]
             )
         )
 
@@ -285,14 +286,22 @@ final class AudioLyricsAlignerTests: XCTestCase {
         let cachedBadge = AudioSyncStatus.cached(.lyricsAlignment).overlayBadge
         XCTAssertEqual(cachedBadge?.text, "Synced")
         XCTAssertEqual(cachedBadge?.isSynced, true)
+        XCTAssertEqual(cachedBadge?.isAnimating, false)
+
+        let settledBadge = AudioSyncStatus.settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3).overlayBadge
+        XCTAssertEqual(settledBadge?.text, "Synced 2/3")
+        XCTAssertEqual(settledBadge?.isSynced, false)
+        XCTAssertEqual(settledBadge?.isAnimating, false)
 
         let listeningBadge = AudioSyncStatus.syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 10).overlayBadge
         XCTAssertEqual(listeningBadge?.text, "Listening")
         XCTAssertEqual(listeningBadge?.isSynced, false)
+        XCTAssertEqual(listeningBadge?.isAnimating, true)
 
         let syncingBadge = AudioSyncStatus.syncing(engine: .lyricsAlignment, alignedLines: 3, totalLines: 10).overlayBadge
         XCTAssertEqual(syncingBadge?.text, "Syncing")
         XCTAssertEqual(syncingBadge?.isSynced, false)
+        XCTAssertEqual(syncingBadge?.isAnimating, true)
     }
 
     @MainActor

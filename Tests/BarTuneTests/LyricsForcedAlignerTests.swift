@@ -110,11 +110,11 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertLessThanOrEqual(third.first.map { $0.startTime + $0.duration } ?? 99, 14.08 + 0.01)
     }
 
-    func testEngineDropsALineFarFromTheSongsOffsetSoItFallsBackToTheLRC() async throws {
+    /// Lines 0-3 and 5 are heard 0.1-0.6 s after their LRC time; line 4 (16.5 s) lands 1.9 s late.
+    private func alignOffsetSong(line4Heard weakly: Bool) async throws -> (words: [RecognizedAudioWord], confident: Set<Int>) {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
         let lines = [10.5, 12.0, 13.5, 15.0, 16.5, 19.5].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
         let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
-        // Lines 0-3 and 5 are heard 0.1-0.6 s after their LRC time; line 4 (16.5 s) lands 1.9 s late.
         // First window: frame f is track -2 + 0.24 f. Second window: frame f is track 10 + 0.24 f.
         var first: [Int: Int] = [:]
         for frame in [54, 61, 67, 73, 85] {
@@ -122,13 +122,27 @@ final class LyricsForcedAlignerTests: XCTestCase {
             first[frame + 1] = 4
         }
         model.peaksForCall = [first, [42: 14, 43: 4]]
+        if weakly { model.weakFrames = [85, 86] }
 
         var words = try await aligner.transcribe(chunk(start: 10.0))
         words += try await aligner.transcribe(chunk(start: 22.0))
+        return (words, aligner.confidentLineIDs)
+    }
+
+    func testEngineDropsAnUnconfidentLineFarFromTheSongsOffsetSoItFallsBackToTheLRC() async throws {
+        let (words, confident) = try await alignOffsetSong(line4Heard: true)
 
         XCTAssertEqual(words.count, 5)
         XCTAssertFalse(words.contains { abs($0.startTime - 18.4) < 0.5 }, "line 4 is 1.4 s off the 0.52 s median offset")
         XCTAssertEqual(words.last?.startTime ?? 0, 20.08, accuracy: 0.01)
+        XCTAssertEqual(confident, [0, 1, 2, 3, 5])
+    }
+
+    func testEngineKeepsAConfidentLineFarFromTheSongsOffset() async throws {
+        let (words, confident) = try await alignOffsetSong(line4Heard: false)
+
+        XCTAssertEqual(words.first { abs($0.startTime - 18.4) < 0.01 }?.text, "ka", "a clearly heard line isn't judged by the others")
+        XCTAssertEqual(confident, [0, 1, 2, 3, 4, 5])
     }
 
     func testEngineAlignsOnlyMissingLinesInsideTheGapTheirAlignedNeighboursLeave() async throws {
@@ -149,45 +163,54 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(words.first?.startTime ?? 0, 14.8, accuracy: 0.01)
     }
 
-    func testEngineReportsTheLinesItHadTheAudioForButNotItsAnchors() async throws {
+    func testEngineReportsTheLinesItHeardAndWhichOfThemItHeardClearly() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
-        let lines = [25.0, 32.0, 34.0, 60.0].enumerated().map { LyricLine(id: $0 + 10, timestamp: $1, text: "ka") }
-        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [12: 34.2...34.6], lineWindow: 3.0, holdBack: 2.0)
-        model.peaksForCall = [[:]] // nothing heard: line 11 is listened for, but not aligned
+        let lines = [12.0, 16.0, 21.0].enumerated().map { LyricLine(id: $0 + 10, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [12: 21.2...21.6], lineWindow: 3.0, holdBack: 2.0)
+        // Line 10 is heard clearly at 13.12 s; line 11's "ka" at 17.2 s only weakly.
+        model.peaksForCall = [[63: 14, 64: 4, 80: 14, 81: 4], [:]]
+        model.weakFrames = [80, 81]
 
-        // Playback picked up mid-song: line 10 may still be heard on a play from the start.
-        _ = try await aligner.transcribe(chunk(start: 30.0))
+        var words = try await aligner.transcribe(chunk(start: 10.0))
+        words += try await aligner.transcribe(chunk(start: 22.0))
 
-        // Line 10 began before the audio; line 13's window is still ahead; line 12 is an anchor.
-        XCTAssertEqual(aligner.attemptedLineIDs, [11])
+        XCTAssertEqual(words.count, 2, "an unconfident line is still shown")
+        XCTAssertEqual(aligner.confidentLineIDs, [10])
+        XCTAssertEqual(aligner.attemptedLineIDs, [10, 11], "the anchor isn't attempted")
     }
 
-    func testLinesBeforeCaptureOnAPlayFromTheStartCountAsListenedFor() async throws {
+    func testFinalChunkAlignsTheLinesItsAudioEndsOn() async throws {
+        let lines = [LyricLine(id: 0, timestamp: 12.0, text: "ka"), LyricLine(id: 1, timestamp: 20.0, text: "ka")]
+        // Frame f is track -2 + 0.24 f: line 1's "ka" at 20.8 s is in the newest 2 s a whole chunk holds back.
+        let peaks = [63: 14, 64: 4, 95: 14, 96: 4]
+
+        let waiting = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        waiting.peaksForCall = [peaks]
+        let midSong = try await LyricsForcedAligner(lines: lines, model: waiting, lineWindow: 3.0, holdBack: 2.0)
+            .transcribe(chunk(start: 10.0))
+        XCTAssertTrue(midSong.isEmpty, "more audio would follow, so line 1's window isn't covered yet")
+
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
-        let lines = [0.4, 9.0, 10.5, 12.0, 40.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
-        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
-        model.peaksForCall = [[:], [:]]
-
-        // Capture starts once the lyrics and model load, so no play hears a line sung at 0.4 s.
-        _ = try await aligner.transcribe(chunk(start: 7.3))
-        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
-
-        // A later seek back before the first run doesn't change what was already settled.
-        _ = try await aligner.transcribe(chunk(start: 50.0))
-        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+        model.peaksForCall = [peaks]
+        let words = try await LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+            .transcribe(chunk(start: 10.0, isFinal: true))
+        XCTAssertEqual(words.count, 2)
+        XCTAssertEqual(words.last?.startTime ?? 0, 20.8, accuracy: 0.01)
     }
 
-    func testRestartingFromTheTopCountsLinesALaterMidSongStartLeftBehind() async throws {
+    func testLineSungBeforeCaptureOnAPlayFromTheStartAlignsAfterASeekBack() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
-        let lines = [0.4, 9.0, 10.5, 12.0, 40.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
+        let lines = [0.4, 2.0, 4.0, 40.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
         let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
-        model.peaksForCall = [[:], [:]]
+        // Seek back to 0: frame f is track -12 + 0.24 f, so "ka" at frames 53-54 is sung at 0.72 s.
+        model.peaksForCall = [[:], [53: 14, 54: 4]]
 
-        _ = try await aligner.transcribe(chunk(start: 30.0))
-        XCTAssertFalse(aligner.attemptedLineIDs.contains(0), "a mid-song start leaves line 0 for a play from the top")
+        // Capture starts once the lyrics and model load, after line 0 is sung.
+        let first = try await aligner.transcribe(chunk(start: 7.3))
+        XCTAssertTrue(first.isEmpty)
 
-        _ = try await aligner.transcribe(chunk(start: 7.3))
-        XCTAssertTrue(aligner.attemptedLineIDs.contains(0))
+        let words = try await aligner.transcribe(chunk(start: 0.0))
+        XCTAssertEqual(words.first?.startTime ?? 0, 0.72, accuracy: 0.01)
     }
 
     func testEngineStartsOverAfterASeek() async throws {
@@ -354,9 +377,13 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the old compiled model must be rebuilt from the new package")
     }
 
-    private func chunk(start: Double) -> AudioSyncManager.AudioChunkRequest {
+    private func chunk(start: Double, isFinal: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
-            samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 }, sampleRate: 16000, chunkStartTime: start, playbackRate: 1
+            samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },
+            sampleRate: 16000,
+            chunkStartTime: start,
+            playbackRate: 1,
+            isFinal: isFinal
         )
     }
 }

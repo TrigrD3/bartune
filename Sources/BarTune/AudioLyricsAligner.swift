@@ -29,16 +29,27 @@ struct OverlaySyncBadge: Equatable, Sendable {
     let symbolName: String
     let text: String
     let isSynced: Bool
+    let isAnimating: Bool
 }
 
 enum AudioSyncStatus: Equatable, Sendable {
     case idle
     case cached(AudioSyncEngine)
     case syncing(engine: AudioSyncEngine, alignedLines: Int, totalLines: Int)
+    /// Lyrics Alignment stopped listening: another play would hear the same audio, so it can't lock more lines.
+    case settled(engine: AudioSyncEngine, lockedLines: Int, totalLines: Int)
     case permissionRequired(String)
     case unavailable(String)
     /// The song's lyric source overrides the enabled engine.
     case offForTrack(TrackLyricSource)
+
+    /// No longer listening: the sync is as complete as the audio allows.
+    var isFinished: Bool {
+        switch self {
+        case .cached, .settled: return true
+        default: return false
+        }
+    }
 
     var allowsResync: Bool {
         if case .offForTrack = self { return false }
@@ -48,12 +59,15 @@ enum AudioSyncStatus: Equatable, Sendable {
     var overlayBadge: OverlaySyncBadge? {
         switch self {
         case .cached:
-            return OverlaySyncBadge(symbolName: "checkmark.circle.fill", text: "Synced", isSynced: true)
+            return OverlaySyncBadge(symbolName: "checkmark.circle.fill", text: "Synced", isSynced: true, isAnimating: false)
+        case let .settled(_, locked, total):
+            return OverlaySyncBadge(symbolName: "checkmark.circle", text: "Synced \(locked)/\(total)", isSynced: false, isAnimating: false)
         case let .syncing(_, aligned, _):
             return OverlaySyncBadge(
                 symbolName: "waveform",
                 text: aligned > 0 ? "Syncing" : "Listening",
-                isSynced: false
+                isSynced: false,
+                isAnimating: true
             )
         case .idle, .permissionRequired, .unavailable, .offForTrack:
             return nil
@@ -66,6 +80,8 @@ enum AudioSyncStatus: Equatable, Sendable {
             return "Idle"
         case let .cached(engine):
             return "Cached (\(engine.title))"
+        case let .settled(engine, locked, total):
+            return "Cached (\(engine.title), \(locked)/\(total) lines locked)"
         case let .syncing(engine, aligned, total):
             if aligned > 0 {
                 return "Syncing via \(engine.title) (\(aligned)/\(total) lines)…"
@@ -116,8 +132,12 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let lines: [LyricLine]
     /// Words heard so far, so a later play can add to a partial sync instead of starting over.
     let heardWords: [RecognizedAudioWord]?
-    /// Lyrics Alignment: lines the engine had the audio for but could not align; not listened for again.
-    let checkedLineIDs: [Int]?
+    /// Lyrics Alignment: lines aligned confidently enough that later plays keep them as they are.
+    let lockedLineIDs: [Int]?
+    /// Lyrics Alignment: unlocked lines whose audio was heard since the locked set last grew.
+    let attemptedLineIDs: [Int]?
+    /// Lyrics Alignment: how many lines were locked when the play that saved this record began.
+    let lockedAtPlayStart: Int?
 
     init(
         trackId: String,
@@ -128,7 +148,9 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         sourceLineCount: Int? = nil,
         lines: [LyricLine],
         heardWords: [RecognizedAudioWord]? = nil,
-        checkedLineIDs: [Int]? = nil
+        lockedLineIDs: [Int]? = nil,
+        attemptedLineIDs: [Int]? = nil,
+        lockedAtPlayStart: Int? = nil
     ) {
         self.trackId = trackId
         self.engine = engine
@@ -138,7 +160,9 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         self.sourceLineCount = sourceLineCount
         self.lines = lines
         self.heardWords = heardWords
-        self.checkedLineIDs = checkedLineIDs
+        self.lockedLineIDs = lockedLineIDs
+        self.attemptedLineIDs = attemptedLineIDs
+        self.lockedAtPlayStart = lockedAtPlayStart
     }
 
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
@@ -167,6 +191,12 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
             return false
         }
         return !comparingText || texts(lines) == source
+    }
+
+    /// Lyrics Alignment: attempted lines that stay settled because the play that heard them locked nothing new.
+    var settledLineIDs: Set<Int> {
+        guard let lockedAtPlayStart, lockedAtPlayStart == (lockedLineIDs ?? []).count else { return [] }
+        return Set(attemptedLineIDs ?? [])
     }
 
     /// A reliable record that matched enough lines to skip listening again on the next play.
