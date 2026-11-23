@@ -1141,12 +1141,12 @@ final class LyricsState: ObservableObject {
                 if activeLine != line { activeLine = line }
                 if activeLineNextTimestamp != nextTimestamp { activeLineNextTimestamp = nextTimestamp }
             }
-        } else if currentLineId != -1 {
-            currentLineId = -1
-            currentText = "♪"
-            activeLine = nil
-            activeLineNextTimestamp = 0.0
-            lineProgress = 0.0
+        } else if currentLineId != -1 || currentText != "♪" {
+            if currentLineId != -1 { currentLineId = -1 }
+            if currentText != "♪" { currentText = "♪" }
+            if activeLine != nil { activeLine = nil }
+            if activeLineNextTimestamp != 0.0 { activeLineNextTimestamp = 0.0 }
+            if lineProgress != 0.0 { lineProgress = 0.0 }
         }
     }
 
