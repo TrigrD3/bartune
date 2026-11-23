@@ -415,6 +415,46 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testLyricsAlignmentTimesBySyllableWhenTheSettingIsOn() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.syllableTiming = true
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let fakeCapture = FakeAudioCapture()
+        let aligned = [
+            RecognizedAudioWord(text: "Hello", startTime: 11.0, duration: 0.6, confidence: 0.5, syllables: [
+                .init(text: "Hel", startTime: 11.0), .init(text: "lo", startTime: 11.3),
+            ]),
+        ] + ["world", "from", "test"].enumerated().map { index, word in
+            RecognizedAudioWord(text: word, startTime: 11.7 + Double(index) * 0.5, duration: 0.4, confidence: 0.5)
+        }
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, _ in FakeChunkEngine { _ in aligned } }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let synced = await waitUntil { !(state.rawLyricLines.first?.words.isEmpty ?? true) }
+
+        XCTAssertTrue(synced)
+        XCTAssertEqual(state.rawLyricLines.first?.words.map(\.text), ["Hel", "lo ", "world ", "from ", "test"])
+        XCTAssertEqual(state.rawLyricLines.first?.words[1].timestamp ?? 0, 11.3, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testSyllableTimingIsOffByDefaultAndPersists() {
+        let state = LyricsState(userDefaults: defaults)
+        XCTAssertFalse(state.syllableTiming)
+        state.syllableTiming = true
+        XCTAssertTrue(LyricsState(userDefaults: defaults).syllableTiming)
+    }
+
+    @MainActor
     func testLyricsAlignmentKeepsSavedLinesAndAlignsOnlyTheMissingOnes() async throws {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment

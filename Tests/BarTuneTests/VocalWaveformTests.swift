@@ -90,6 +90,15 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertEqual(result.stats.extended, 1)
     }
 
+    func testHeldNoteKeepsTheWordsSyllables() {
+        let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
+        var held = word(1.0, 0.2)
+        held.syllables = [.init(text: "a", startTime: 1.0), .init(text: "way", startTime: 1.1)]
+        let result = WaveformTimingRefiner.refine([held], envelope: env, timingError: 0)
+        XCTAssertEqual(result.stats.extended, 1)
+        XCTAssertEqual(result.words[0].syllables, held.syllables)
+    }
+
     func testHeldNoteStopsShortOfTheNextWord() {
         let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
         let result = WaveformTimingRefiner.refine([word(1.0, 0.2), word(2.0, 0.3)], envelope: env, timingError: 0)

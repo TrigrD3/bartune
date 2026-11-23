@@ -82,10 +82,17 @@ enum AudioSyncStatus: Equatable, Sendable {
 }
 
 struct RecognizedAudioWord: Equatable, Codable, Sendable {
+    struct Syllable: Equatable, Codable, Sendable {
+        let text: String
+        let startTime: Double
+    }
+
     let text: String
     let startTime: Double
     let duration: Double
     let confidence: Double
+    /// Lyrics Alignment: the word's syllables when it has more than one; their texts spell `text`.
+    var syllables: [Syllable]?
 
     var endTime: Double { startTime + max(0.04, duration) }
 }
@@ -479,12 +486,14 @@ enum LyricsAudioAligner {
     /// Aligns fetched lyric lines against recognized audio words to produce precise word-level karaoke timings.
     /// When `replaceTextWithTranscription` is true, matched lines permanently use the recognized audio words
     /// as their lyric text (useful when written lyrics differ from sung pronunciation).
+    /// With `splitsSyllables`, a matched word that carries syllables is timed one syllable at a time.
     static func align(
         lines: [LyricLine],
         recognizedWords: [RecognizedAudioWord],
         searchWindow: Double = 8.0,
         replaceTextWithTranscription: Bool = false,
-        regroupsCJKWords: Bool = true
+        regroupsCJKWords: Bool = true,
+        splitsSyllables: Bool = false
     ) -> AudioAlignmentResult {
         guard !lines.isEmpty, !recognizedWords.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
@@ -646,7 +655,8 @@ enum LyricsAudioAligner {
                     tokens: lineTokens,
                     matches: Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) }),
                     fallbackStart: max(shiftedStart, floor),
-                    fallbackEnd: max(shiftedEnd, floor + 0.4)
+                    fallbackEnd: max(shiftedEnd, floor + 0.4),
+                    splitsSyllables: splitsSyllables
                 )
                 let newLineStart = builtWords.first?.timestamp ?? shiftedStart
                 let rawEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
@@ -947,7 +957,8 @@ enum LyricsAudioAligner {
         tokens: [DisplayToken],
         matches: [Int: RecognizedAudioWord],
         fallbackStart: Double,
-        fallbackEnd: Double
+        fallbackEnd: Double,
+        splitsSyllables: Bool
     ) -> [WordTimestamp] {
         guard !tokens.isEmpty else { return [] }
         let anchorIndices = matches.keys.sorted()
@@ -1009,7 +1020,7 @@ enum LyricsAudioAligner {
             }
         }
 
-        return tokens.enumerated().map { idx, token in
+        return tokens.enumerated().flatMap { idx, token in
             let s = starts[idx]
             let rawDur = max(0, ends[idx] - s)
             let dur: Double
@@ -1019,7 +1030,57 @@ enum LyricsAudioAligner {
             } else {
                 dur = max(0.05, rawDur)
             }
-            return WordTimestamp(timestamp: s, duration: dur, text: token.display)
+            if splitsSyllables, let syllables = matches[idx]?.syllables,
+               let split = syllableTimestamps(syllables, display: token.display, start: s, end: s + dur) {
+                return split
+            }
+            return [WordTimestamp(timestamp: s, duration: dur, text: token.display)]
         }
+    }
+
+    /// A word's syllables kept inside its `start...end`, the last one carrying the token's trailing text;
+    /// nil when the syllables don't spell the start of `display`.
+    private static func syllableTimestamps(
+        _ syllables: [RecognizedAudioWord.Syllable],
+        display: String,
+        start: Double,
+        end: Double
+    ) -> [WordTimestamp]? {
+        let spelled = syllables.map(\.text).joined()
+        guard syllables.count > 1, display.hasPrefix(spelled) else { return nil }
+        var starts = [start]
+        for syllable in syllables.dropFirst() {
+            starts.append(min(end, max(starts[starts.count - 1], syllable.startTime)))
+        }
+        let trailing = String(display.dropFirst(spelled.count))
+        return syllables.indices.map { index in
+            let isLast = index == syllables.count - 1
+            let syllableEnd = isLast ? end : starts[index + 1]
+            return WordTimestamp(
+                timestamp: starts[index],
+                duration: syllableEnd - starts[index],
+                text: syllables[index].text + (isLast ? trailing : "")
+            )
+        }
+    }
+
+    /// A line's timed words grouped into the tokens `tokenizeLine` splits its text into, so the
+    /// syllables of one word come back together; nil when the words don't spell those tokens.
+    static func tokenGroups(of line: LyricLine) -> [[WordTimestamp]]? {
+        var groups: [[WordTimestamp]] = []
+        var index = 0
+        for token in tokenizeLine(line.text) {
+            var group: [WordTimestamp] = []
+            var spelled = ""
+            while index < line.words.count, spelled != token.display {
+                spelled += line.words[index].text
+                guard token.display.hasPrefix(spelled) else { return nil }
+                group.append(line.words[index])
+                index += 1
+            }
+            guard spelled == token.display else { return nil }
+            groups.append(group)
+        }
+        return index == line.words.count ? groups : nil
     }
 }

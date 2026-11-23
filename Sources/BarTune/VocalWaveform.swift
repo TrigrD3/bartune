@@ -226,7 +226,8 @@ enum WaveformTimingRefiner {
                     text: word.text,
                     startTime: word.startTime,
                     duration: sustainEnd - word.startTime,
-                    confidence: word.confidence
+                    confidence: word.confidence,
+                    syllables: word.syllables
                 )
                 stats.extended += 1
             }

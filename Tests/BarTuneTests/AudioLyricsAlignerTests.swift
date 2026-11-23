@@ -1159,4 +1159,52 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.matchedLineIDs, [0, 1])
         XCTAssertEqual(result.lines.last?.timestamp ?? 0, 26.25, accuracy: 0.01)
     }
+
+    private func syllableWords() -> [RecognizedAudioWord] {
+        [
+            RecognizedAudioWord(text: "Beautiful", startTime: 10.0, duration: 1.5, confidence: 0.9, syllables: [
+                .init(text: "Beau", startTime: 10.0),
+                .init(text: "ti", startTime: 10.6),
+                .init(text: "ful", startTime: 11.0),
+            ]),
+            RecognizedAudioWord(text: "day", startTime: 11.6, duration: 0.5, confidence: 0.9),
+        ]
+    }
+
+    func testAlignTimesAMatchedWordBySyllableWhenAsked() {
+        let lines = [LyricLine(id: 0, timestamp: 10.0, text: "Beautiful day")]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: syllableWords(), splitsSyllables: true)
+
+        let words = result.lines[0].words
+        XCTAssertEqual(words.map(\.text), ["Beau", "ti", "ful ", "day"], "the trailing space stays with the word's last syllable")
+        XCTAssertEqual(words.map(\.text).joined(), "Beautiful day")
+        XCTAssertEqual(words.map(\.timestamp), [10.0, 10.6, 11.0, 11.6])
+        XCTAssertEqual(words[0].duration ?? 0, 0.6, accuracy: 0.001)
+        XCTAssertEqual(words[2].timestamp + (words[2].duration ?? 0), 11.5, accuracy: 0.001, "the last syllable ends with the word")
+    }
+
+    func testAlignKeepsWholeWordsUnlessAskedForSyllables() {
+        let lines = [LyricLine(id: 0, timestamp: 10.0, text: "Beautiful day")]
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: syllableWords())
+        XCTAssertEqual(result.lines[0].words.map(\.text), ["Beautiful ", "day"])
+    }
+
+    func testTokenGroupsBringASyllableTimedWordBackTogether() throws {
+        let lines = [LyricLine(id: 0, timestamp: 10.0, text: "Beautiful day")]
+        let aligned = LyricsAudioAligner.align(lines: lines, recognizedWords: syllableWords(), splitsSyllables: true).lines
+
+        let groups = try XCTUnwrap(LyricsAudioAligner.tokenGroups(of: aligned[0]))
+        XCTAssertEqual(groups.map { $0.map(\.text) }, [["Beau", "ti", "ful "], ["day"]])
+        XCTAssertNil(LyricsAudioAligner.tokenGroups(of: LyricLine(id: 1, timestamp: 0, text: "ab", words: [
+            WordTimestamp(timestamp: 0, text: "b"),
+        ])))
+
+        // An anchored line's words come back with their syllables, so realigning keeps them.
+        let heard = AudioSyncManager.recognizedWords(of: aligned)
+        XCTAssertEqual(heard.map(\.text), ["Beautiful", "day"])
+        XCTAssertEqual(heard[0].syllables?.map(\.startTime), [10.0, 10.6, 11.0])
+        XCTAssertEqual(heard[0].startTime + heard[0].duration, 11.5, accuracy: 0.001)
+        XCTAssertNil(heard[1].syllables)
+    }
 }
