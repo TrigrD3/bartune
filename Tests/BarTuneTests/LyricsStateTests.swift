@@ -297,4 +297,35 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertEqual(reloaded.barCornerRadius, 11.0, accuracy: 0.01)
         XCTAssertFalse(reloaded.showTrackTitle)
     }
+
+    func testLongIntroShowsOverlayBeforeFirstLyricLine() throws {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let track = TrackInfo(
+            id: "track:long-intro",
+            title: "Long Intro",
+            artist: "Artist",
+            album: "",
+            duration: 240,
+            artworkURL: nil
+        )
+        state.setTrack(track, lyrics: [
+            LyricLine(id: 0, timestamp: 30.0, duration: 4.0, text: "First sung line"),
+        ])
+        state.updatePlayback(isPlaying: true, position: 1.0)
+
+        XCTAssertEqual(state.currentText, "♪")
+        XCTAssertEqual(state.currentLineId, -1)
+        XCTAssertNil(state.activeLine)
+        XCTAssertTrue(state.shouldShowOverlay)
+
+        state.updatePlayback(isPlaying: true, position: 30.2)
+        XCTAssertEqual(state.currentText, "First sung line")
+        XCTAssertEqual(state.currentLineId, 0)
+        XCTAssertTrue(state.shouldShowOverlay)
+
+        state.updatePlayback(isPlaying: false, position: 30.2)
+        XCTAssertFalse(state.shouldShowOverlay)
+    }
 }
