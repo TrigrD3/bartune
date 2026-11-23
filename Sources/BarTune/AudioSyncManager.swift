@@ -14,10 +14,12 @@ struct CapturedAudio: Sendable {
     let sampleRate: Double
     /// Seconds the first sample was captured before this delivery, from the buffer's presentation timestamp.
     var captureDelay: Double?
+    /// Monotonic capture timestamp (`ProcessInfo.processInfo.systemUptime` domain) measured before extraction.
+    var capturedAt: Double?
 }
 
 protocol AudioCaptureProviding: AnyObject {
-    var onAudioSamples: ((CapturedAudio) -> Void)? { get set }
+    var onAudioSamples: (@Sendable (CapturedAudio) -> Void)? { get set }
     @MainActor func start(targetBundleIds: Set<String>) async throws
     @MainActor func stop()
 }
@@ -300,8 +302,8 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
 
 final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding, @unchecked Sendable {
     private let callbackLock = NSLock()
-    private var _onAudioSamples: ((CapturedAudio) -> Void)?
-    var onAudioSamples: ((CapturedAudio) -> Void)? {
+    private var _onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
+    var onAudioSamples: (@Sendable (CapturedAudio) -> Void)? {
         get {
             callbackLock.lock()
             defer { callbackLock.unlock() }
@@ -390,11 +392,13 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
 
         let asbd = asbdPtr.pointee
         let sampleRate = asbd.mSampleRate > 0 ? asbd.mSampleRate : 16000.0
+        let uptimeNow = ProcessInfo.processInfo.systemUptime
         let hostNow = CMClockGetTime(CMClockGetHostTimeClock()).seconds
         let presentation = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let delay = presentation.isNumeric
             ? AudioSampleExtractor.captureDelay(presentation: presentation.seconds, hostNow: hostNow)
             : nil
+        let capturedAt = uptimeNow - (delay ?? 0)
 
         var (mid, side) = AudioSampleExtractor.midSide(
             channels: AudioSampleExtractor.extractChannels(from: sampleBuffer, asbd: asbd)
@@ -404,7 +408,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
             side = []
         }
         guard !mid.isEmpty else { return }
-        onAudioSamples?(CapturedAudio(samples: mid, side: side, sampleRate: sampleRate, captureDelay: delay))
+        onAudioSamples?(CapturedAudio(samples: mid, side: side, sampleRate: sampleRate, captureDelay: delay, capturedAt: capturedAt))
     }
 }
 
@@ -500,6 +504,7 @@ final class AudioSyncManager {
     private var priorHeardWords: [RecognizedAudioWord] = []
     /// Lyrics Alignment lines aligned on an earlier play, by line ID: kept as they are, never realigned.
     private var anchoredLines: [Int: LyricLine] = [:]
+    private var acceptedSessionLines: [Int: LyricLine] = [:]
     /// Lyrics Alignment lines already listened for without aligning, on this play or an earlier one.
     private var checkedLineIDs: Set<Int> = []
     private var activeTrackDuration: Double = 0
@@ -579,6 +584,7 @@ final class AudioSyncManager {
         cachedAlignedLineCount = 0
         priorHeardWords = []
         anchoredLines = [:]
+        acceptedSessionLines = [:]
         checkedLineIDs = []
         activeTrackDuration = track.duration
         vocalEnvelope = VocalEnvelope()
@@ -913,9 +919,9 @@ final class AudioSyncManager {
     }
 
     private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
-        capture.onAudioSamples = { [weak self] audio in
-            // When the first sample was captured: the buffer's own timestamp, else its delivery.
-            let capturedAt = ProcessInfo.processInfo.systemUptime - (audio.captureDelay ?? 0)
+        capture.onAudioSamples = { @Sendable [weak self] audio in
+            // When the first sample was captured: the pre-extraction monotonic timestamp, else delivery minus delay.
+            let capturedAt = audio.capturedAt ?? (ProcessInfo.processInfo.systemUptime - (audio.captureDelay ?? 0))
             Task { @MainActor in
                 guard let self,
                       self.syncGeneration == generation,
@@ -934,13 +940,25 @@ final class AudioSyncManager {
                 if let delay = audio.captureDelay {
                     self.diagnostics.recordCaptureDelay(delay)
                 }
+                let livePos = Self.playbackPosition(
+                    self.currentPlaybackPosition(),
+                    capturedAt: capturedAt,
+                    now: ProcessInfo.processInfo.systemUptime,
+                    rate: self.state.isPlaying ? self.state.playbackRate : 0
+                )
+                if let existingStart = self.whisperChunkStartPos,
+                   sampleRate > 0,
+                   audio.captureDelay != nil || audio.capturedAt != nil {
+                    let expectedStart = existingStart
+                        + Double(self.whisperSampleBuffer.count) / sampleRate * self.whisperChunkPlaybackRate
+                    if abs(livePos - expectedStart) > Self.seekTolerance {
+                        // Dropped audio gap: start a fresh chunk & envelope segment at the measured position.
+                        self.whisperSampleBuffer.removeAll(keepingCapacity: true)
+                        self.whisperChunkStartPos = livePos
+                        self.whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
+                    }
+                }
                 if self.whisperChunkStartPos == nil {
-                    let livePos = Self.playbackPosition(
-                        self.currentPlaybackPosition(),
-                        capturedAt: capturedAt,
-                        now: ProcessInfo.processInfo.systemUptime,
-                        rate: self.state.isPlaying ? self.state.playbackRate : 0
-                    )
                     if let pending = self.whisperPendingSeekPos {
                         self.whisperPendingSeekPos = nil
                         self.whisperChunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
@@ -1088,7 +1106,8 @@ final class AudioSyncManager {
         return words
     }
 
-    /// Aligns the lyrics to every word heard, keeping lines anchored from an earlier play exactly as saved.
+    /// Aligns the lyrics to every word heard, keeping lines anchored from an earlier play or already
+    /// accepted in this Lyrics Alignment session so later audio-level shifts cannot drop them.
     private func currentAlignment() -> AudioAlignmentResult {
         let result = LyricsAudioAligner.align(
             lines: baseLines,
@@ -1096,9 +1115,19 @@ final class AudioSyncManager {
             replaceTextWithTranscription: state.replaceLyricsWithTranscription,
             regroupsCJKWords: chunkEngine != .lyricsAlignment
         )
-        guard !anchoredLines.isEmpty else { return result }
-        let matched = Set(result.matchedLineIDs).union(anchoredLines.keys)
-        let lines = result.lines.map { anchoredLines[$0.id] ?? $0 }
+        let preserved = chunkEngine == .lyricsAlignment ? acceptedSessionLines : [:]
+        guard !anchoredLines.isEmpty || !preserved.isEmpty else { return result }
+        let resultMatched = Set(result.matchedLineIDs)
+        let matched = resultMatched.union(anchoredLines.keys).union(preserved.keys)
+        let lines = result.lines.map { line -> LyricLine in
+            if let anchored = anchoredLines[line.id] {
+                return anchored
+            }
+            if resultMatched.contains(line.id) {
+                return line
+            }
+            return preserved[line.id] ?? line
+        }
         return AudioAlignmentResult(
             lines: lines,
             matchedLineCount: matched.count,
@@ -1203,6 +1232,10 @@ final class AudioSyncManager {
         )
         // Equal counts still save, so the lines checked on this play are remembered.
         if result.matchedLineCount > 0, result.matchedLineCount >= cachedAlignedLineCount {
+            let matchedIDs = Set(result.matchedLineIDs)
+            for line in result.lines where matchedIDs.contains(line.id) {
+                acceptedSessionLines[line.id] = line
+            }
             persistAlignment(result, engine: .lyricsAlignment)
             state.applyAudioSyncedLines(result.lines)
         }
