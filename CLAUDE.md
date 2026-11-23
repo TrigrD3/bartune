@@ -33,6 +33,7 @@ scripts/
   lint.sh                  # Runs SwiftFormat (--lint) and SwiftLint (--strict)
   convert-lyrics-aligner.py # Builds LyricsAligner.mlpackage (MMS forced-aligner → Core ML, 8-bit) for the Lyrics Alignment engine
   export-coverage.sh       # CI LCOV export; fails when the test binary, profdata, or report is missing
+  fetch-jamendolyrics.sh   # Downloads JamendoLyrics (word-annotated, Creative Commons audio; never commit it) for AlignmentEvalTests
   hooks/commit-msg         # Local Conventional Commits git hook
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
 .github/
@@ -84,6 +85,11 @@ git config core.hooksPath scripts/hooks
 # Redirect to a file (`> /tmp/run.log 2>&1`) or enable `set -o pipefail` instead.
 swift build
 swift test
+
+# Score audio sync against annotated songs (opt-in, skipped without the env var; needs the
+# Lyrics Alignment model installed). Run it on main and on a branch to compare an audio sync change.
+scripts/fetch-jamendolyrics.sh <dir> English
+BARTUNE_EVAL_DIR=<dir> swift test --filter AlignmentEvalTests > <log> 2>&1
 
 # Lint & format check (matches CI)
 bash scripts/lint.sh
