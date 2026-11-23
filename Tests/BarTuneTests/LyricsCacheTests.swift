@@ -600,6 +600,34 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertEqual(translatedAfterClear.map(\.text), ["newer en"])
     }
 
+    func testClearingAudioSyncKeepsFetchedLyricsAndTranslations() {
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
+        let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
+        let offline: LyricsFetcher.DataLoader = { _ in throw URLError(.notConnectedToInternet) }
+        let remover = OfflineCacheRemover(
+            fetcher: LyricsFetcher(diskCache: diskCache, dataLoader: offline),
+            translator: LyricsTranslator(diskCache: diskCache, dataLoader: offline),
+            lyricsCache: diskCache,
+            syncCache: syncCache
+        )
+        let trackId = "spotify:track:keep-lyrics"
+        let lines = [LyricLine(id: 0, timestamp: 1, text: "fetched")]
+        let translationKey = LyricsTranslator.cacheKey(trackId: trackId, targetLanguage: .english, lines: lines)
+        diskCache.save(trackId: trackId, lines: lines, title: "Song", artist: "Artist")
+        diskCache.save(trackId: translationKey, lines: [LyricLine(id: 0, timestamp: 1, text: "fetched en")])
+        syncCache.save(AudioSyncedLyricsRecord(
+            trackId: trackId, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.2,
+            alignedLineCount: 1, sourceLineCount: 1, lines: [LyricLine(id: 0, timestamp: 1.2, text: "fetched")]
+        ))
+
+        remover.removeAllAudioSync()
+
+        XCTAssertNil(syncCache.load(trackId: trackId))
+        XCTAssertEqual(syncCache.stats().count, 0)
+        XCTAssertEqual(diskCache.load(trackId: trackId)?.map(\.text), ["fetched"])
+        XCTAssertEqual(diskCache.load(trackId: translationKey)?.map(\.text), ["fetched en"])
+    }
+
     func testAutomaticEvictionDeletesDerivedTranslationAndPreservesControlSong() {
         let lyricsDir = tempDir.appendingPathComponent("lyrics", isDirectory: true)
         let syncDir = tempDir.appendingPathComponent("sync", isDirectory: true)
