@@ -29,13 +29,54 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         let line = LyricLine(id: 0, timestamp: 10, duration: 2, text: "iiii WWWW", words: lineWords)
         let fractions = try XCTUnwrap(LyricsState.wordBoundaryFractions(words: lineWords, lineText: line.text, font: font))
 
+        let atSecondWord = LyricsState.computeLineProgress(line: line, nextTimestamp: 13, position: 11, boundaries: fractions)
+        let characterShare = LyricsState.computeLineProgress(line: line, nextTimestamp: 13, position: 11)
         let halfwayThroughSecondWord = LyricsState.computeLineProgress(
             line: line, nextTimestamp: 13, position: 11.5, boundaries: fractions
         )
-        let characterShare = LyricsState.computeLineProgress(line: line, nextTimestamp: 13, position: 11.5)
 
-        XCTAssertEqual(halfwayThroughSecondWord, (fractions[1] + fractions[2]) / 2, accuracy: 0.0001)
-        XCTAssertEqual(characterShare, (5 + 2) / 9.0, accuracy: 0.0001)
+        XCTAssertEqual(atSecondWord, fractions[1], accuracy: 0.0001)
+        XCTAssertEqual(characterShare, 5 / 9.0, accuracy: 0.0001)
+        XCTAssertGreaterThan(halfwayThroughSecondWord, fractions[1])
+        XCTAssertLessThan(halfwayThroughSecondWord, fractions[2])
+    }
+
+    private func progress(_ line: LyricLine, at position: Double) -> Double {
+        LyricsState.computeLineProgress(line: line, nextTimestamp: 20, position: position)
+    }
+
+    func testSweepKeepsItsSpeedFromOneWordIntoTheNext() {
+        // A long word, then a short one right after it: a straight line per word jumps from 9 to 2 characters a second.
+        let line = LyricLine(id: 0, timestamp: 10, text: "aaaaaaaa bb", words: [
+            WordTimestamp(timestamp: 10, duration: 1, text: "aaaaaaaa "),
+            WordTimestamp(timestamp: 11, duration: 1, text: "bb"),
+        ])
+        let before = (progress(line, at: 11) - progress(line, at: 10.98)) / 0.02
+        let after = (progress(line, at: 11.02) - progress(line, at: 11)) / 0.02
+
+        XCTAssertEqual(progress(line, at: 11), 9 / 11.0, accuracy: 0.0001, "the sweep still reaches the word as it is sung")
+        XCTAssertEqual(after / before, 1, accuracy: 0.1)
+    }
+
+    func testSweepStartsFromRestAfterAPause() {
+        let line = LyricLine(id: 0, timestamp: 10, text: "aaaa bbbb", words: [
+            WordTimestamp(timestamp: 10, duration: 1, text: "aaaa "),
+            WordTimestamp(timestamp: 13, duration: 1, text: "bbbb"),
+        ])
+        let wordStart = 5 / 9.0
+        let wordWidth = 4 / 9.0
+
+        XCTAssertEqual(progress(line, at: 13), wordStart, accuracy: 0.0001)
+        XCTAssertLessThan(progress(line, at: 13.05) - wordStart, 0.02 * wordWidth, "a straight line would already be 5% in")
+        XCTAssertEqual(progress(line, at: 14), 1, accuracy: 0.0001)
+
+        var previous = 0.0
+        for step in 0...500 {
+            let value = progress(line, at: 9.5 + Double(step) * 0.01)
+            XCTAssertGreaterThanOrEqual(value, previous - 1e-12, "the sweep never moves backwards")
+            XCTAssertLessThanOrEqual(value, 1)
+            previous = value
+        }
     }
 
     func testRomanizedWordsWithATrailingSpaceStillMeasure() throws {
@@ -111,10 +152,10 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         XCTAssertEqual(shown.words[1].timestamp, 12.0, accuracy: 0.001)
         XCTAssertEqual(shown.words[1].duration ?? 0, 1.0, accuracy: 0.001)
         let boundaries = try XCTUnwrap(LyricsState.wordBoundaryFractions(words: shown.words, lineText: shown.text, font: font))
-        let midMergedWord = LyricsState.computeLineProgress(
-            line: shown, nextTimestamp: 14, position: 11.0, boundaries: boundaries
+        let endOfMergedWord = LyricsState.computeLineProgress(
+            line: shown, nextTimestamp: 14, position: 12.0, boundaries: boundaries
         )
-        XCTAssertEqual(midMergedWord, boundaries[1] / 2, accuracy: 0.001)
+        XCTAssertEqual(endOfMergedWord, boundaries[1], accuracy: 0.001)
     }
 
     func testApplyAudioSyncedLinesAndTranslationUseExtrapolatedPositionWhenAnchorIsRetained() throws {
