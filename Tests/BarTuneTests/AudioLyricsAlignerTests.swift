@@ -77,6 +77,55 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.lines[2].timestamp, 32.0, accuracy: 0.05)
     }
 
+    /// Heard words from SiM's "The Rumbling", where "things" was stretched past the next line's first "I".
+    func testLineStartingInsideTheStretchedLastWordOfTheLineBeforeStillAligns() throws {
+        let lines = [
+            LyricLine(id: 0, timestamp: 20.68, text: "All I ever wanted to do was do right things"),
+            LyricLine(id: 1, timestamp: 24.43, text: "I never wanted to be the king, I swear"),
+        ]
+        let heard: [(String, Double, Double)] = [
+            ("All", 21.20, 0.16), ("I", 21.40, 0.13), ("ever", 21.56, 0.35), ("wanted", 21.94, 0.48),
+            ("to", 22.56, 0.15), ("do", 22.74, 0.17), ("was", 22.94, 0.16), ("do", 23.16, 0.17),
+            ("right", 23.36, 0.50), ("things", 23.97, 0.56),
+            ("I", 24.09, 0.43), ("never", 24.81, 0.41), ("wanted", 25.25, 0.36), ("to", 25.65, 0.13),
+            ("be", 25.85, 0.39), ("the", 26.27, 0.22), ("king,", 26.51, 0.51), ("I", 27.11, 0.56),
+            ("swear", 27.69, 3.64),
+        ]
+        let recognized = heard.map { RecognizedAudioWord(text: $0.0, startTime: $0.1, duration: $0.2, confidence: 0.1) }
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[1].timestamp, 24.09, accuracy: 0.01)
+        // The first line gives up its overlapping tail instead of the second line losing its match.
+        let first = result.lines[0]
+        let firstEnd = first.timestamp + (first.duration ?? 0)
+        XCTAssertEqual(firstEnd, 24.09, accuracy: 0.01)
+        let lastWord = try XCTUnwrap(first.words.last)
+        XCTAssertLessThanOrEqual(lastWord.timestamp + (lastWord.duration ?? 0), 24.09 + 0.001)
+    }
+
+    func testLineStartingWithin50msOfPreviousLastWordStillAligns() throws {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "love you"),
+            LyricLine(id: 1, timestamp: 12.0, text: "now"),
+        ]
+        let recognized = [
+            RecognizedAudioWord(text: "love", startTime: 10.0, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 11.90, duration: 0.50, confidence: 0.9),
+            RecognizedAudioWord(text: "now", startTime: 11.94, duration: 0.40, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[1].timestamp, 11.94, accuracy: 0.005)
+        let first = result.lines[0]
+        XCTAssertEqual(first.timestamp + (first.duration ?? 0), 11.94, accuracy: 0.005)
+        let lastWord = try XCTUnwrap(first.words.last)
+        XCTAssertEqual(lastWord.timestamp + (lastWord.duration ?? 0), 11.94, accuracy: 0.005)
+    }
+
     func testAudioSyncedLyricsCacheDiscardsRemovedEngineRecords() throws {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         for removedEngine in ["appleSpeech", "whisper"] {

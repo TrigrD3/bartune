@@ -555,7 +555,7 @@ enum LyricsAudioAligner {
         var previousBlankTimestamp: Double?
 
         // Pass 2: align each line inside a tight, monotonic window so adjacent lines never steal words or overlap.
-        for (lineIdx, line) in lines.enumerated() {
+        lineLoop: for (lineIdx, line) in lines.enumerated() {
             let lineTokens = tokenizeLine(line.text)
             let isNonEmpty = !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let nextTs = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : (line.timestamp + 4.5)
@@ -569,22 +569,20 @@ enum LyricsAudioAligner {
                 previousLineEnd,
                 previousBlankTimestamp.map { $0 + 0.01 } ?? 0
             )
-
-            // Words before `minAllowedStart` would be rejected below, so they can't outrank a later eligible one.
-            let windowStart = max(0, lastConsumedWordStart, minAllowedStart, shiftedStart - localPadding)
             let windowEnd = min(shiftedEnd + localPadding, nextShiftedStart + 0.4)
-
-            let matches: [TokenMatch] = windowEnd > windowStart
-                ? matchLineTokens(
-                    lineTokens: lineTokens,
-                    expectedStart: shiftedStart,
-                    window: windowStart...windowEnd,
-                    recognized: sortedRecognized,
-                    normalizedRec: normalizedRec
-                )
-                : []
-
-            let matchMap = Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) })
+            // Words before `floor` would be rejected below, so they can't outrank a later eligible one.
+            let matchesAfter = { (floor: Double) -> [TokenMatch] in
+                let windowStart = max(0, lastConsumedWordStart, floor, shiftedStart - localPadding)
+                return windowEnd > windowStart
+                    ? matchLineTokens(
+                        lineTokens: lineTokens,
+                        expectedStart: shiftedStart,
+                        window: windowStart...windowEnd,
+                        recognized: sortedRecognized,
+                        normalizedRec: normalizedRec
+                    )
+                    : []
+            }
             let meaningfulTokenCount = lineTokens.filter { !$0.normalized.isEmpty }.count
             let minMatches = meaningfulTokenCount <= 2 ? 1 : max(2, meaningfulTokenCount / 3)
 
@@ -630,24 +628,40 @@ enum LyricsAudioAligner {
                 continue
             }
 
-            if matches.count >= minMatches {
+            // A matched line's end is only where its last word's audio ran out, which can be stretched past
+            // the next line's first word. If nothing starts after that end, the next line may start after
+            // the last word's start instead, trimming the line before rather than losing its own match.
+            let trimmablePrevious = alignedLines.last.flatMap { $0.id == matchedLineIDs.last ? $0 : nil }
+            var floors = [minAllowedStart]
+            if let previous = trimmablePrevious {
+                let lastWordStart = previous.words.last?.timestamp ?? previous.timestamp
+                let relaxed = max(previous.timestamp + 0.25, lastWordStart + 0.001)
+                if relaxed < minAllowedStart { floors.append(relaxed) }
+            }
+
+            for floor in floors {
+                let matches = matchesAfter(floor)
+                guard matches.count >= minMatches else { continue }
                 let builtWords = interpolateWordTimestamps(
                     tokens: lineTokens,
-                    matches: matchMap,
-                    fallbackStart: max(shiftedStart, minAllowedStart),
-                    fallbackEnd: max(shiftedEnd, minAllowedStart + 0.4)
+                    matches: Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) }),
+                    fallbackStart: max(shiftedStart, floor),
+                    fallbackEnd: max(shiftedEnd, floor + 0.4)
                 )
                 let newLineStart = builtWords.first?.timestamp ?? shiftedStart
                 let rawEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
 
-                if abs(newLineStart - shiftedStart) <= 2.5, newLineStart >= minAllowedStart {
+                if abs(newLineStart - shiftedStart) <= 2.5, newLineStart >= floor {
                     let clampedEnd = nextShiftedStart > newLineStart + 0.3 ? min(rawEnd, nextShiftedStart) : rawEnd
                     let newDuration = max(0.3, clampedEnd - newLineStart)
+                    if let previous = trimmablePrevious, newLineStart < previousLineEnd {
+                        alignedLines[alignedLines.count - 1] = Self.trimmed(previous, toEnd: newLineStart)
+                    }
                     matchedLineCount += 1
                     matchedLineIDs.append(line.id)
                     matchedWordCount += matches.count
                     lastConsumedWordStart = max(lastConsumedWordStart, (matches.map(\.word.startTime).max() ?? newLineStart) + 0.001)
-                    previousLineEnd = max(previousLineEnd, newLineStart + newDuration)
+                    previousLineEnd = newLineStart + newDuration
                     previousEmittedTimestamp = newLineStart
 
                     alignedLines.append(
@@ -659,7 +673,7 @@ enum LyricsAudioAligner {
                             words: builtWords
                         )
                     )
-                    continue
+                    continue lineLoop
                 }
             }
 
@@ -707,6 +721,20 @@ enum LyricsAudioAligner {
             matchedWordCount: matchedWordCount,
             medianOffset: medianOffset,
             matchedLineIDs: matchedLineIDs
+        )
+    }
+
+    /// `line` cut to end at `end`, with any word running past it shortened to fit.
+    private static func trimmed(_ line: LyricLine, toEnd end: Double) -> LyricLine {
+        LyricLine(
+            id: line.id,
+            timestamp: line.timestamp,
+            duration: end - line.timestamp,
+            text: line.text,
+            words: line.words.map { word in
+                guard word.timestamp + (word.duration ?? 0) > end else { return word }
+                return WordTimestamp(timestamp: word.timestamp, duration: end - word.timestamp, text: word.text)
+            }
         )
     }
 
