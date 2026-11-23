@@ -2026,7 +2026,7 @@ final class AudioSyncManagerTests: XCTestCase {
 }
 
 private final class FakeAudioCapture: AudioCaptureProviding {
-    var onAudioSamples: ((CapturedAudio) -> Void)?
+    var onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []
