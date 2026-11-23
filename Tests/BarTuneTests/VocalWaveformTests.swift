@@ -90,6 +90,13 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertEqual(result.stats.extended, 1)
     }
 
+    func testHeldNoteSofterThanTheWordsLoudestSyllableIsStillHeld() {
+        // "kem" is loud (1.0-1.2 s); the held "li" is 10.5 dB softer and lasts until 2.5 s.
+        let env = envelope([(1, 0), (0.2, 0.5), (1.3, 0.15), (1, 0)])
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.3)], envelope: env, timingError: 0)
+        XCTAssertEqual(result.words[0].endTime, 2.5, accuracy: 0.05)
+    }
+
     func testHeldNoteKeepsTheWordsSyllables() {
         let env = envelope([(1, 0), (1.5, 0.5), (1, 0)])
         var held = word(1.0, 0.2)
