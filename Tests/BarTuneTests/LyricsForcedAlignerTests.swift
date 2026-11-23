@@ -151,14 +151,43 @@ final class LyricsForcedAlignerTests: XCTestCase {
 
     func testEngineReportsTheLinesItHadTheAudioForButNotItsAnchors() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
-        let lines = [5.0, 12.0, 14.0, 40.0].enumerated().map { LyricLine(id: $0 + 10, timestamp: $1, text: "ka") }
-        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [12: 14.2...14.6], lineWindow: 3.0, holdBack: 2.0)
+        let lines = [25.0, 32.0, 34.0, 60.0].enumerated().map { LyricLine(id: $0 + 10, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [12: 34.2...34.6], lineWindow: 3.0, holdBack: 2.0)
         model.peaksForCall = [[:]] // nothing heard: line 11 is listened for, but not aligned
 
-        _ = try await aligner.transcribe(chunk(start: 10.0))
+        // Playback picked up mid-song: line 10 may still be heard on a play from the start.
+        _ = try await aligner.transcribe(chunk(start: 30.0))
 
         // Line 10 began before the audio; line 13's window is still ahead; line 12 is an anchor.
         XCTAssertEqual(aligner.attemptedLineIDs, [11])
+    }
+
+    func testLinesBeforeCaptureOnAPlayFromTheStartCountAsListenedFor() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [0.4, 9.0, 10.5, 12.0, 40.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        model.peaksForCall = [[:], [:]]
+
+        // Capture starts once the lyrics and model load, so no play hears a line sung at 0.4 s.
+        _ = try await aligner.transcribe(chunk(start: 7.3))
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+
+        // A later seek back before the first run doesn't change what was already settled.
+        _ = try await aligner.transcribe(chunk(start: 50.0))
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+    }
+
+    func testRestartingFromTheTopCountsLinesALaterMidSongStartLeftBehind() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [0.4, 9.0, 10.5, 12.0, 40.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        model.peaksForCall = [[:], [:]]
+
+        _ = try await aligner.transcribe(chunk(start: 30.0))
+        XCTAssertFalse(aligner.attemptedLineIDs.contains(0), "a mid-song start leaves line 0 for a play from the top")
+
+        _ = try await aligner.transcribe(chunk(start: 7.3))
+        XCTAssertTrue(aligner.attemptedLineIDs.contains(0))
     }
 
     func testEngineStartsOverAfterASeek() async throws {

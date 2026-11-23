@@ -168,6 +168,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private let maxOffsetDeviation = 1.0
 
     static let sampleRate = 16000
+    /// A run starting this early is a play from the song's start: capture waits for the lyrics and
+    /// model to load (1.4–8.8 s measured), so lines sung before it can't be heard on any play.
+    static let playFromStartReach = 12.0
 
     /// `anchors` are lines aligned on an earlier play (line ID -> sung span in track time): they are not
     /// aligned again, and bound the lines between them.
@@ -256,6 +259,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private func startNewRunIfNeeded(for request: AudioSyncManager.AudioChunkRequest) {
         let contiguous = expectedNextChunkStart.map { abs($0 - request.chunkStartTime) <= 0.5 } ?? false
         if !contiguous || abs(request.playbackRate - runRate) > 0.001 {
+            if request.chunkStartTime <= Self.playFromStartReach {
+                done.formUnion(lines.indices.filter { lines[$0].start < request.chunkStartTime })
+            }
             runStartTime = request.chunkStartTime
             runRate = request.playbackRate
             history.removeAll()
