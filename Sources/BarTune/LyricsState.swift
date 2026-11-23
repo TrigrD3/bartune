@@ -331,6 +331,7 @@ final class LyricsState: ObservableObject {
         static let lineTransitionDuration = "bartune.lineTransitionDuration"
         static let lineTransitionStartsEarly = "bartune.lineTransitionStartsEarly"
         static let wordPopEnabled = "bartune.wordPopEnabled"
+        static let typingCaretEnabled = "bartune.typingCaretEnabled"
         static let visualizerColorTheme = "bartune.visualizerColorTheme"
         static let visualizerWidth = "bartune.visualizerWidth"
         static let fontSize = "bartune.fontSize"
@@ -459,6 +460,10 @@ final class LyricsState: ObservableObject {
 
     @Published var wordPopEnabled: Bool {
         didSet { userDefaults.set(wordPopEnabled, forKey: Keys.wordPopEnabled) }
+    }
+
+    @Published var typingCaretEnabled: Bool {
+        didSet { userDefaults.set(typingCaretEnabled, forKey: Keys.typingCaretEnabled) }
     }
 
     private var lineTransitionLead: Double {
@@ -714,6 +719,7 @@ final class LyricsState: ObservableObject {
         )
         self.lineTransitionStartsEarly = ud.object(forKey: Keys.lineTransitionStartsEarly) as? Bool ?? false
         self.wordPopEnabled = ud.object(forKey: Keys.wordPopEnabled) as? Bool ?? false
+        self.typingCaretEnabled = ud.object(forKey: Keys.typingCaretEnabled) as? Bool ?? false
         if let raw = ud.string(forKey: Keys.visualizerStyle), let parsed = VisualizerStyle(rawValue: raw) {
             self.visualizerStyle = parsed
         } else {
@@ -1181,6 +1187,28 @@ final class LyricsState: ObservableObject {
         let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
         let position = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
         return Self.wordPop(words: line.words, boundaries: boundaries, position: position)
+    }
+
+    /// True when no word is being sung at `position` (the typing caret blinks then).
+    static func isWaitingForWord(line: LyricLine, nextTimestamp: Double, position: Double) -> Bool {
+        guard !line.words.isEmpty else {
+            return position < line.timestamp
+                || computeLineProgress(line: line, nextTimestamp: nextTimestamp, position: position) >= 1
+        }
+        let lineEnd = line.duration.map { line.timestamp + $0 } ?? nextTimestamp
+        for (i, word) in line.words.enumerated() {
+            let fallbackEnd = (i + 1 < line.words.count) ? line.words[i + 1].timestamp : lineEnd
+            let wordEnd = word.duration.map { word.timestamp + $0 } ?? fallbackEnd
+            if position >= word.timestamp, position < wordEnd { return false }
+        }
+        return true
+    }
+
+    func liveIsWaitingForWord(at date: Date) -> Bool {
+        guard isPlaying, let line = activeLine else { return true }
+        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
+        let position = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
+        return Self.isWaitingForWord(line: line, nextTimestamp: activeLineNextTimestamp, position: position)
     }
 
     private struct BoundaryKey: Equatable {
