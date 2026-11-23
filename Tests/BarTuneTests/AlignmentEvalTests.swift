@@ -65,58 +65,101 @@ final class AlignmentEvalTests: XCTestCase {
             .sorted()
         XCTAssertFalse(stems.isEmpty, "No songs in \(path)/wav")
 
-        var totals = (lrc: Errors(), firstPlay: Errors(), replay: Errors(), lineEnds: Errors())
+        var totals = (lrc: Errors(), firstPlay: Errors(), replay: Errors(), lineEnds: Errors(), locked: Errors())
         var alignedLines = 0
+        var lockedLines = 0
         var totalLines = 0
+        var syncedSongs = 0
+        var playsByLock: [Int] = []
         for stem in stems {
             let song = try Self.loadSong(stem, from: dir)
             let lrcLines = Self.lrcLines(for: song)
-            let snapshots = try await Self.liveSession(song, lrcLines: lrcLines)
-            let final = try XCTUnwrap(snapshots.last).lines
+
+            // Play the song again, carrying locked lines over, until a play could lock nothing more.
+            var locked: [Int: LyricLine] = [:]
+            var attempted = Set<Int>()
+            var plays: [Play] = []
+            var progress = AudioSyncManager.lyricsAlignmentProgress(lockedIDs: [], settledIDs: [], lines: lrcLines)
+            while plays.count < Self.maxPlays {
+                let play = try await Self.liveSession(song, lrcLines: lrcLines, locked: locked)
+                plays.append(play)
+                let lockedBefore = locked.count
+                locked.merge(play.locked) { old, _ in old }
+                attempted = locked.count == lockedBefore ? attempted.union(play.attempted) : play.attempted
+                let settled = locked.count == lockedBefore ? attempted : []
+                progress = AudioSyncManager.lyricsAlignmentProgress(lockedIDs: Set(locked.keys), settledIDs: settled, lines: lrcLines)
+                if progress.isFinished { break }
+            }
+            let snapshots = try XCTUnwrap(plays.first).snapshots
+            let final = try XCTUnwrap(plays.last?.snapshots.last).lines
             let aligned = AudioSyncManager.alignedLineIDs(in: final).count
+            let synced = progress.lockedLines == progress.totalLines
+            if synced { syncedSongs += 1 }
+            playsByLock.append(plays.count)
 
             let lrc = await Self.errors(song, snapshots: [Snapshot(availableAt: 0, lines: lrcLines)])
             let firstPlay = await Self.errors(song, snapshots: snapshots)
             let replay = await Self.errors(song, snapshots: [Snapshot(availableAt: 0, lines: final)])
             let lineEnds = await Self.lineEndErrors(song, lines: final)
+            var lockedStarts = Errors()
+            lockedStarts.values = locked.values.compactMap { line in line.words.first.map { $0.timestamp - song.wordStarts[line.id][0] } }
             totals.lrc.add(lrc)
             totals.firstPlay.add(firstPlay)
             totals.replay.add(replay)
             totals.lineEnds.add(lineEnds)
+            totals.locked.add(lockedStarts)
             alignedLines += aligned
-            totalLines += song.lines.count
-            print("EVAL \(stem): aligned \(aligned)/\(song.lines.count) lines")
+            lockedLines += progress.lockedLines
+            totalLines += progress.totalLines
+            let perPlay = plays.map { String($0.locked.count) }.joined(separator: "+")
+            print("EVAL \(stem): aligned \(aligned)/\(song.lines.count), locked \(progress.lockedLines)/\(progress.totalLines) "
+                + "over \(plays.count) plays (\(perPlay))\(synced ? ", synced" : progress.isFinished ? ", settled" : "")")
             print("EVAL   LRC only    \(lrc.summary)")
             print("EVAL   first play  \(firstPlay.summary)")
             print("EVAL   replay      \(replay.summary)")
             print("EVAL   line ends   \(lineEnds.summary)")
+            print("EVAL   locked      \(lockedStarts.summary)")
         }
-        print("EVAL ALL \(stems.count) songs: aligned \(alignedLines)/\(totalLines) lines")
+        print("EVAL ALL \(stems.count) songs: aligned \(alignedLines)/\(totalLines) lines, locked \(lockedLines), "
+            + "\(syncedSongs) synced, plays \(playsByLock.map(String.init).joined(separator: " "))")
         print("EVAL   LRC only    \(totals.lrc.summary)")
         print("EVAL   first play  \(totals.firstPlay.summary)")
         print("EVAL   replay      \(totals.replay.summary)")
         print("EVAL   line ends   \(totals.lineEnds.summary)")
+        print("EVAL   locked      \(totals.locked.summary)")
     }
 
     // MARK: - Session
 
-    /// Plays `song` through the engine as `AudioSyncManager` does on a first play with no cache: whole
-    /// chunks only, every word heard so far refined and aligned after each one, and lines accepted
-    /// during the session kept (`currentAlignment` and `applyLyricsAlignment`).
-    private static func liveSession(_ song: Song, lrcLines: [LyricLine]) async throws -> [Snapshot] {
-        let launched = await LyricsAlignerModel.launch(lines: lrcLines)
+    /// Plays past which the eval stops replaying a song that keeps locking lines.
+    private static let maxPlays = 5
+
+    private struct Play {
+        let snapshots: [Snapshot]
+        /// Lines locked on this play.
+        let locked: [Int: LyricLine]
+        let attempted: Set<Int>
+    }
+
+    /// Plays `song` through the engine as `AudioSyncManager` does: whole chunks, then the rest of the audio
+    /// as the final chunk, every word heard so far refined and aligned after each one, lines `locked` on
+    /// earlier plays kept as they are, and confident lines locked (`currentAlignment` and `applyLyricsAlignment`).
+    private static func liveSession(_ song: Song, lrcLines: [LyricLine], locked: [Int: LyricLine]) async throws -> Play {
+        let launched = await LyricsAlignerModel.launch(lines: lrcLines, anchors: locked.compactMapValues(AudioSyncManager.sungSpan))
         let engine = try XCTUnwrap(launched, "The Lyrics Alignment model isn't installed (Settings → Audio Sync)")
         defer { engine.shutdown() }
+        let reporter = try XCTUnwrap(engine as? LineAttemptReporting)
 
-        var snapshots = [Snapshot(availableAt: 0, lines: lrcLines)]
+        var snapshots = [Snapshot(availableAt: 0, lines: lrcLines.map { locked[$0.id] ?? $0 })]
         var envelope = VocalEnvelope()
-        var heard: [RecognizedAudioWord] = []
+        var heard = AudioSyncManager.recognizedWords(of: Array(locked.values))
         var accepted: [Int: LyricLine] = [:]
+        var lockedNow: [Int: LyricLine] = [:]
         var bestMatchedCount = 0
         let chunkLength = Int(chunkSeconds) * sampleRate
         var start = 0
-        while start + chunkLength <= song.mid.count {
-            let range = start..<(start + chunkLength)
+        while start < song.mid.count {
+            let range = start..<min(start + chunkLength, song.mid.count)
             let startTime = Double(start) / Double(sampleRate)
             let mid = Array(song.mid[range])
             envelope.append(mid: mid, side: Array(song.side[range]), sampleRate: Double(sampleRate), startTime: startTime, rate: 1)
@@ -124,23 +167,30 @@ final class AlignmentEvalTests: XCTestCase {
                 samples: AudioLevel.normalizedForRecognition(mid),
                 sampleRate: sampleRate,
                 chunkStartTime: startTime,
-                playbackRate: 1
+                playbackRate: 1,
+                isFinal: range.upperBound == song.mid.count
             ))
             start += chunkLength
 
-            let refined = WaveformTimingRefiner.refine(heard, envelope: envelope, timingError: 0.06).words
+            let refined = WaveformTimingRefiner.refine(heard.sorted { $0.startTime < $1.startTime }, envelope: envelope, timingError: 0.06).words
             let result = LyricsAudioAligner.align(lines: lrcLines, recognizedWords: refined, regroupsCJKWords: false)
             let matchedNow = Set(result.matchedLineIDs)
-            let matched = matchedNow.union(accepted.keys)
+            let frozen = locked.merging(lockedNow) { old, _ in old }
+            let matched = matchedNow.union(accepted.keys).union(frozen.keys)
+            var shown = result.lines.map { frozen[$0.id] ?? (matchedNow.contains($0.id) ? $0 : accepted[$0.id] ?? $0) }
+            let confident = reporter.confidentLineIDs
+            for line in shown where matched.contains(line.id) && confident.contains(line.id) && frozen[line.id] == nil {
+                lockedNow[line.id] = line
+            }
+            shown = shown.map { locked[$0.id] ?? lockedNow[$0.id] ?? $0 }
             guard !matched.isEmpty, matched.count >= bestMatchedCount else { continue }
-            let shown = result.lines.map { matchedNow.contains($0.id) ? $0 : accepted[$0.id] ?? $0 }
             for line in shown where matched.contains(line.id) {
                 accepted[line.id] = line
             }
             bestMatchedCount = matched.count
-            snapshots.append(Snapshot(availableAt: Double(start) / Double(sampleRate), lines: shown))
+            snapshots.append(Snapshot(availableAt: Double(min(start, song.mid.count)) / Double(sampleRate), lines: shown))
         }
-        return snapshots
+        return Play(snapshots: snapshots, locked: lockedNow, attempted: reporter.attemptedLineIDs)
     }
 
     // MARK: - Scoring

@@ -381,7 +381,7 @@ struct LyricsOverlayView: View {
     private func handleBadgeAutoDismiss(for status: AudioSyncStatus) {
         badgeDismissTask?.cancel()
         badgeDismissTask = nil
-        if case .cached = status {
+        if status.isFinished {
             hideSyncedBadge = false
             badgeDismissTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 3_500_000_000)
@@ -451,7 +451,7 @@ struct LyricsOverlayView: View {
                 if state.showSyncBadge, let badge = state.audioSyncStatus.overlayBadge {
                     SyncStatusBadgeView(
                         badge: badge,
-                        compact: badge.isSynced && hideSyncedBadge,
+                        compact: !badge.isAnimating && hideSyncedBadge,
                         foreground: syncBadgeForegroundColor(isSynced: badge.isSynced),
                         background: syncBadgeBackgroundColor(isSynced: badge.isSynced),
                         lowCPUMode: state.lowCPUMode
@@ -497,16 +497,16 @@ private struct SyncStatusBadgeView: View {
     let lowCPUMode: Bool
 
     var body: some View {
-        if compact && badge.isSynced {
+        if compact && !badge.isAnimating {
             Image(systemName: badge.symbolName)
                 .font(.system(size: 10.5, weight: .semibold))
-                .foregroundStyle(Color.green)
+                .foregroundStyle(badge.isSynced ? Color.green : foreground)
                 .transition(.opacity.combined(with: .scale(scale: 0.85)))
         } else {
-            TimelineView(.animation(minimumInterval: lowCPUMode ? 0.30 : 0.12, paused: badge.isSynced)) { timeline in
+            TimelineView(.animation(minimumInterval: lowCPUMode ? 0.30 : 0.12, paused: !badge.isAnimating)) { timeline in
                 let t = timeline.date.timeIntervalSinceReferenceDate
-                let pulse = badge.isSynced ? 1.0 : (0.55 + 0.45 * abs(sin(t * 3.2)))
-                let iconScale = badge.isSynced ? 1.0 : (0.88 + 0.16 * abs(sin(t * 3.2)))
+                let pulse = badge.isAnimating ? (0.55 + 0.45 * abs(sin(t * 3.2))) : 1.0
+                let iconScale = badge.isAnimating ? (0.88 + 0.16 * abs(sin(t * 3.2))) : 1.0
                 let dotPhase = Int(t * 2.2) % 3
 
                 HStack(spacing: 3) {
@@ -518,7 +518,7 @@ private struct SyncStatusBadgeView: View {
                     Text(badge.text)
                         .font(.system(size: 10, weight: .medium))
 
-                    if !badge.isSynced {
+                    if badge.isAnimating {
                         HStack(spacing: 1.5) {
                             ForEach(0..<3, id: \.self) { idx in
                                 Circle()
@@ -539,7 +539,7 @@ private struct SyncStatusBadgeView: View {
                 )
                 .overlay(
                     Capsule(style: .continuous)
-                        .strokeBorder(foreground.opacity(badge.isSynced ? 0.28 : (0.18 + 0.22 * pulse)), lineWidth: 0.5)
+                        .strokeBorder(foreground.opacity(badge.isAnimating ? (0.18 + 0.22 * pulse) : 0.28), lineWidth: 0.5)
                 )
             }
         }

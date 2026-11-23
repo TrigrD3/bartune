@@ -292,9 +292,12 @@ protocol CTCAcousticModel: AnyObject, Sendable {
 
 /// Aligns the known lyrics to captured audio instead of transcribing it. Each chunk is scored in a window
 /// that ends with it; a line is aligned once audio covering its LRC time ± `lineWindow` has been scored.
-/// An engine that knows which lyric lines it has had the audio for, aligned or not.
+/// An engine that reports which lyric lines it had the audio for, and which of them it aligned confidently.
 protocol LineAttemptReporting: AnyObject {
+    /// Lines whose full audio window was heard, aligned or not; not the anchors.
     var attemptedLineIDs: Set<Int> { get }
+    /// Aligned lines whose words the model heard clearly enough to lock.
+    var confidentLineIDs: Set<Int> { get }
 }
 
 final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
@@ -317,6 +320,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private let lock = NSLock()
     private var done = Set<Int>()
     private let anchoredIndices: Set<Int>
+    private var confident = Set<Int>()
 
     // The current run of contiguous audio; a seek or rate change starts a new one.
     private var runStartTime = 0.0
@@ -328,15 +332,15 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private var committedFrames = 0
     /// End of the last aligned word in this run; later lines can't start before it.
     private var alignedUntilFrame = 0
-    /// Onset minus LRC time of every line kept so far, across runs.
+    /// Onset minus LRC time of every anchor and confident line so far, across runs.
     private var lineOffsets: [Double] = []
     /// A line whose onset strays this far from the song's median offset is dropped, so it keeps its LRC time.
     private let maxOffsetDeviation = 1.0
+    /// A line whose words average at least this confidence is locked. Tuned on JamendoLyrics (English):
+    /// 93% of such lines start within 300 ms of the sung onset, against 70% of all aligned lines.
+    static let lockConfidence = 0.15
 
     static let sampleRate = 16000
-    /// A run starting this early is a play from the song's start: capture waits for the lyrics and
-    /// model to load (1.4–8.8 s measured), so lines sung before it can't be heard on any play.
-    static let playFromStartReach = 12.0
 
     /// `anchors` are lines aligned on an earlier play (line ID -> sung span in track time): they are not
     /// aligned again, and bound the lines between them.
@@ -394,11 +398,16 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         lineOffsets = offsets
     }
 
-    /// Lines this engine has had the full audio window for, whether they aligned or not; not the anchors.
     var attemptedLineIDs: Set<Int> {
         lock.lock()
         defer { lock.unlock() }
         return Set(done.subtracting(anchoredIndices).map { lines[$0].id })
+    }
+
+    var confidentLineIDs: Set<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(confident.map { lines[$0].id })
     }
 
     // swiftlint:disable:next async_without_await
@@ -411,8 +420,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         lock.lock()
         defer { lock.unlock() }
         startNewRunIfNeeded(for: request)
-        try score(request.samples)
-        return alignReadyLines()
+        try score(request.samples, holdingBack: !request.isFinal)
+        return alignReadyLines(throughEnd: request.isFinal)
     }
 
     func shutdown() {}
@@ -432,9 +441,6 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private func startNewRunIfNeeded(for request: AudioSyncManager.AudioChunkRequest) {
         let contiguous = expectedNextChunkStart.map { abs($0 - request.chunkStartTime) <= 0.5 } ?? false
         if !contiguous || abs(request.playbackRate - runRate) > 0.001 {
-            if request.chunkStartTime <= Self.playFromStartReach {
-                done.formUnion(lines.indices.filter { lines[$0].start < request.chunkStartTime })
-            }
             runStartTime = request.chunkStartTime
             runRate = request.playbackRate
             history.removeAll()
@@ -448,8 +454,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     }
 
     /// Scores the window ending with `samples` and keeps the frames not yet kept, except the newest
-    /// `holdBack`, which wait for the next window so they have audio on both sides.
-    private func score(_ samples: [Float]) throws {
+    /// `holdBack`, which wait for the next window so they have audio on both sides (unless no window follows).
+    private func score(_ samples: [Float], holdingBack: Bool) throws {
         let windowSize = model.windowSampleCount
         history.append(contentsOf: samples)
         if history.count > windowSize { history.removeFirst(history.count - windowSize) }
@@ -466,14 +472,17 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let logProbs = try model.logProbabilities(window: window)
         let frameCount = model.frameCount
         let windowStartFrame = Int((Double(runSamples - windowSize) / Double(windowSize) * Double(frameCount)).rounded())
-        let keepEnd = Int((Double(windowSize - holdBackSamples) / Double(windowSize) * Double(frameCount)).rounded())
+        let heldBack = holdingBack ? holdBackSamples : 0
+        let keepEnd = Int((Double(windowSize - heldBack) / Double(windowSize) * Double(frameCount)).rounded())
         let keepStart = max(0, committedFrames - windowStartFrame)
         guard keepEnd > keepStart else { return }
         frames.append(contentsOf: logProbs[(keepStart * model.vocabSize)..<(keepEnd * model.vocabSize)])
         committedFrames += keepEnd - keepStart
     }
 
-    private func alignReadyLines() -> [RecognizedAudioWord] {
+    /// `throughEnd`: the run's audio ends here (the track's last chunk), so every line still ahead is aligned
+    /// with what was heard.
+    private func alignReadyLines(throughEnd: Bool = false) -> [RecognizedAudioWord] {
         let coveredStart = trackTime(ofRunFrame: 0)
         let coveredEnd = trackTime(ofRunFrame: committedFrames)
         var batch: [Int] = []
@@ -481,12 +490,13 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let line = lines[index]
             // A line that began before this run's audio is left for a later play.
             guard line.start >= coveredStart else { continue }
-            guard line.end + lineWindow <= coveredEnd else { break }
+            guard throughEnd ? line.start < coveredEnd : line.end + lineWindow <= coveredEnd else { break }
             batch.append(index)
         }
         // The newest ready line is only context, so the line before it can't stretch into its audio;
         // a line right before an aligned one is already bounded by it.
-        let keep = batch.last.map { $0 == lines.count - 1 || done.contains($0 + 1) } == true ? batch.count : batch.count - 1
+        let lastIsBounded = batch.last.map { throughEnd || $0 == lines.count - 1 || done.contains($0 + 1) } == true
+        let keep = lastIsBounded ? batch.count : batch.count - 1
         guard keep > 0 else { return [] }
         done.formUnion(batch.prefix(keep))
         if let words = align(batch, keeping: keep) { return words }
@@ -576,20 +586,25 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         min(line.end + lineWindow, line.upperBound)
     }
 
-    /// Words the model barely hears (a shout under backing vocals, say) can land seconds off; such a
-    /// line is dropped once enough lines give the song's offset to compare it with.
+    /// Words the model barely hears (a shout under backing vocals, say) can land seconds off. A confident
+    /// line is kept and sets the song's offset; any other line is dropped when it strays from that offset.
     private func dropUnreliableLines(_ words: [RecognizedAudioWord], lineOf wordLines: [Int]) -> [RecognizedAudioWord] {
         var dropped = Set<Int>()
         for (index, line) in wordLines.enumerated() where index == 0 || wordLines[index - 1] != line {
+            let confidences = zip(words, wordLines).filter { $0.1 == line }.map(\.0.confidence)
+            let meanConfidence = confidences.reduce(0, +) / Double(confidences.count)
             let offset = words[index].startTime - lines[line].start
+            if meanConfidence >= Self.lockConfidence {
+                confident.insert(line)
+                lineOffsets.append(offset)
+                continue
+            }
             if lineOffsets.count >= 4 {
                 let median = lineOffsets.sorted()[lineOffsets.count / 2]
                 if abs(offset - median) > maxOffsetDeviation {
                     dropped.insert(line)
-                    continue
                 }
             }
-            lineOffsets.append(offset)
         }
         return zip(words, wordLines).filter { !dropped.contains($0.1) }.map(\.0)
     }

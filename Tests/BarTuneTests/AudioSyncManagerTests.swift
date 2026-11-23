@@ -476,7 +476,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ]
         cache.save(AudioSyncedLyricsRecord(
             trackId: sampleTrack().id, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.7,
-            alignedLineCount: 2, sourceLineCount: 3, lines: saved
+            alignedLineCount: 2, sourceLineCount: 3, lines: saved, lockedLineIDs: [0, 1]
         ))
         let anchorsSeen = LockedBox<[Int: ClosedRange<Double>]>([:])
         let lineTwo = ["Epsilon", "zeta"].enumerated().map { index, word in
@@ -536,7 +536,41 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
-    func testLyricsAlignmentIsDoneAfterOnePlayListenedForEveryLine() async throws {
+    func testLyricsAlignmentListensAgainForALineItHeardButCouldNotAlign() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        // The play covers every line, but only two align.
+        let words = ["Alpha", "beta", "Gamma", "delta"].enumerated().map { index, word in
+            RecognizedAudioWord(text: word, startTime: [10.7, 11.1, 15.7, 16.1][index], duration: 0.3, confidence: 0.5)
+        }
+        let launches = LockedBox<[Set<Int>]>([])
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, anchors in
+            launches.withLock { $0.append(Set(anchors.keys)) }
+            return FakeChunkEngine { _ in words }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let saved = await waitUntil { cache.load(trackId: self.sampleTrack().id)?.alignedLineCount == 2 }
+        XCTAssertTrue(saved)
+        XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 2, totalLines: 3))
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        let relaunched = await waitUntil { launches.withLock { $0.count } == 2 }
+        XCTAssertTrue(relaunched, "the next play listens again for the line that did not align")
+        XCTAssertEqual(launches.withLock { $0.last }, [0, 1], "the aligned lines are kept as they are")
+    }
+
+    @MainActor
+    func testLyricsAlignmentShowsAnUnconfidentLineButDoesNotLockIt() async throws {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
@@ -545,30 +579,131 @@ final class AudioSyncManagerTests: XCTestCase {
         let words = ["Alpha", "beta", "Gamma", "delta"].enumerated().map { index, word in
             RecognizedAudioWord(text: word, startTime: [10.7, 11.1, 15.7, 16.1][index], duration: 0.3, confidence: 0.5)
         }
-        // The engine had the audio for every line but could only align two.
-        let engine = FakeAttemptingEngine(words: words, attempted: [0, 1, 2])
-        let launches = LockedBox<Int>(0)
+        let anchorsSeen = LockedBox<[Set<Int>]>([])
         let fakeCapture = FakeAudioCapture()
         var deps = makeDependencies(capture: fakeCapture)
         deps.chunkDurationSeconds = 1.0
-        deps.launchLyricsAligner = { _, _ in
-            launches.withLock { $0 += 1 }
-            return engine
+        deps.launchLyricsAligner = { _, anchors in
+            anchorsSeen.withLock { $0.append(Set(anchors.keys)) }
+            return FakeChunkEngine(confident: [0]) { _ in words }
         }
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
         _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
 
         fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
-        let done = await waitUntil { state.audioSyncStatus == .cached(.lyricsAlignment) }
-        XCTAssertTrue(done, "a line listened for once is not listened for again")
-        XCTAssertFalse(manager.isLiveSyncActive)
+        let saved = await waitUntil { cache.load(trackId: self.sampleTrack().id)?.lockedLineIDs == [0] }
+        XCTAssertTrue(saved)
         let record = try XCTUnwrap(cache.load(trackId: sampleTrack().id))
-        XCTAssertEqual(record.checkedLineIDs, [2])
+        XCTAssertEqual(record.lines[1].words.first?.timestamp, 15.7, "line 1's alignment is shown")
 
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
-        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
-        XCTAssertEqual(launches.withLock { $0 }, 1, "the next play loads the saved sync without listening")
+        let relaunched = await waitUntil { anchorsSeen.withLock { $0.count } == 2 }
+        XCTAssertTrue(relaunched)
+        XCTAssertEqual(anchorsSeen.withLock { $0.last }, [0], "only the locked line is kept as it is")
+    }
+
+    @MainActor
+    func testLyricsAlignmentSettlesOnceAPlayLocksNothingNew() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        // An earlier play locked lines 0 and 1, so line 2 is worth another listen.
+        let saved = [
+            LyricLine(id: 0, timestamp: 10.7, text: "Alpha beta", words: [WordTimestamp(timestamp: 10.7, duration: 0.7, text: "Alpha beta")]),
+            LyricLine(id: 1, timestamp: 15.7, text: "Gamma delta", words: [WordTimestamp(timestamp: 15.7, duration: 0.7, text: "Gamma delta")]),
+            LyricLine(id: 2, timestamp: 20.0, text: "Epsilon zeta"),
+        ]
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: sampleTrack().id, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.7,
+            alignedLineCount: 2, sourceLineCount: 3, lines: saved, lockedLineIDs: [0, 1], attemptedLineIDs: [], lockedAtPlayStart: 0
+        ))
+        let launches = LockedBox<Int>(0)
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, _ in
+            launches.withLock { $0 += 1 }
+            return FakeChunkEngine(attempted: [2], confident: []) { _ in [] }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // This play hears line 2 again and locks nothing: the same audio would do the same next time.
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let settled = await waitUntil { state.audioSyncStatus == .settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3) }
+        XCTAssertTrue(settled, "status \(state.audioSyncStatus)")
+        XCTAssertFalse(manager.isLiveSyncActive)
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        XCTAssertEqual(state.audioSyncStatus, .settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3))
+        XCTAssertEqual(launches.withLock { $0 }, 1, "a settled song isn't listened for again")
+    }
+
+    @MainActor
+    func testLyricsAlignmentSendsTheRestOfTheAudioAsTheFinalChunkAtTheTrackEnd() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 178.2 // the track is 180 s long
+        state.playbackAnchorDate = Date()
+        let requests = LockedBox<[(samples: Int, isFinal: Bool)]>([])
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine { request in
+                requests.withLock { $0.append((request.samples.count, request.isFinal)) }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 30), sampleRate: 100) // up to 178.5 s
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 60), sampleRate: 100) // up to 179.1 s
+        let sent = await waitUntil { !requests.withLock { $0.isEmpty } }
+        XCTAssertTrue(sent, "audio within a second of the end is sent without waiting for a whole chunk")
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100)
+        _ = await waitUntil(timeout: 0.2) { requests.withLock { $0.count } > 1 }
+
+        let sentRequests = requests.withLock { $0 }
+        XCTAssertEqual(sentRequests.map(\.samples), [90])
+        XCTAssertEqual(sentRequests.map(\.isFinal), [true])
+    }
+
+    @MainActor
+    func testResyncCurrentTrackPreservesTrackDurationForFinalChunk() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 178.2 // the track is 180 s long
+        state.playbackAnchorDate = Date()
+        let requests = LockedBox<[(samples: Int, isFinal: Bool)]>([])
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine { request in
+                requests.withLock { $0.append((request.samples.count, request.isFinal)) }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
+
+        manager.resyncCurrentTrack()
+        let restarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 2 }
+        XCTAssertTrue(restarted)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 90), sampleRate: 100) // up to 179.1 s
+        let sent = await waitUntil { !requests.withLock { $0.isEmpty } }
+        XCTAssertTrue(sent, "resyncCurrentTrack must keep activeTrackDuration so final chunks still flush")
+        XCTAssertEqual(requests.withLock { $0.map(\.isFinal) }, [true])
     }
 
     @MainActor
@@ -584,38 +719,74 @@ final class AudioSyncManagerTests: XCTestCase {
         let fakeCapture = FakeAudioCapture()
         var deps = makeDependencies(capture: fakeCapture)
         deps.chunkDurationSeconds = 1.0
-        deps.launchLyricsAligner = { _, _ in FakeAttemptingEngine(words: words, attempted: [0, 1]) }
+        deps.launchLyricsAligner = { _, _ in FakeChunkEngine { _ in words } }
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
         _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
 
         fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
-        let saved = await waitUntil { cache.load(trackId: sampleTrack().id)?.checkedLineIDs == [1] }
+        let saved = await waitUntil { cache.load(trackId: sampleTrack().id)?.alignedLineCount == 1 }
         XCTAssertTrue(saved)
         XCTAssertTrue(manager.isLiveSyncActive, "line 2 has not been heard yet")
         XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 1, totalLines: 3))
     }
 
-    func testLyricsAlignmentCountsLinesInTheUnreachedTailOnceTheRestIsDone() {
+    func testLyricsAlignmentProgressCountsLockedLinesAndFinishesOnceTheRestAreSettled() {
         let lines = [
             LyricLine(id: 0, timestamp: 10.0, text: "Alpha"),
             LyricLine(id: 1, timestamp: 20.0, text: "Beta"),
             LyricLine(id: 2, timestamp: 40.0, text: "Omega"),
             LyricLine(id: 3, timestamp: 44.0, text: "♪"),
         ]
-        XCTAssertTrue(AudioSyncManager.lyricsAlignmentIsComplete(alignedIDs: [0], checkedIDs: [1], lines: lines, trackDuration: 60))
+        let all = AudioSyncManager.lyricsAlignmentProgress(lockedIDs: [0, 1, 2], settledIDs: [], lines: lines)
+        XCTAssertEqual(all, .init(lockedLines: 3, totalLines: 3, isFinished: true), "♪ has nothing to align")
+        XCTAssertEqual(all.status(engine: .lyricsAlignment), .cached(.lyricsAlignment))
+
+        let settled = AudioSyncManager.lyricsAlignmentProgress(lockedIDs: [0, 1], settledIDs: [2], lines: lines)
+        XCTAssertEqual(settled, .init(lockedLines: 2, totalLines: 3, isFinished: true))
+        XCTAssertEqual(settled.status(engine: .lyricsAlignment), .settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3))
+
         XCTAssertFalse(
-            AudioSyncManager.lyricsAlignmentIsComplete(alignedIDs: [0], lines: lines, trackDuration: 60),
-            "line 1 is not in the tail"
+            AudioSyncManager.lyricsAlignmentProgress(lockedIDs: [0, 1], settledIDs: [], lines: lines).isFinished,
+            "line 2 has not been heard since the locked set last grew"
         )
-        XCTAssertFalse(
-            AudioSyncManager.lyricsAlignmentIsComplete(alignedIDs: [0, 1], lines: lines, trackDuration: 0),
-            "with no known duration there is no tail"
+
+        let unsupported = [
+            LyricLine(id: 0, timestamp: 10.0, text: "Привет мир"),
+            LyricLine(id: 1, timestamp: 20.0, text: "Как дела"),
+        ]
+        XCTAssertEqual(
+            AudioSyncManager.lyricsAlignmentProgress(lockedIDs: [], settledIDs: [], lines: unsupported),
+            .init(lockedLines: 0, totalLines: 0, isFinished: false),
+            "tracks with no alignable letters must not report finished"
         )
-        XCTAssertFalse(
-            AudioSyncManager.lyricsAlignmentIsComplete(alignedIDs: [0, 1], lines: lines, trackDuration: 120),
-            "line 2 is reachable in a longer song"
-        )
+    }
+
+    @MainActor
+    func testLyricsAlignmentStopsWithUnavailableWhenNoLinesAreReadable() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.chunkDurationSeconds = 1.0
+        deps.launchLyricsAligner = { _, _ in FakeChunkEngine { _ in [] } }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        let cyrillicLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "Привет мир"),
+            LyricLine(id: 1, timestamp: 15.0, text: "Как дела"),
+        ]
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: cyrillicLines)
+        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+
+        fakeCapture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let stopped = await waitUntil { !manager.isLiveSyncActive }
+        XCTAssertTrue(stopped)
+        guard case .unavailable = state.audioSyncStatus else {
+            XCTFail("Expected .unavailable for unreadable script, got \(state.audioSyncStatus)")
+            return
+        }
     }
 
     @MainActor
@@ -1117,6 +1288,15 @@ final class AudioSyncManagerTests: XCTestCase {
         }
     }
 
+    /// `tenLines()` as Lyrics Alignment saves them once every line is aligned.
+    private func alignedTenLines() -> [LyricLine] {
+        tenLines().map { line in
+            LyricLine(id: line.id, timestamp: line.timestamp, text: line.text, words: [
+                WordTimestamp(timestamp: line.timestamp, duration: 1.0, text: line.text),
+            ])
+        }
+    }
+
     /// Words for the given lines as the aligner would report them, at track time 10 + 3 s per line.
     private func heardWords(lines range: Range<Int>) -> [RecognizedAudioWord] {
         range.flatMap { index in
@@ -1260,10 +1440,12 @@ final class AudioSyncManagerTests: XCTestCase {
 
         // Play 2 catches the remaining lines 4..<10.
         _ = await hear(heardWords(lines: 4..<10), manager: manager, capture: capture, feed: feed)
-        let completed = await waitUntil { state.audioSyncStatus == .cached(.lyricsAlignment) }
+        let saved = await waitUntil { cache.load(trackId: self.sampleTrack().id)?.alignedLineCount == 10 }
 
-        XCTAssertTrue(completed, "4 earlier + 6 new lines reach 10/10; status \(state.audioSyncStatus)")
-        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 10)
+        XCTAssertTrue(saved, "4 earlier + 6 new lines reach 10/10")
+        // The record predates locking, so its lines are kept on screen but not locked until heard again.
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.lockedLineIDs, Array(4..<10))
+        XCTAssertTrue(manager.isLiveSyncActive)
     }
 
     @MainActor
@@ -1289,7 +1471,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         cache.save(AudioSyncedLyricsRecord(
             trackId: sampleTrack().id, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.2,
-            alignedLineCount: 10, sourceLineCount: 10, lines: tenLines(), checkedLineIDs: Array(0..<10)
+            alignedLineCount: 10, sourceLineCount: 10, lines: alignedTenLines(), lockedLineIDs: Array(0..<10)
         ))
 
         let (manager, _, capture, state) = startTenLineSync(cache: cache)
@@ -1341,7 +1523,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let trackB = TrackInfo(id: "spotify:track:second", title: "Second Song", artist: "Artist B", album: "", duration: 200, artworkURL: nil)
         cache.save(AudioSyncedLyricsRecord(
             trackId: trackB.id, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.0,
-            alignedLineCount: 10, sourceLineCount: 10, lines: tenLines(), checkedLineIDs: Array(0..<10)
+            alignedLineCount: 10, sourceLineCount: 10, lines: alignedTenLines(), lockedLineIDs: Array(0..<10)
         ))
         manager.handleTrackLoaded(track: trackB, rawLines: tenLines())
         XCTAssertNil(manager.diagnostics.snapshot, "switching to a cached track must clear the previous track's diagnostics")
@@ -1870,14 +2052,23 @@ private enum FakeChunkEngineError: Error {
     case exited
 }
 
-private final class FakeChunkEngine: AudioChunkTranscribing, @unchecked Sendable {
+/// Reports every line as aligned confidently unless `confident` says otherwise.
+private final class FakeChunkEngine: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
     private let handler: @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]
     private let shutdowns = LockedBox<Int>(0)
+    let attemptedLineIDs: Set<Int>
+    let confidentLineIDs: Set<Int>
 
     var shutdownCount: Int { shutdowns.withLock { $0 } }
 
-    init(transcribe handler: @escaping @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]) {
+    init(
+        attempted: Set<Int> = [],
+        confident: Set<Int> = Set(0..<100),
+        transcribe handler: @escaping @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]
+    ) {
         self.handler = handler
+        attemptedLineIDs = attempted
+        confidentLineIDs = confident
     }
 
     // swiftlint:disable:next async_without_await
@@ -1956,25 +2147,4 @@ private final class LockedBox<Value>: @unchecked Sendable {
         defer { lock.unlock() }
         return body(&value)
     }
-}
-
-private final class FakeAttemptingEngine: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
-    private let words: [RecognizedAudioWord]
-    private let attempted: Set<Int>
-    private let calls = LockedBox<Int>(0)
-
-    init(words: [RecognizedAudioWord], attempted: Set<Int>) {
-        self.words = words
-        self.attempted = attempted
-    }
-
-    var attemptedLineIDs: Set<Int> { calls.withLock { $0 } > 0 ? attempted : [] }
-
-    // swiftlint:disable:next async_without_await
-    func transcribe(_: AudioSyncManager.AudioChunkRequest) async -> [RecognizedAudioWord] {
-        calls.withLock { $0 += 1 }
-        return words
-    }
-
-    func shutdown() {}
 }
