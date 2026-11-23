@@ -77,84 +77,29 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.lines[2].timestamp, 32.0, accuracy: 0.05)
     }
 
-    func testWhisperJSONParserMergesSubwordsAndSkipsSpecialTokens() throws {
-        let json = """
-        {
-          "segments": [
-            {
-              "start": 0.0,
-              "end": 2.5,
-              "text": " Hello world",
-              "words": [
-                { "word": "[_BEG_]", "start": 0.0, "end": 0.0, "probability": 1.0 },
-                { "word": " Hel", "start": 0.2, "end": 0.45, "probability": 0.8 },
-                { "word": "lo", "start": 0.45, "end": 0.7, "probability": 0.9 },
-                { "word": " world", "start": 0.8, "end": 1.4, "probability": 0.95 },
-                { "word": "[BLANK_AUDIO]", "start": 1.5, "end": 2.0, "probability": 0.5 }
-              ]
-            }
-          ]
-        }
-        """
-        let data = try XCTUnwrap(json.data(using: .utf8))
-        let words = WhisperJSONParser.parse(data: data, chunkStartTime: 10.0)
-        XCTAssertEqual(words.count, 2)
-        XCTAssertEqual(words[0].text, "Hello")
-        XCTAssertEqual(words[0].startTime, 10.2, accuracy: 0.001)
-        XCTAssertEqual(words[0].duration, 0.5, accuracy: 0.001)
-        XCTAssertEqual(words[1].text, "world")
-        XCTAssertEqual(words[1].startTime, 10.8, accuracy: 0.001)
-        XCTAssertEqual(words[1].duration, 0.6, accuracy: 0.001)
-    }
-
-    func testWhisperJSONParserScalesInChunkOffsetsByPlaybackRate() throws {
-        let json = """
-        {
-          "segments": [
-            {
-              "start": 0.0,
-              "end": 2.0,
-              "text": " Hello",
-              "words": [
-                { "word": " Hello", "start": 1.0, "end": 1.5, "probability": 0.9 }
-              ]
-            },
-            { "start": 3.0, "end": 4.0, "text": " plain words" }
-          ]
-        }
-        """
-        let data = try XCTUnwrap(json.data(using: .utf8))
-        let words = WhisperJSONParser.parse(data: data, chunkStartTime: 20.0, playbackRate: 2.0)
-        XCTAssertEqual(words.map(\.text), ["Hello", "plain", "words"])
-        guard words.count == 3 else { return }
-        XCTAssertEqual(words[0].startTime, 22.0, accuracy: 0.001)
-        XCTAssertEqual(words[0].duration, 1.0, accuracy: 0.001)
-        XCTAssertEqual(words[1].startTime, 26.0, accuracy: 0.001)
-        XCTAssertEqual(words[1].duration, 1.0, accuracy: 0.001)
-        XCTAssertEqual(words[2].startTime, 27.0, accuracy: 0.001)
-    }
-
-    func testAudioSyncedLyricsCacheDiscardsAppleSpeechRecords() throws {
+    func testAudioSyncedLyricsCacheDiscardsRemovedEngineRecords() throws {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
-        cache.save(
-            AudioSyncedLyricsRecord(
-                trackId: "spotify:track:apple",
-                engine: .whisper,
-                syncedAt: Date(),
-                medianOffset: 0.1,
-                alignedLineCount: 1,
-                lines: [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+        for removedEngine in ["appleSpeech", "whisper"] {
+            let trackId = "spotify:track:\(removedEngine)"
+            cache.save(
+                AudioSyncedLyricsRecord(
+                    trackId: trackId,
+                    engine: .lyricsAlignment,
+                    syncedAt: Date(),
+                    medianOffset: 0.1,
+                    alignedLineCount: 1,
+                    lines: [LyricLine(id: 0, timestamp: 1.0, text: "Line")]
+                )
             )
-        )
-        let url = try XCTUnwrap(
-            FileManager.default.contentsOfDirectory(at: tempDir, includingPropertiesForKeys: nil)
-                .first { $0.pathExtension == "json" }
-        )
-        let json = try String(contentsOf: url, encoding: .utf8)
-        try json.replacingOccurrences(of: "\"whisper\"", with: "\"appleSpeech\"").write(to: url, atomically: true, encoding: .utf8)
+            let url = cache.fileURL(forCacheKey: LyricsDiskCache.cacheKey(for: trackId))
+            let json = try String(contentsOf: url, encoding: .utf8)
+            try json
+                .replacingOccurrences(of: "\"lyricsAlignment\"", with: "\"\(removedEngine)\"")
+                .write(to: url, atomically: true, encoding: .utf8)
 
-        XCTAssertNil(cache.load(trackId: "spotify:track:apple"))
-        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+            XCTAssertNil(cache.load(trackId: trackId))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
     }
 
     func testAudioSyncedLyricsCacheRoundTripAndClear() {
@@ -173,7 +118,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         ]
         let record = AudioSyncedLyricsRecord(
             trackId: "spotify:track:sync-test",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(timeIntervalSince1970: 1_700_000_000),
             medianOffset: 0.4,
             alignedLineCount: 1,
@@ -194,40 +139,6 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(cache.stats().count, 0)
     }
 
-    func testWhisperModelLocatorDiscoversAndDeduplicatesSharedModels() throws {
-        let fakeHome = tempDir.appendingPathComponent("home", isDirectory: true)
-        let sharedDir = fakeHome.appendingPathComponent(".cache/whisper", isDirectory: true)
-        let hfDir = fakeHome.appendingPathComponent(".cache/huggingface/hub/models--ggerganov--whisper.cpp/snapshots/abc", isDirectory: true)
-        try FileManager.default.createDirectory(at: sharedDir, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: hfDir, withIntermediateDirectories: true)
-
-        let tinyModel = sharedDir.appendingPathComponent("ggml-tiny.bin")
-        let baseModel = hfDir.appendingPathComponent("ggml-base.bin")
-        let symlinkDuplicate = hfDir.appendingPathComponent("ggml-tiny.bin")
-        try Data(repeating: 1, count: 64).write(to: tinyModel)
-        try Data(repeating: 2, count: 128).write(to: baseModel)
-        try FileManager.default.createSymbolicLink(at: symlinkDuplicate, withDestinationURL: tinyModel)
-
-        let models = WhisperModelLocator.discoverModels(
-            customPath: nil,
-            environment: [:],
-            homeDirectory: fakeHome
-        )
-
-        let names = Set(models.map(\.name))
-        XCTAssertEqual(names, ["ggml-tiny.bin", "ggml-base.bin"])
-        // Symlink duplicate pointing to ggml-tiny.bin must be deduplicated.
-        XCTAssertEqual(models.count, 2)
-    }
-
-    func testWAVEncoderHeaderAndSize() {
-        let samples: [Float] = [0.0, 0.5, -0.5, 1.0]
-        let wav = WAVEncoder.encodeMono16BitPCM(samples: samples, sampleRate: 16000)
-        XCTAssertEqual(wav.count, 44 + samples.count * 2)
-        XCTAssertEqual(String(data: wav.prefix(4), encoding: .ascii), "RIFF")
-        XCTAssertEqual(String(data: wav.subdata(in: 8..<12), encoding: .ascii), "WAVE")
-    }
-
     @MainActor
     func testLyricsStatePersistsAudioSyncSettings() throws {
         let suiteName = "bartune.test.audiosync.\(UUID().uuidString)"
@@ -236,14 +147,11 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: ud)
         XCTAssertEqual(state.audioSyncEngine, .off)
-        XCTAssertEqual(state.whisperModelPath, "")
 
-        state.audioSyncEngine = .whisper
-        state.whisperModelPath = "/tmp/ggml-base.bin"
+        state.audioSyncEngine = .lyricsAlignment
 
         let reloaded = LyricsState(userDefaults: ud)
-        XCTAssertEqual(reloaded.audioSyncEngine, .whisper)
-        XCTAssertEqual(reloaded.whisperModelPath, "/tmp/ggml-base.bin")
+        XCTAssertEqual(reloaded.audioSyncEngine, .lyricsAlignment)
     }
 
     @MainActor
@@ -253,7 +161,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
 
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let track = TrackInfo(
@@ -280,7 +188,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         cache.save(
             AudioSyncedLyricsRecord(
                 trackId: track.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0.4,
                 alignedLineCount: 1,
@@ -293,7 +201,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         manager.handleTrackLoaded(track: track, rawLines: rawLines)
 
         XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
         XCTAssertEqual(state.rawLyricLines, cachedLines)
     }
 
@@ -325,15 +233,15 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertNil(AudioSyncStatus.permissionRequired("Needed").overlayBadge)
         XCTAssertNil(AudioSyncStatus.unavailable("Missing").overlayBadge)
 
-        let cachedBadge = AudioSyncStatus.cached(.whisper).overlayBadge
+        let cachedBadge = AudioSyncStatus.cached(.lyricsAlignment).overlayBadge
         XCTAssertEqual(cachedBadge?.text, "Synced")
         XCTAssertEqual(cachedBadge?.isSynced, true)
 
-        let listeningBadge = AudioSyncStatus.syncing(engine: .whisper, alignedLines: 0, totalLines: 10).overlayBadge
+        let listeningBadge = AudioSyncStatus.syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 10).overlayBadge
         XCTAssertEqual(listeningBadge?.text, "Listening")
         XCTAssertEqual(listeningBadge?.isSynced, false)
 
-        let syncingBadge = AudioSyncStatus.syncing(engine: .whisper, alignedLines: 3, totalLines: 10).overlayBadge
+        let syncingBadge = AudioSyncStatus.syncing(engine: .lyricsAlignment, alignedLines: 3, totalLines: 10).overlayBadge
         XCTAssertEqual(syncingBadge?.text, "Syncing")
         XCTAssertEqual(syncingBadge?.isSynced, false)
     }
@@ -382,31 +290,19 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
     // MARK: - #139: Japanese recognizer output arrives as characters or whole phrases
 
-    /// Per-character tokens as whisper-server returned them for synthesized Japanese speech.
-    private let japaneseWhisperTokens: [(String, Double, Double)] = [
+    /// Per-character tokens for synthesized Japanese speech.
+    private let japaneseCharacterTokens: [(String, Double, Double)] = [
         ("見", 0.00, 0.18), ("つ", 0.18, 0.31), ("け", 0.31, 0.39), ("出", 0.39, 0.52), ("して", 0.52, 0.86),
         ("く", 0.86, 0.92), ("れた", 0.92, 1.19), ("忘", 2.38, 2.51), ("れる", 2.51, 2.92), ("こと", 2.92, 3.18),
         ("ない", 3.18, 3.44), ("君", 3.44, 3.64), ("の", 3.64, 3.84), ("笑", 3.84, 3.97), ("顔", 3.97, 4.30),
     ]
 
-    func testWhisperParserKeepsJapaneseTokensSeparate() throws {
-        let tokens = japaneseWhisperTokens.map { ["word": $0.0, "start": $0.1, "end": $0.2, "probability": 0.9] as [String: Any] }
-        let json: [String: Any] = ["segments": [["start": 0.0, "end": 4.3, "text": "見つけ出してくれた忘れることない君の笑顔", "words": tokens]]]
-        let data = try JSONSerialization.data(withJSONObject: json)
-
-        let words = WhisperJSONParser.parse(data: data, chunkStartTime: 20.0)
-
-        XCTAssertEqual(words.count, japaneseWhisperTokens.count)
-        XCTAssertEqual(words.first?.text, "見")
-        XCTAssertEqual(words.last?.startTime ?? 0, 23.97, accuracy: 0.001)
-    }
-
-    func testAlignsJapaneseLinesFromPerCharacterWhisperWords() {
+    func testAlignsJapaneseLinesFromPerCharacterWords() {
         let lines = [
             LyricLine(id: 0, timestamp: 20.3, text: "見つけ出してくれた"),
             LyricLine(id: 1, timestamp: 22.6, text: "忘れることない 君の笑顔"),
         ]
-        let recognized = japaneseWhisperTokens.map {
+        let recognized = japaneseCharacterTokens.map {
             RecognizedAudioWord(text: $0.0, startTime: 20.0 + $0.1, duration: $0.2 - $0.1, confidence: 0.9)
         }
 
@@ -478,7 +374,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
         state.replaceLyricsWithTranscription = false
 
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -508,7 +404,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         manager.handleTrackLoaded(track: track, rawLines: yrcLines)
 
         XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
     }
 
     func testTranscriptionOverwriteRejectsUnrelatedExternalSpeech() {
@@ -591,13 +487,6 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.lines[1].timestamp, 30.0, accuracy: 0.01)
     }
 
-    func testWhisperModelPresetsProvideValidDownloadURLs() {
-        XCTAssertEqual(WhisperModelPreset.allCases.count, 4)
-        for preset in WhisperModelPreset.allCases {
-            XCTAssertTrue(preset.downloadURL.absoluteString.hasSuffix(preset.rawValue))
-        }
-    }
-
     func testCachedRecordReliabilityRejectsSingleLinePartialMatchAndOutlierOffsets() {
         let lines = [
             LyricLine(id: 0, timestamp: 1.0, text: "Line one"),
@@ -607,7 +496,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let singleLinePartial = AudioSyncedLyricsRecord(
             trackId: "spotify:track:partial",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.2,
             alignedLineCount: 1,
@@ -617,7 +506,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let outlierOffset = AudioSyncedLyricsRecord(
             trackId: "spotify:track:outlier",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 9.85,
             alignedLineCount: 3,
@@ -627,7 +516,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let singleLineTranscriptOnly = AudioSyncedLyricsRecord(
             trackId: "spotify:track:transcript-partial",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.1,
             alignedLineCount: 1,
@@ -638,7 +527,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let reliable = AudioSyncedLyricsRecord(
             trackId: "spotify:track:good",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: -0.45,
             alignedLineCount: 2,
@@ -649,7 +538,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let duplicateTimestamp = AudioSyncedLyricsRecord(
             trackId: "spotify:track:dup",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: nil,
             alignedLineCount: 3,
@@ -788,7 +677,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         // Transcript-only mode omits unmatched lines; 2 matched lines of a 40-line song must NOT be reliable.
         let partialTranscript = AudioSyncedLyricsRecord(
             trackId: "spotify:track:partial-transcript-2-of-40",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.1,
             alignedLineCount: 2,
@@ -800,7 +689,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         // Complete transcript covering all source lines remains reliable.
         let completeTranscript = AudioSyncedLyricsRecord(
             trackId: "spotify:track:complete-transcript",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.1,
             alignedLineCount: 2,
@@ -812,7 +701,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         // Legacy cache (sourceLineCount == nil) with fewer lines than raw source must be rejected when validated.
         let legacyPartial = AudioSyncedLyricsRecord(
             trackId: "spotify:track:legacy-partial",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.1,
             alignedLineCount: 2,
@@ -905,7 +794,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         // Caches written before blank lines were clamped can hold a blank marker behind the previous lyric.
         let record = AudioSyncedLyricsRecord(
             trackId: "spotify:track:legacy-blank-order",
-            engine: .whisper,
+            engine: .lyricsAlignment,
             syncedAt: Date(),
             medianOffset: 0.2,
             alignedLineCount: 2,
@@ -946,7 +835,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         defer { ud.removePersistentDomain(forName: suiteName) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
 
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let track = TrackInfo(
@@ -982,7 +871,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         cache.save(
             AudioSyncedLyricsRecord(
                 trackId: track.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0.2,
                 alignedLineCount: 2,
@@ -1000,7 +889,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         manager.handleTrackLoaded(track: track, rawLines: [])
 
         XCTAssertFalse(manager.isLiveSyncActive)
-        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
         XCTAssertEqual(state.rawLyricLines, cachedLines)
         XCTAssertTrue(state.hasLyrics)
         state.updatePlayback(isPlaying: true, position: 5.5)
@@ -1016,11 +905,11 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertFalse(state.hasLyrics)
 
         // Unreliable surviving cache (e.g. partial transcript) must be evicted rather than applied offline.
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
         cache.save(
             AudioSyncedLyricsRecord(
                 trackId: track.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0.2,
                 alignedLineCount: 2,

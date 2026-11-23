@@ -412,43 +412,9 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
     }
 }
 
-enum WAVEncoder {
-    /// Encodes 16-bit mono PCM WAV data for whisper-server input.
-    static func encodeMono16BitPCM(samples: [Float], sampleRate: Int = 16000) -> Data {
-        let dataSize = samples.count * 2
-        var data = Data(capacity: 44 + dataSize)
-
-        func appendUInt32LE(_ value: UInt32) {
-            var le = value.littleEndian
-            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        }
-
-        func appendUInt16LE(_ value: UInt16) {
-            var le = value.littleEndian
-            withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
-        }
-
-        data.append(contentsOf: "RIFF".utf8)
-        appendUInt32LE(UInt32(36 + dataSize))
-        data.append(contentsOf: "WAVE".utf8)
-        data.append(contentsOf: "fmt ".utf8)
-        appendUInt32LE(16) // PCM chunk size
-        appendUInt16LE(1) // AudioFormat = PCM
-        appendUInt16LE(1) // NumChannels = 1
-        appendUInt32LE(UInt32(sampleRate))
-        appendUInt32LE(UInt32(sampleRate * 2)) // ByteRate
-        appendUInt16LE(2) // BlockAlign
-        appendUInt16LE(16) // BitsPerSample
-        data.append(contentsOf: "data".utf8)
-        appendUInt32LE(UInt32(dataSize))
-
-        for sample in samples {
-            let clamped = max(-1.0, min(1.0, sample))
-            var intSample = Int16(clamped * 32767.0).littleEndian
-            withUnsafeBytes(of: &intSample) { data.append(contentsOf: $0) }
-        }
-        return data
-    }
+protocol AudioChunkTranscribing: AnyObject, Sendable {
+    func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async throws -> [RecognizedAudioWord]
+    func shutdown()
 }
 
 @MainActor
@@ -457,14 +423,11 @@ final class AudioSyncManager {
         var capture: AudioCaptureProviding
         var hasScreenCaptureAccess: () -> Bool
         var requestScreenCaptureAccess: () -> Void
-        var locateWhisperServer: () -> String?
-        var resolveWhisperModelPath: @Sendable (String) -> String?
-        var launchWhisper: @Sendable (_ serverPath: String, _ modelPath: String) async -> WhisperTranscribing?
-        var whisperChunkDurationSeconds: Double
+        var chunkDurationSeconds: Double
         var launchLyricsAligner: @Sendable (
             _ lines: [LyricLine],
             _ anchors: [Int: ClosedRange<Double>]
-        ) async -> WhisperTranscribing? = {
+        ) async -> AudioChunkTranscribing? = {
             await LyricsAlignerModel.launch(lines: $0, anchors: $1)
         }
 
@@ -473,18 +436,7 @@ final class AudioSyncManager {
                 capture: SystemAudioCapture(),
                 hasScreenCaptureAccess: { CGPreflightScreenCaptureAccess() },
                 requestScreenCaptureAccess: { CGRequestScreenCaptureAccess() },
-                locateWhisperServer: { WhisperModelLocator.locateWhisperServer() },
-                resolveWhisperModelPath: { selected in
-                    let trimmed = selected.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty, FileManager.default.fileExists(atPath: trimmed) {
-                        return trimmed
-                    }
-                    return WhisperModelLocator.discoverModels(customPath: trimmed).first?.path
-                },
-                launchWhisper: { serverPath, modelPath in
-                    await WhisperServer.launch(serverPath: serverPath, modelPath: modelPath)
-                },
-                whisperChunkDurationSeconds: 12.0
+                chunkDurationSeconds: 12.0
             )
         }
     }
@@ -517,29 +469,25 @@ final class AudioSyncManager {
 
     private static let seekTolerance: Double = 2.0
 
-    // Whisper chunk state
-    private var whisperSampleBuffer: [Float] = []
-    private var whisperChunkStartPos: Double?
-    private var whisperChunkPlaybackRate: Double = 1.0
-    private var whisperPendingSeekPos: Double?
+    // Audio chunk state
+    private var audioSampleBuffer: [Float] = []
+    private var chunkStartPos: Double?
+    private var chunkPlaybackRate: Double = 1.0
+    private var pendingSeekPos: Double?
     /// Uptime of the last detected seek; deliveries captured before it hold pre-seek audio.
-    private var whisperSeekBoundary: TimeInterval = 0
+    private var seekBoundary: TimeInterval = 0
     /// Last playback state this manager saw; seeks are detected against it because `LyricsState` is updated first.
-    private var whisperLastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
-    private var whisperStartupTask: Task<Void, Never>?
-    private var whisperProcessingTask: Task<Void, Never>?
-    private var whisperEngine: WhisperTranscribing?
-    /// The engine this session's audio chunks go to: Whisper or lyrics alignment.
-    private var chunkEngine: AudioSyncEngine = .whisper
-    /// Lyric language passed to Whisper, so it doesn't guess per chunk.
-    private var whisperLanguage: String?
-    private var whisperSampleRate: Double = 16000.0
-    private var whisperCapturedSeconds: Double = 0
-    private var whisperChunkDurationSeconds: Double { dependencies.whisperChunkDurationSeconds }
+    private var lastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
+    private var alignerStartupTask: Task<Void, Never>?
+    private var chunkProcessingTask: Task<Void, Never>?
+    private var chunkEngine: AudioChunkTranscribing?
+    private var activeSampleRate: Double = 16000.0
+    private var capturedSeconds: Double = 0
+    private var chunkDurationSeconds: Double { dependencies.chunkDurationSeconds }
 
-    var bufferedWhisperSampleCount: Int { whisperSampleBuffer.count }
-    var currentWhisperChunkStartPos: Double? { whisperChunkStartPos }
-    var isWhisperProcessing: Bool { whisperProcessingTask != nil }
+    var bufferedSampleCount: Int { audioSampleBuffer.count }
+    var currentChunkStartPos: Double? { chunkStartPos }
+    var isChunkProcessing: Bool { chunkProcessingTask != nil }
 
     init(
         state: LyricsState,
@@ -559,18 +507,18 @@ final class AudioSyncManager {
         isLiveSyncActive = false
         capture.onAudioSamples = nil
         capture.stop()
-        whisperStartupTask?.cancel()
-        whisperStartupTask = nil
-        whisperProcessingTask?.cancel()
-        whisperProcessingTask = nil
-        whisperEngine?.shutdown()
-        whisperEngine = nil
-        whisperSampleBuffer.removeAll(keepingCapacity: false)
-        whisperChunkStartPos = nil
-        whisperChunkPlaybackRate = 1.0
-        whisperPendingSeekPos = nil
-        whisperLastPlayback = nil
-        whisperCapturedSeconds = 0
+        alignerStartupTask?.cancel()
+        alignerStartupTask = nil
+        chunkProcessingTask?.cancel()
+        chunkProcessingTask = nil
+        chunkEngine?.shutdown()
+        chunkEngine = nil
+        audioSampleBuffer.removeAll(keepingCapacity: false)
+        chunkStartPos = nil
+        chunkPlaybackRate = 1.0
+        pendingSeekPos = nil
+        lastPlayback = nil
+        capturedSeconds = 0
     }
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
@@ -672,10 +620,10 @@ final class AudioSyncManager {
         guard isLiveSyncActive, previousTargets != updatedTargets else { return }
         capture.stop()
         // Buffered samples belong to the old capture's timeline; the next sample starts a new chunk.
-        whisperSampleBuffer.removeAll(keepingCapacity: true)
-        whisperChunkStartPos = nil
+        audioSampleBuffer.removeAll(keepingCapacity: true)
+        chunkStartPos = nil
         // Deliveries still queued from the old capture must not start the new chunk.
-        whisperSeekBoundary = ProcessInfo.processInfo.systemUptime
+        seekBoundary = ProcessInfo.processInfo.systemUptime
         startCaptureForCurrentTarget(trackId: track.id, engine: state.audioSyncEngine, generation: syncGeneration)
     }
 
@@ -745,7 +693,7 @@ final class AudioSyncManager {
 
     func handlePlaybackStateChanged(isPlaying: Bool, position: Double, playbackRate: Double? = nil) {
         let resolvedRate = Self.sanitizedPlaybackRate(playbackRate ?? state.playbackRate)
-        discardWhisperChunkIfSeeked(to: position, playbackRate: resolvedRate, isPlaying: isPlaying)
+        discardChunkIfSeeked(to: position, playbackRate: resolvedRate, isPlaying: isPlaying)
         guard !isPlaying, isLiveSyncActive else { return }
         // Persist whatever alignment we gathered before pausing/stopping.
         persistCurrentAlignmentIfReady()
@@ -755,31 +703,31 @@ final class AudioSyncManager {
         (rate.isFinite && rate > 0) ? rate : 1.0
     }
 
-    private func discardWhisperChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
-        guard isLiveSyncActive, state.audioSyncEngine == chunkEngine else { return }
+    private func discardChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
+        guard isLiveSyncActive, state.audioSyncEngine == .lyricsAlignment else { return }
         let now = ProcessInfo.processInfo.systemUptime
-        let last = whisperLastPlayback
-        whisperLastPlayback = (position, now, playbackRate, isPlaying)
-        if let chunkStart = whisperChunkStartPos {
-            let bufferedDuration = whisperSampleRate > 0 ? Double(whisperSampleBuffer.count) / whisperSampleRate : 0
-            let expected = chunkStart + bufferedDuration * whisperChunkPlaybackRate
+        let last = lastPlayback
+        lastPlayback = (position, now, playbackRate, isPlaying)
+        if let chunkStart = chunkStartPos {
+            let bufferedDuration = activeSampleRate > 0 ? Double(audioSampleBuffer.count) / activeSampleRate : 0
+            let expected = chunkStart + bufferedDuration * chunkPlaybackRate
             let seeked = abs(position - expected) > Self.seekTolerance
-            let rateChanged = abs(playbackRate - whisperChunkPlaybackRate) > 0.01
+            let rateChanged = abs(playbackRate - chunkPlaybackRate) > 0.01
             if seeked || rateChanged {
-                whisperSampleBuffer.removeAll(keepingCapacity: true)
-                whisperChunkStartPos = nil
-                whisperChunkPlaybackRate = playbackRate
-                whisperPendingSeekPos = position
-                whisperSeekBoundary = ProcessInfo.processInfo.systemUptime
+                audioSampleBuffer.removeAll(keepingCapacity: true)
+                chunkStartPos = nil
+                chunkPlaybackRate = playbackRate
+                pendingSeekPos = position
+                seekBoundary = ProcessInfo.processInfo.systemUptime
             }
         } else if let last {
             let expected = last.position + (last.isPlaying ? (now - last.uptime) * last.rate : 0)
             let seeked = abs(position - expected) > Self.seekTolerance
             let rateChanged = abs(playbackRate - last.rate) > 0.01
             if seeked || rateChanged {
-                whisperPendingSeekPos = position
-                whisperChunkPlaybackRate = playbackRate
-                whisperSeekBoundary = now
+                pendingSeekPos = position
+                chunkPlaybackRate = playbackRate
+                seekBoundary = now
             }
         }
     }
@@ -813,11 +761,7 @@ final class AudioSyncManager {
         switch engine {
         case .off:
             state.audioSyncStatus = .idle
-        case .whisper:
-            chunkEngine = .whisper
-            startWhisperSync(track: track, lines: lines)
         case .lyricsAlignment:
-            chunkEngine = .lyricsAlignment
             startLyricsAlignmentSync(track: track, lines: lines)
         }
     }
@@ -832,71 +776,17 @@ final class AudioSyncManager {
         }
     }
 
-    private func startWhisperSync(track: TrackInfo, lines: [LyricLine]) {
-        guard let serverPath = dependencies.locateWhisperServer() else {
-            state.audioSyncStatus = .unavailable("whisper-server not found (install via: brew install whisper-cpp)")
-            return
-        }
-
-        let generation = syncGeneration
-        let selectedModelPath = state.whisperModelPath
-        let resolveModelPath = dependencies.resolveWhisperModelPath
-        let launchWhisper = dependencies.launchWhisper
-        whisperSampleBuffer.removeAll(keepingCapacity: true)
-        whisperChunkStartPos = nil
-        whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
-        whisperPendingSeekPos = nil
-        whisperLanguage = LyricsLanguageDetector.detectSpeechLocale(for: lines).language.languageCode?.identifier
-        state.audioSyncStatus = .syncing(engine: .whisper, alignedLines: 0, totalLines: lines.count)
-
-        whisperStartupTask = Task { [weak self] in
-            let resolvedModelPath = await Task.detached(priority: .utility) {
-                resolveModelPath(selectedModelPath)
-            }.value
-            guard let self,
-                  !Task.isCancelled,
-                  self.syncGeneration == generation,
-                  self.activeTrackId == track.id,
-                  self.state.audioSyncEngine == self.chunkEngine
-            else { return }
-            guard let modelPath = resolvedModelPath else {
-                self.whisperStartupTask = nil
-                self.state.audioSyncStatus = .unavailable("No Whisper GGML model found — pick or download one in Settings")
-                return
-            }
-            let engine = await launchWhisper(serverPath, modelPath)
-            guard !Task.isCancelled,
-                  self.syncGeneration == generation,
-                  self.activeTrackId == track.id,
-                  self.state.audioSyncEngine == self.chunkEngine
-            else {
-                engine?.shutdown()
-                return
-            }
-            self.whisperStartupTask = nil
-            guard let engine else {
-                self.state.audioSyncStatus = .unavailable("whisper-server could not load the Whisper model")
-                return
-            }
-            self.whisperEngine = engine
-            let language = self.whisperLanguage
-            self.diagnostics.update { $0.localeIdentifier = language ?? "auto (Whisper)" }
-            self.beginWhisperCapture(track: track, generation: generation)
-        }
-    }
-
     private func startLyricsAlignmentSync(track: TrackInfo, lines: [LyricLine]) {
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
-        whisperSampleBuffer.removeAll(keepingCapacity: true)
-        whisperChunkStartPos = nil
-        whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
-        whisperPendingSeekPos = nil
-        whisperLanguage = nil
+        audioSampleBuffer.removeAll(keepingCapacity: true)
+        chunkStartPos = nil
+        chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
+        pendingSeekPos = nil
         state.audioSyncStatus = .syncing(engine: .lyricsAlignment, alignedLines: anchoredLines.count, totalLines: lines.count)
 
         let anchors = anchoredLines.compactMapValues(Self.sungSpan)
-        whisperStartupTask = Task { [weak self] in
+        alignerStartupTask = Task { [weak self] in
             let engine = await launch(lines, anchors)
             guard let self,
                   !Task.isCancelled,
@@ -907,18 +797,18 @@ final class AudioSyncManager {
                 engine?.shutdown()
                 return
             }
-            self.whisperStartupTask = nil
+            self.alignerStartupTask = nil
             guard let engine else {
                 self.state.audioSyncStatus = .unavailable("Lyrics alignment model not installed, or this Mac has no Neural Engine")
                 return
             }
-            self.whisperEngine = engine
+            self.chunkEngine = engine
             self.diagnostics.update { $0.localeIdentifier = "lyrics alignment" }
-            self.beginWhisperCapture(track: track, generation: generation)
+            self.beginChunkCapture(track: track, generation: generation)
         }
     }
 
-    private func beginWhisperCapture(track: TrackInfo, generation: UInt64) {
+    private func beginChunkCapture(track: TrackInfo, generation: UInt64) {
         capture.onAudioSamples = { @Sendable [weak self] audio in
             // When the first sample was captured: the pre-extraction monotonic timestamp, else delivery minus delay.
             let capturedAt = audio.capturedAt ?? (ProcessInfo.processInfo.systemUptime - (audio.captureDelay ?? 0))
@@ -927,15 +817,15 @@ final class AudioSyncManager {
                       self.syncGeneration == generation,
                       self.isLiveSyncActive,
                       self.activeTrackId == track.id,
-                      self.state.audioSyncEngine == self.chunkEngine,
-                      capturedAt > self.whisperSeekBoundary
+                      self.state.audioSyncEngine == .lyricsAlignment,
+                      capturedAt > self.seekBoundary
                 else { return }
                 let samples = audio.samples
                 let sampleRate = audio.sampleRate
-                self.whisperSampleRate = sampleRate
+                self.activeSampleRate = sampleRate
                 if sampleRate > 0 {
-                    self.whisperCapturedSeconds += Double(samples.count) / sampleRate
-                    self.diagnostics.recordAudio(totalSeconds: self.whisperCapturedSeconds)
+                    self.capturedSeconds += Double(samples.count) / sampleRate
+                    self.diagnostics.recordAudio(totalSeconds: self.capturedSeconds)
                 }
                 if let delay = audio.captureDelay {
                     self.diagnostics.recordCaptureDelay(delay)
@@ -946,123 +836,117 @@ final class AudioSyncManager {
                     now: ProcessInfo.processInfo.systemUptime,
                     rate: self.state.isPlaying ? self.state.playbackRate : 0
                 )
-                if let existingStart = self.whisperChunkStartPos,
+                if let existingStart = self.chunkStartPos,
                    sampleRate > 0,
                    audio.captureDelay != nil || audio.capturedAt != nil {
                     let expectedStart = existingStart
-                        + Double(self.whisperSampleBuffer.count) / sampleRate * self.whisperChunkPlaybackRate
+                        + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
                     if abs(livePos - expectedStart) > Self.seekTolerance {
                         // Dropped audio gap: start a fresh chunk & envelope segment at the measured position.
-                        self.whisperSampleBuffer.removeAll(keepingCapacity: true)
-                        self.whisperChunkStartPos = livePos
-                        self.whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
+                        self.audioSampleBuffer.removeAll(keepingCapacity: true)
+                        self.chunkStartPos = livePos
+                        self.chunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
                     }
                 }
-                if self.whisperChunkStartPos == nil {
-                    if let pending = self.whisperPendingSeekPos {
-                        self.whisperPendingSeekPos = nil
-                        self.whisperChunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
+                if self.chunkStartPos == nil {
+                    if let pending = self.pendingSeekPos {
+                        self.pendingSeekPos = nil
+                        self.chunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
                     } else {
-                        self.whisperChunkStartPos = livePos
+                        self.chunkStartPos = livePos
                     }
-                    self.whisperChunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
+                    self.chunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
                 }
-                if let chunkStart = self.whisperChunkStartPos, sampleRate > 0 {
+                if let chunkStart = self.chunkStartPos, sampleRate > 0 {
                     let deliveryStart = chunkStart
-                        + Double(self.whisperSampleBuffer.count) / sampleRate * self.whisperChunkPlaybackRate
+                        + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
                     self.vocalEnvelope.append(
                         mid: samples,
                         side: audio.side,
                         sampleRate: sampleRate,
                         startTime: deliveryStart,
-                        rate: self.whisperChunkPlaybackRate
+                        rate: self.chunkPlaybackRate
                     )
                 }
-                self.whisperSampleBuffer.append(contentsOf: samples)
+                self.audioSampleBuffer.append(contentsOf: samples)
 
-                let targetFrames = max(1, Int(sampleRate * self.whisperChunkDurationSeconds))
+                let targetFrames = max(1, Int(sampleRate * self.chunkDurationSeconds))
                 let maxFrames = targetFrames * 2
-                if self.whisperSampleBuffer.count > maxFrames {
-                    let overflow = self.whisperSampleBuffer.count - maxFrames
-                    self.whisperSampleBuffer.removeFirst(overflow)
-                    if let startPos = self.whisperChunkStartPos, sampleRate > 0 {
-                        self.whisperChunkStartPos = startPos + (Double(overflow) / sampleRate) * self.whisperChunkPlaybackRate
+                if self.audioSampleBuffer.count > maxFrames {
+                    let overflow = self.audioSampleBuffer.count - maxFrames
+                    self.audioSampleBuffer.removeFirst(overflow)
+                    if let startPos = self.chunkStartPos, sampleRate > 0 {
+                        self.chunkStartPos = startPos + (Double(overflow) / sampleRate) * self.chunkPlaybackRate
                     }
                 }
 
-                self.dispatchWhisperChunkIfReady(trackId: track.id, generation: generation)
+                self.dispatchChunkIfReady(trackId: track.id, generation: generation)
             }
         }
 
         isLiveSyncActive = true
-        whisperLastPlayback = (
+        lastPlayback = (
             currentPlaybackPosition(),
             ProcessInfo.processInfo.systemUptime,
             Self.sanitizedPlaybackRate(state.playbackRate),
             state.isPlaying
         )
-        startCaptureForCurrentTarget(trackId: track.id, engine: chunkEngine, generation: generation)
+        startCaptureForCurrentTarget(trackId: track.id, engine: .lyricsAlignment, generation: generation)
     }
 
     /// Dispatches one `targetFrames` chunk when the worker is idle; called on sample delivery and worker completion.
-    private func dispatchWhisperChunkIfReady(trackId: String, generation: UInt64) {
+    private func dispatchChunkIfReady(trackId: String, generation: UInt64) {
         guard syncGeneration == generation,
               isLiveSyncActive,
               activeTrackId == trackId,
-              state.audioSyncEngine == chunkEngine,
-              whisperProcessingTask == nil,
-              let engine = whisperEngine
+              state.audioSyncEngine == .lyricsAlignment,
+              chunkProcessingTask == nil,
+              let engine = chunkEngine
         else { return }
-        let sampleRate = whisperSampleRate
-        let targetFrames = max(1, Int(sampleRate * whisperChunkDurationSeconds))
-        guard whisperSampleBuffer.count >= targetFrames else { return }
+        let sampleRate = activeSampleRate
+        let targetFrames = max(1, Int(sampleRate * chunkDurationSeconds))
+        guard audioSampleBuffer.count >= targetFrames else { return }
 
-        let chunk = AudioLevel.normalizedForRecognition(Array(whisperSampleBuffer.prefix(targetFrames)))
-        let chunkStart = whisperChunkStartPos ?? currentPlaybackPosition()
-        whisperSampleBuffer.removeFirst(targetFrames)
-        if whisperSampleBuffer.isEmpty {
-            whisperChunkStartPos = nil
+        let chunk = AudioLevel.normalizedForRecognition(Array(audioSampleBuffer.prefix(targetFrames)))
+        let chunkStart = chunkStartPos ?? currentPlaybackPosition()
+        audioSampleBuffer.removeFirst(targetFrames)
+        if audioSampleBuffer.isEmpty {
+            chunkStartPos = nil
         } else if sampleRate > 0 {
-            whisperChunkStartPos = chunkStart + (Double(targetFrames) / sampleRate) * whisperChunkPlaybackRate
+            chunkStartPos = chunkStart + (Double(targetFrames) / sampleRate) * chunkPlaybackRate
         }
 
-        let request = WhisperChunkRequest(
+        let request = AudioChunkRequest(
             samples: chunk,
             sampleRate: Int(sampleRate),
             chunkStartTime: chunkStart,
-            playbackRate: whisperChunkPlaybackRate,
-            language: whisperLanguage
+            playbackRate: chunkPlaybackRate
         )
-        whisperProcessingTask = Task { [weak self] in
+        chunkProcessingTask = Task { [weak self] in
             let words: [RecognizedAudioWord]
             do {
                 words = try await engine.transcribe(request)
             } catch {
                 guard let self, self.syncGeneration == generation else { return }
-                self.whisperProcessingTask = nil
+                self.chunkProcessingTask = nil
                 self.persistCurrentAlignmentIfReady()
                 self.stop()
-                self.state.audioSyncStatus = .unavailable("whisper-server stopped unexpectedly; it restarts with the next track")
+                self.state.audioSyncStatus = .unavailable("Lyrics alignment stopped unexpectedly; it restarts with the next track")
                 return
             }
             guard let self, self.syncGeneration == generation else { return }
-            self.whisperProcessingTask = nil
+            self.chunkProcessingTask = nil
             guard self.activeTrackId == trackId,
                   self.isLiveSyncActive,
-                  self.state.audioSyncEngine == self.chunkEngine
+                  self.state.audioSyncEngine == .lyricsAlignment
             else { return }
             self.diagnostics.update { $0.record(words: words, replacing: false) }
-            if self.chunkEngine == .lyricsAlignment {
-                self.recognizedWords.append(contentsOf: words)
-                if let reporter = engine as? LineAttemptReporting {
-                    self.checkedLineIDs.formUnion(reporter.attemptedLineIDs)
-                }
-                self.applyLyricsAlignment()
-            } else if !words.isEmpty {
-                self.recognizedWords.append(contentsOf: words)
-                self.applyAlignment(engine: self.chunkEngine)
+            self.recognizedWords.append(contentsOf: words)
+            if let reporter = engine as? LineAttemptReporting {
+                self.checkedLineIDs.formUnion(reporter.attemptedLineIDs)
             }
-            self.dispatchWhisperChunkIfReady(trackId: trackId, generation: generation)
+            self.applyLyricsAlignment()
+            self.dispatchChunkIfReady(trackId: trackId, generation: generation)
         }
     }
 
@@ -1096,11 +980,8 @@ final class AudioSyncManager {
         return Self.mergeHeardWords(prior: priorHeardWords, current: recognizedWords)
     }
 
-    /// Every word heard; Lyrics Alignment words are refined against this play's vocal envelope.
-    /// Whisper words are not: on annotated songs its sung word times are too far off for the envelope
-    /// to improve, and lengthening them made word ends worse.
+    /// Every word heard, refined against this play's vocal envelope.
     private func refinedHeardWords() -> [RecognizedAudioWord] {
-        guard chunkEngine == .lyricsAlignment else { return allHeardWords }
         let (words, stats) = WaveformTimingRefiner.refine(allHeardWords, envelope: vocalEnvelope, timingError: 0.06)
         diagnostics.update { $0.waveformRefinement = stats }
         return words
@@ -1113,9 +994,9 @@ final class AudioSyncManager {
             lines: baseLines,
             recognizedWords: refinedHeardWords(),
             replaceTextWithTranscription: state.replaceLyricsWithTranscription,
-            regroupsCJKWords: chunkEngine != .lyricsAlignment
+            regroupsCJKWords: false
         )
-        let preserved = chunkEngine == .lyricsAlignment ? acceptedSessionLines : [:]
+        let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !preserved.isEmpty else { return result }
         let resultMatched = Set(result.matchedLineIDs)
         let matched = resultMatched.union(anchoredLines.keys).union(preserved.keys)
@@ -1183,40 +1064,6 @@ final class AudioSyncManager {
         }
     }
 
-    private func applyAlignment(engine: AudioSyncEngine) {
-        guard !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
-        let result = currentAlignment()
-        let lines = baseLines
-        diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
-        AudioSyncDiagnosticsModel.logger.debug(
-            "Alignment: \(result.matchedLineCount, privacy: .public)/\(lines.count, privacy: .public) lines, \(self.recognizedWords.count, privacy: .public) words heard"
-        )
-        guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
-
-        cachedAlignedLineCount = result.matchedLineCount
-        state.applyAudioSyncedLines(result.lines)
-        state.audioSyncStatus = .syncing(
-            engine: engine,
-            alignedLines: result.matchedLineCount,
-            totalLines: baseLines.count
-        )
-
-        let nonEmptyCount = max(
-            1,
-            baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
-        )
-        let confidentThreshold = state.replaceLyricsWithTranscription
-            ? nonEmptyCount
-            : AudioSyncedLyricsRecord.linesNeededForCompletion(of: nonEmptyCount)
-        if result.matchedLineCount >= confidentThreshold {
-            persistAlignment(result, engine: engine)
-            stop()
-            state.audioSyncStatus = .cached(engine)
-        } else if result.matchedLineCount >= 1 {
-            persistAlignment(result, engine: engine)
-        }
-    }
-
     /// Lyrics Alignment keeps listening until every line is aligned or was listened for once (see
     /// `lyricsAlignmentIsComplete`), saving after each chunk so a later play only listens for the rest.
     private func applyLyricsAlignment() {
@@ -1277,35 +1124,11 @@ final class AudioSyncManager {
         cachedAlignedLineCount = max(cachedAlignedLineCount, result.matchedLineCount)
     }
 
-    struct WhisperChunkRequest: Sendable {
+    struct AudioChunkRequest: Sendable {
         let samples: [Float]
         let sampleRate: Int
         let chunkStartTime: Double
         /// Media seconds per recorded second, used to map in-chunk word offsets to track time.
         let playbackRate: Double
-        var language: String?
-    }
-
-    /// Downloads a GGML Whisper model preset into `~/.cache/whisper/` so other tools on the Mac can reuse it.
-    static func downloadSharedModel(_ preset: WhisperModelPreset = .tiny) async throws -> URL {
-        let dir = WhisperModelLocator.sharedCacheDirectory()
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let destURL = dir.appendingPathComponent(preset.rawValue)
-        if FileManager.default.fileExists(atPath: destURL.path) {
-            return destURL
-        }
-
-        let (tempURL, response) = try await URLSession.shared.download(from: preset.downloadURL)
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw NSError(domain: "BarTune.WhisperDownload", code: http.statusCode, userInfo: [
-                NSLocalizedDescriptionKey: "Download failed with HTTP \(http.statusCode)",
-            ])
-        }
-
-        if FileManager.default.fileExists(atPath: destURL.path) {
-            try FileManager.default.removeItem(at: destURL)
-        }
-        try FileManager.default.moveItem(at: tempURL, to: destURL)
-        return destURL
     }
 }

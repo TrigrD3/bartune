@@ -256,7 +256,7 @@ final class LyricsCacheTests: XCTestCase {
         syncCache.save(
             AudioSyncedLyricsRecord(
                 trackId: "spotify:track:modern",
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0.1,
                 alignedLineCount: 1,
@@ -275,7 +275,7 @@ final class LyricsCacheTests: XCTestCase {
         let modern = try XCTUnwrap(entries.first { $0.trackId == "spotify:track:modern" })
         XCTAssertEqual(modern.title, "Yoru ni Kakeru")
         XCTAssertEqual(modern.artist, "YOASOBI")
-        XCTAssertEqual(modern.syncEngine, .whisper)
+        XCTAssertEqual(modern.syncEngine, .lyricsAlignment)
 
         let legacy = try XCTUnwrap(entries.first { $0.cacheKey == legacyKey })
         XCTAssertEqual(legacy.title, "Legacy opening line")
@@ -410,14 +410,14 @@ final class LyricsCacheTests: XCTestCase {
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
         let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
         let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
         let track = TrackInfo(id: "spotify:track:cached-sync-offline", title: "Dusk", artist: "Iris", album: "", duration: 200, artworkURL: nil)
         let cachedLines = [LyricLine(id: 0, timestamp: 1, text: "Cached line")]
         syncCache.save(
             AudioSyncedLyricsRecord(
                 trackId: track.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0,
                 alignedLineCount: 1,
@@ -438,7 +438,7 @@ final class LyricsCacheTests: XCTestCase {
         await app.fetchTask?.value
 
         XCTAssertEqual(state.rawLyricLines.map(\.text), ["Cached line"], "A cached audio sync record must show while lookups fail")
-        XCTAssertEqual(state.audioSyncStatus, .cached(.whisper))
+        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
     }
 
     func testCancelledLookupStopsEarlyAndRetriesWhenOnline() async {
@@ -527,7 +527,7 @@ final class LyricsCacheTests: XCTestCase {
             syncCache.save(
                 AudioSyncedLyricsRecord(
                     trackId: track.id,
-                    engine: .whisper,
+                    engine: .lyricsAlignment,
                     syncedAt: Date(),
                     medianOffset: 0,
                     alignedLineCount: 1,
@@ -550,7 +550,7 @@ final class LyricsCacheTests: XCTestCase {
         syncCache.save(
             AudioSyncedLyricsRecord(
                 trackId: controlTrack.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0,
                 alignedLineCount: 1,
@@ -618,7 +618,7 @@ final class LyricsCacheTests: XCTestCase {
         syncCache.save(
             AudioSyncedLyricsRecord(
                 trackId: track1.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0,
                 alignedLineCount: 1,
@@ -632,7 +632,7 @@ final class LyricsCacheTests: XCTestCase {
         syncCache.save(
             AudioSyncedLyricsRecord(
                 trackId: track2.id,
-                engine: .whisper,
+                engine: .lyricsAlignment,
                 syncedAt: Date(),
                 medianOffset: 0,
                 alignedLineCount: 1,

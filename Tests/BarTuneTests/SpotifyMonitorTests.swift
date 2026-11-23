@@ -421,17 +421,15 @@ final class SpotifyMonitorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
 
         let fakeCapture = MonitorFakeAudioCapture()
         let syncDeps = AudioSyncManager.Dependencies(
             capture: fakeCapture,
             hasScreenCaptureAccess: { true },
             requestScreenCaptureAccess: {},
-            locateWhisperServer: { "/usr/local/bin/whisper-server" },
-            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
-            launchWhisper: { _, _ in MonitorFakeWhisperEngine() },
-            whisperChunkDurationSeconds: 12.0
+            chunkDurationSeconds: 12.0,
+            launchLyricsAligner: { _, _ in MonitorFakeAlignerEngine() }
         )
         let syncManager = AudioSyncManager(
             state: state,
@@ -506,17 +504,15 @@ final class SpotifyMonitorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let state = LyricsState(userDefaults: ud)
-        state.audioSyncEngine = .whisper
+        state.audioSyncEngine = .lyricsAlignment
 
         let fakeCapture = MonitorFakeAudioCapture()
         let syncDeps = AudioSyncManager.Dependencies(
             capture: fakeCapture,
             hasScreenCaptureAccess: { true },
             requestScreenCaptureAccess: {},
-            locateWhisperServer: { "/usr/local/bin/whisper-server" },
-            resolveWhisperModelPath: { _ in "/tmp/ggml-base.bin" },
-            launchWhisper: { _, _ in MonitorFakeWhisperEngine() },
-            whisperChunkDurationSeconds: 12.0
+            chunkDurationSeconds: 12.0,
+            launchLyricsAligner: { _, _ in MonitorFakeAlignerEngine() }
         )
         let syncManager = AudioSyncManager(
             state: state,
@@ -714,9 +710,9 @@ private final class MonitorFakeAudioCapture: AudioCaptureProviding {
     }
 }
 
-private final class MonitorFakeWhisperEngine: WhisperTranscribing {
+private final class MonitorFakeAlignerEngine: AudioChunkTranscribing {
     // swiftlint:disable:next async_without_await
-    func transcribe(_ request: AudioSyncManager.WhisperChunkRequest) async -> [RecognizedAudioWord] {
+    func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async -> [RecognizedAudioWord] {
         []
     }
     func shutdown() {}

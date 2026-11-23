@@ -350,7 +350,6 @@ final class LyricsState: ObservableObject {
         static let trackOffsets = "bartune.trackOffsets"
         static let trackLyricSources = "bartune.trackLyricSources"
         static let audioSyncEngine = "bartune.audioSyncEngine"
-        static let whisperModelPath = "bartune.whisperModelPath"
         static let replaceLyricsWithTranscription = "bartune.replaceLyricsWithTranscription"
         static let showSyncBadge = "bartune.showSyncBadge"
         static let lyricsColorPreset = "bartune.lyricsColorPreset"
@@ -537,10 +536,6 @@ final class LyricsState: ObservableObject {
 
     @Published var audioSyncEngine: AudioSyncEngine {
         didSet { userDefaults.set(audioSyncEngine.rawValue, forKey: Keys.audioSyncEngine) }
-    }
-
-    @Published var whisperModelPath: String {
-        didSet { userDefaults.set(whisperModelPath, forKey: Keys.whisperModelPath) }
     }
 
     @Published var replaceLyricsWithTranscription: Bool {
@@ -761,7 +756,6 @@ final class LyricsState: ObservableObject {
         } else {
             self.audioSyncEngine = .off
         }
-        self.whisperModelPath = ud.string(forKey: Keys.whisperModelPath) ?? ""
         self.replaceLyricsWithTranscription = ud.object(forKey: Keys.replaceLyricsWithTranscription) as? Bool ?? false
         self.showSyncBadge = ud.object(forKey: Keys.showSyncBadge) as? Bool ?? true
         if let rawPreset = ud.string(forKey: Keys.lyricsColorPreset),

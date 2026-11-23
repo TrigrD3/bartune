@@ -180,7 +180,7 @@ final class LyricsForcedAlignerTests: XCTestCase {
     func testEngineIgnoresAudioAtAnotherSampleRate() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
         let aligner = LyricsForcedAligner(lines: [LyricLine(id: 0, timestamp: 1, text: "ka")], model: model)
-        let words = try await aligner.transcribe(AudioSyncManager.WhisperChunkRequest(
+        let words = try await aligner.transcribe(AudioSyncManager.AudioChunkRequest(
             samples: [Float](repeating: 0.1, count: 48000), sampleRate: 48000, chunkStartTime: 0, playbackRate: 1
         ))
         XCTAssertTrue(words.isEmpty)
@@ -215,8 +215,8 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the old compiled model must be rebuilt from the new package")
     }
 
-    private func chunk(start: Double) -> AudioSyncManager.WhisperChunkRequest {
-        AudioSyncManager.WhisperChunkRequest(
+    private func chunk(start: Double) -> AudioSyncManager.AudioChunkRequest {
+        AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 }, sampleRate: 16000, chunkStartTime: start, playbackRate: 1
         )
     }

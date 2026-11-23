@@ -7,7 +7,7 @@ final class AudioSyncDiagnosticsTests: XCTestCase {
     }
 
     func testAppendedWordsKeepOnlyTheNewestUpToTheCap() {
-        var diagnostics = AudioSyncDiagnostics(engine: .whisper, trackDescription: "A — B")
+        var diagnostics = AudioSyncDiagnostics(engine: .lyricsAlignment, trackDescription: "A — B")
         let first = (0..<150).map { word("a\($0)", Double($0)) }
         let second = (150..<260).map { word("b\($0)", Double($0)) }
 
@@ -22,7 +22,7 @@ final class AudioSyncDiagnosticsTests: XCTestCase {
     }
 
     func testReplacingWordsResetsTheTotal() {
-        var diagnostics = AudioSyncDiagnostics(engine: .whisper, trackDescription: "A — B")
+        var diagnostics = AudioSyncDiagnostics(engine: .lyricsAlignment, trackDescription: "A — B")
         diagnostics.record(words: [word("one", 1), word("two", 2), word("three", 3)], replacing: true)
         diagnostics.record(words: [word("one", 1), word("two", 2)], replacing: true)
 
@@ -37,7 +37,7 @@ final class AudioSyncDiagnosticsTests: XCTestCase {
         ]
         let words = [word("hello", 10.4), word("world", 10.8), word("from", 11.1), word("test", 11.5)]
         let result = LyricsAudioAligner.align(lines: lines, recognizedWords: words)
-        var diagnostics = AudioSyncDiagnostics(engine: .whisper, trackDescription: "Artist — Song")
+        var diagnostics = AudioSyncDiagnostics(engine: .lyricsAlignment, trackDescription: "Artist — Song")
         diagnostics.localeIdentifier = "en-US"
 
         diagnostics.record(words: words, replacing: true)
