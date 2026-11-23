@@ -1062,8 +1062,10 @@ final class LyricsState: ObservableObject {
         isPlaying ? extrapolatedPlaybackPosition(at: date) - reportedPosition : nil
     }
 
-    func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0) {
-        let now = Date()
+    /// `sampledAt` is when the player reported `position`, if earlier than now (a poll's midpoint):
+    /// anchoring at the time the update arrives instead would leave the clock that far behind.
+    func updatePlayback(isPlaying: Bool, position: Double, playbackRate: Double = 1.0, sampledAt: Date? = nil) {
+        let now = sampledAt ?? Date()
         let predicted = extrapolatedPlaybackPosition(at: now)
         let keepsClock = isPlaying && self.isPlaying
             && playbackRate == self.playbackRate
