@@ -22,6 +22,24 @@ struct CustomLyricsRecord: Equatable, Codable, Sendable {
     let artist: String
     let savedAt: Date
     let lines: [LyricLine]
+    /// 0-based indices of lines whose end timestamp was explicitly set by the user (rather than Auto).
+    let explicitEndLineIndices: Set<Int>?
+
+    init(
+        trackId: String,
+        title: String,
+        artist: String,
+        savedAt: Date,
+        lines: [LyricLine],
+        explicitEndLineIndices: Set<Int>? = nil
+    ) {
+        self.trackId = trackId
+        self.title = title
+        self.artist = artist
+        self.savedAt = savedAt
+        self.lines = lines
+        self.explicitEndLineIndices = explicitEndLineIndices
+    }
 }
 
 enum CustomLyricsStoreError: LocalizedError, Equatable {

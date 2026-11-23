@@ -15,19 +15,24 @@ final class LyricTimingEditorModel: ObservableObject {
     private let customLyricsStore: CustomLyricsStore
     private let onSeek: (String, Double) -> Void
     private let onTogglePlayPause: (String) -> Void
-    private let onSelectSource: (TrackInfo, TrackLyricSource) -> Void
-    private let onSaveCustom: (TrackInfo, [LyricLine]) throws -> Void
-    private let onDeleteCustom: (TrackInfo) -> Void
+    private let onSelectSource: (TrackInfo, TrackLyricSource) -> [LyricLine]
+    private let onSaveCustom: (TrackInfo, [LyricLine], Set<Int>) throws -> Void
+    private let onDeleteCustom: (TrackInfo) -> [LyricLine]
+    private var baselineLines: [EditableLine] = []
     private var cancellables = Set<AnyCancellable>()
+
+    var hasUnsavedEdits: Bool {
+        session.lines != baselineLines
+    }
 
     init(
         state: LyricsState,
         customLyricsStore: CustomLyricsStore,
         onSeek: @escaping (String, Double) -> Void,
         onTogglePlayPause: @escaping (String) -> Void,
-        onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> Void,
-        onSaveCustom: @escaping (TrackInfo, [LyricLine]) throws -> Void,
-        onDeleteCustom: @escaping (TrackInfo) -> Void
+        onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> [LyricLine],
+        onSaveCustom: @escaping (TrackInfo, [LyricLine], Set<Int>) throws -> Void,
+        onDeleteCustom: @escaping (TrackInfo) -> [LyricLine]
     ) {
         self.state = state
         self.customLyricsStore = customLyricsStore
@@ -77,16 +82,19 @@ final class LyricTimingEditorModel: ObservableObject {
         )
 
         let startingLines = !state.rawLyricLines.isEmpty ? state.rawLyricLines : (customRecord?.lines ?? [])
-        session = LyricTimingSession(lines: startingLines)
+        let explicitEnds = (selectedSource == .custom) ? customRecord?.explicitEndLineIndices : nil
+        session = LyricTimingSession(lines: startingLines, explicitEndIndices: explicitEnds)
+        baselineLines = session.lines
         selectedLineId = session.lines.first?.id
     }
 
     func selectSource(_ source: TrackLyricSource) {
         guard let track = activeTrack else { return }
         selectedSource = source
-        onSelectSource(track, source)
-        // Reload lines to reflect the newly selected source when not actively stamping.
-        session = LyricTimingSession(lines: state.rawLyricLines)
+        let resolvedLines = onSelectSource(track, source)
+        let explicitEnds = (source == .custom) ? customLyricsStore.load(trackId: track.id)?.explicitEndLineIndices : nil
+        session = LyricTimingSession(lines: resolvedLines, explicitEndIndices: explicitEnds)
+        baselineLines = session.lines
         selectedLineId = session.lines.first?.id
         statusMessage = "Switched to \(source.title)."
     }
@@ -128,6 +136,7 @@ final class LyricTimingEditorModel: ObservableObject {
     struct PendingCustomSave: Equatable {
         let track: TrackInfo
         let lines: [LyricLine]
+        let explicitEndIndices: Set<Int>
     }
 
     /// Validates the draft for saving; returns the payload if valid, otherwise sets `statusMessage`.
@@ -146,7 +155,11 @@ final class LyricTimingEditorModel: ObservableObject {
             statusMessage = "Stamp at least one line before saving."
             return nil
         }
-        return PendingCustomSave(track: track, lines: built)
+        return PendingCustomSave(
+            track: track,
+            lines: built,
+            explicitEndIndices: session.explicitEndLineIndices
+        )
     }
 
     @discardableResult
@@ -154,9 +167,10 @@ final class LyricTimingEditorModel: ObservableObject {
         guard activeTrack?.id == pending.track.id else { return false }
         session.stopStamping()
         do {
-            try onSaveCustom(pending.track, pending.lines)
+            try onSaveCustom(pending.track, pending.lines, pending.explicitEndIndices)
             hasCustomLyrics = true
             selectedSource = .custom
+            baselineLines = session.lines
             statusMessage = "Saved Custom timing (\(pending.lines.count) lines)."
             return true
         } catch {
@@ -168,14 +182,15 @@ final class LyricTimingEditorModel: ObservableObject {
     func deleteCustomLyrics(for capturedTrack: TrackInfo) {
         guard activeTrack?.id == capturedTrack.id else { return }
         session.stopStamping()
-        onDeleteCustom(capturedTrack)
+        let fallbackLines = onDeleteCustom(capturedTrack)
         hasCustomLyrics = false
         selectedSource = LyricSourceResolver.effectiveSource(
             choice: state.lyricSourceChoice(for: capturedTrack.id),
             hasCustomLyrics: false,
             audioSyncEngine: state.audioSyncEngine
         )
-        session = LyricTimingSession(lines: state.rawLyricLines)
+        session = LyricTimingSession(lines: fallbackLines)
+        baselineLines = session.lines
         selectedLineId = session.lines.first?.id
         statusMessage = "Deleted Custom lyrics."
     }
@@ -194,6 +209,7 @@ struct LyricTimingEditorView: View {
     @State private var pasteBuffer = ""
     @State private var trackPendingDeletion: TrackInfo?
     @State private var pendingOverwriteSave: LyricTimingEditorModel.PendingCustomSave?
+    @State private var pendingSourceSwitch: TrackLyricSource?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -267,6 +283,26 @@ struct LyricTimingEditorView: View {
                 "This permanently replaces your previously saved Custom timing for \(pending.track.title)."
             )
         }
+        .alert(
+            "Discard Unsaved Changes?",
+            isPresented: Binding(
+                get: { pendingSourceSwitch != nil },
+                set: { if !$0 { pendingSourceSwitch = nil } }
+            ),
+            presenting: pendingSourceSwitch
+        ) { targetSource in
+            Button("Discard & Switch", role: .destructive) {
+                model.selectSource(targetSource)
+                pendingSourceSwitch = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingSourceSwitch = nil
+            }
+        } message: { targetSource in
+            Text(
+                "Switching to \(targetSource.title) will discard your unsaved lyric text and timing edits."
+            )
+        }
     }
 
     // MARK: - Header
@@ -331,7 +367,14 @@ struct LyricTimingEditorView: View {
 
                 Picker("Source", selection: Binding(
                     get: { model.selectedSource },
-                    set: { model.selectSource($0) }
+                    set: { newSource in
+                        guard newSource != model.selectedSource else { return }
+                        if model.hasUnsavedEdits {
+                            pendingSourceSwitch = newSource
+                        } else {
+                            model.selectSource(newSource)
+                        }
+                    }
                 )) {
                     ForEach(model.availableSources) { source in
                         Text(source.title).tag(source)
@@ -997,9 +1040,9 @@ final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
     private let customLyricsStore: CustomLyricsStore
     private let onSeek: (String, Double) -> Void
     private let onTogglePlayPause: (String) -> Void
-    private let onSelectSource: (TrackInfo, TrackLyricSource) -> Void
-    private let onSaveCustom: (TrackInfo, [LyricLine]) throws -> Void
-    private let onDeleteCustom: (TrackInfo) -> Void
+    private let onSelectSource: (TrackInfo, TrackLyricSource) -> [LyricLine]
+    private let onSaveCustom: (TrackInfo, [LyricLine], Set<Int>) throws -> Void
+    private let onDeleteCustom: (TrackInfo) -> [LyricLine]
 
     private var window: NSWindow?
     private var model: LyricTimingEditorModel?
@@ -1010,9 +1053,9 @@ final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
         customLyricsStore: CustomLyricsStore,
         onSeek: @escaping (String, Double) -> Void,
         onTogglePlayPause: @escaping (String) -> Void,
-        onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> Void,
-        onSaveCustom: @escaping (TrackInfo, [LyricLine]) throws -> Void,
-        onDeleteCustom: @escaping (TrackInfo) -> Void
+        onSelectSource: @escaping (TrackInfo, TrackLyricSource) -> [LyricLine],
+        onSaveCustom: @escaping (TrackInfo, [LyricLine], Set<Int>) throws -> Void,
+        onDeleteCustom: @escaping (TrackInfo) -> [LyricLine]
     ) {
         self.state = state
         self.customLyricsStore = customLyricsStore
@@ -1072,6 +1115,9 @@ final class LyricTimingEditorWindowController: NSObject, NSWindowDelegate {
                   event.modifierFlags.isDisjoint(with: [.command, .control, .option])
             else {
                 return event
+            }
+            if event.isARepeat {
+                return nil
             }
             model.stampNow()
             return nil

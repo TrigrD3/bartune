@@ -46,7 +46,7 @@ final class SpotifyMonitor {
         var executeNativeScript: @Sendable () -> String?
         var pollBrowser: @Sendable (Set<String>, Bool) -> PlaybackSnapshot?
         var executeTransportScript: @Sendable (String) -> Void
-        var executeBrowserCommand: @Sendable (PlaybackCommand, Set<String>) -> Void = { _, _ in }
+        var executeBrowserCommand: @Sendable (PlaybackCommand, Set<String>, String?) -> Void = { _, _, _ in }
 
         static func live() -> Dependencies {
             let spotifyScript = CompiledScriptBox(source: SpotifyMonitor.scriptSource)
@@ -67,8 +67,8 @@ final class SpotifyMonitor {
                         script.executeAndReturnError(&error)
                     }
                 },
-                executeBrowserCommand: { command, runningBundleIds in
-                    browserMonitor.sendCommand(command, runningBundleIds: runningBundleIds)
+                executeBrowserCommand: { command, runningBundleIds, expectedTrackId in
+                    browserMonitor.sendCommand(command, runningBundleIds: runningBundleIds, expectedTrackId: expectedTrackId)
                 }
             )
         }
@@ -224,7 +224,7 @@ final class SpotifyMonitor {
 
         scriptQueue.async { [weak self] in
             if routeToBrowser {
-                executeBrowserCommand(command, runningBundleIds)
+                executeBrowserCommand(command, runningBundleIds, expectedTrackId)
             } else if let source = scriptSource {
                 executeTransportScript(source)
             }
@@ -274,7 +274,7 @@ final class SpotifyMonitor {
             }
             if expectedTrackId.hasPrefix("spotify:") {
                 guard runningBundleIds.contains("com.spotify.client") else { return nil }
-                let spotifyId = escapeAppleScriptString(expectedTrackId)
+                let spotifyId = escapeAppleScriptString(String(expectedTrackId.dropFirst("spotify:".count)))
                 return """
                 tell application "Spotify"
                     if (id of current track as string) is "\(spotifyId)" then \(verb)
