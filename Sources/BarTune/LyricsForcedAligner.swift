@@ -1,5 +1,6 @@
 import CoreML
 import Foundation
+import os
 
 /// CTC Viterbi forced alignment: finds the most likely frames for a known token sequence.
 enum CTCForcedAlignment {
@@ -134,6 +135,23 @@ protocol LineAttemptReporting: AnyObject {
 }
 
 final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
+    /// What happened to a line once its audio was aligned, logged so failures can be counted by cause.
+    struct LineReport: Equatable {
+        enum Outcome: String {
+            case aligned
+            /// Aligned, but its onset strayed too far from the song's median offset.
+            case offsetOutlier
+            /// No path fitted its words inside its window.
+            case noFit
+        }
+
+        let outcome: Outcome
+        /// First-word onset minus LRC time.
+        var offset: Double?
+        /// Mean per-frame log-prob of the aligned path minus the frame's best token (MMS-style; 0 is best).
+        var score: Float?
+    }
+
     private struct PreparedLine {
         let id: Int
         let start: Double
@@ -160,12 +178,15 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private var runSamples = 0
     private var frames: [Float] = []
     private var committedFrames = 0
-    /// End of the last aligned word in this run; later lines can't start before it.
+    /// End of the last kept word in this run; later lines can't start before it.
     private var alignedUntilFrame = 0
     /// Onset minus LRC time of every line kept so far, across runs.
     private var lineOffsets: [Double] = []
     /// A line whose onset strays this far from the song's median offset is dropped, so it keeps its LRC time.
     private let maxOffsetDeviation = 1.0
+    /// Outcome of every line aligned so far, by line ID.
+    private var reports: [Int: LineReport] = [:]
+    private static let logger = Logger(subsystem: "com.arya.BarTune", category: "audio-sync")
 
     static let sampleRate = 16000
     /// A run starting this early is a play from the song's start: capture waits for the lyrics and
@@ -226,6 +247,13 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         lock.lock()
         defer { lock.unlock() }
         return Set(done.subtracting(anchoredIndices).map { lines[$0].id })
+    }
+
+    /// Outcome of every line this engine aligned or failed to, by line ID.
+    var lineOutcomes: [Int: LineReport] {
+        lock.lock()
+        defer { lock.unlock() }
+        return reports
     }
 
     // swiftlint:disable:next async_without_await
@@ -316,10 +344,23 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let keep = batch.last.map { $0 == lines.count - 1 || done.contains($0 + 1) } == true ? batch.count : batch.count - 1
         guard keep > 0 else { return [] }
         done.formUnion(batch.prefix(keep))
-        if let words = align(batch, keeping: keep) { return words }
-        return batch.prefix(keep).flatMap { index in
+        let words = align(batch, keeping: keep) ?? batch.prefix(keep).flatMap { index in
             align(batch.contains(index + 1) ? [index, index + 1] : [index], keeping: 1) ?? []
         }
+        for index in batch.prefix(keep) where reports[lines[index].id] == nil {
+            record(LineReport(outcome: .noFit), for: index)
+        }
+        return words
+    }
+
+    private func record(_ report: LineReport, for index: Int) {
+        let line = lines[index]
+        reports[line.id] = report
+        let offset = report.offset.map { String(format: "%+.2f", $0) } ?? "-"
+        let score = report.score.map { String(format: "%.2f", $0) } ?? "-"
+        Self.logger.notice(
+            "Line \(line.id, privacy: .public) at \(line.start, format: .fixed(precision: 2), privacy: .public)s: \(report.outcome.rawValue, privacy: .public) offset=\(offset, privacy: .public) score=\(score, privacy: .public)"
+        )
     }
 
     /// Aligns `batch` together and returns the words of its first `keep` lines.
@@ -353,7 +394,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let kept = Set(batch.prefix(keep))
         var words: [RecognizedAudioWord] = []
         var wordLines: [Int] = []
-        var keptUntilFrame: Int?
+        var wordEndFrames: [Int] = []
+        var lineFrames: [Int: ClosedRange<Int>] = [:]
         var cursor = 0
         while cursor < spans.count, kept.contains(owners[cursor].line) {
             let owner = owners[cursor]
@@ -373,11 +415,40 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 confidence: Double(exp(logProbability / Float(max(1, frameCount))))
             ))
             wordLines.append(owner.line)
-            keptUntilFrame = lowFrame + spans[end].lastFrame + 1
+            wordEndFrames.append(lowFrame + spans[end].lastFrame + 1)
+            let first = lineFrames[owner.line]?.lowerBound ?? spans[cursor].firstFrame
+            lineFrames[owner.line] = first...spans[end].lastFrame
             cursor = end + 1
         }
-        if let keptUntilFrame { alignedUntilFrame = keptUntilFrame }
-        return dropUnreliableLines(words, lineOf: wordLines)
+        let scores = lineFrames.mapValues { Self.pathScore(slice, vocabSize: vocab, frames: $0, spans: spans, tokens: tokens) }
+        let dropped = dropUnreliableLines(words, lineOf: wordLines, scores: scores)
+        // A dropped line's audio may hold the next line, so only kept lines bound where it can start.
+        if let last = wordLines.lastIndex(where: { !dropped.contains($0) }) {
+            alignedUntilFrame = wordEndFrames[last]
+        }
+        return zip(words, wordLines).filter { !dropped.contains($0.1) }.map(\.0)
+    }
+
+    /// Mean over `frames` of the path's log-prob (its token, else blank) minus the frame's best log-prob.
+    private static func pathScore(
+        _ logProbs: [Float],
+        vocabSize: Int,
+        frames: ClosedRange<Int>,
+        spans: [CTCForcedAlignment.TokenSpan],
+        tokens: [Int]
+    ) -> Float {
+        var pathToken = [Int](repeating: CTCForcedAlignment.blank, count: frames.count)
+        for (span, token) in zip(spans, tokens) {
+            for frame in span.firstFrame...span.lastFrame where frames.contains(frame) {
+                pathToken[frame - frames.lowerBound] = token
+            }
+        }
+        var total: Float = 0
+        for frame in frames {
+            let row = logProbs[(frame * vocabSize)..<((frame + 1) * vocabSize)]
+            total += row[row.startIndex + pathToken[frame - frames.lowerBound]] - (row.max() ?? 0)
+        }
+        return total / Float(frames.count)
     }
 
     private func windowStart(of line: PreparedLine) -> Double {
@@ -389,8 +460,12 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     }
 
     /// Words the model barely hears (a shout under backing vocals, say) can land seconds off; such a
-    /// line is dropped once enough lines give the song's offset to compare it with.
-    private func dropUnreliableLines(_ words: [RecognizedAudioWord], lineOf wordLines: [Int]) -> [RecognizedAudioWord] {
+    /// line is dropped once enough lines give the song's offset to compare it with. Returns the dropped lines.
+    private func dropUnreliableLines(
+        _ words: [RecognizedAudioWord],
+        lineOf wordLines: [Int],
+        scores: [Int: Float]
+    ) -> Set<Int> {
         var dropped = Set<Int>()
         for (index, line) in wordLines.enumerated() where index == 0 || wordLines[index - 1] != line {
             let offset = words[index].startTime - lines[line].start
@@ -398,12 +473,14 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 let median = lineOffsets.sorted()[lineOffsets.count / 2]
                 if abs(offset - median) > maxOffsetDeviation {
                     dropped.insert(line)
+                    record(LineReport(outcome: .offsetOutlier, offset: offset, score: scores[line]), for: line)
                     continue
                 }
             }
             lineOffsets.append(offset)
+            record(LineReport(outcome: .aligned, offset: offset, score: scores[line]), for: line)
         }
-        return zip(words, wordLines).filter { !dropped.contains($0.1) }.map(\.0)
+        return dropped
     }
 }
 

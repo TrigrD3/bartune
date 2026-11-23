@@ -131,6 +131,31 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(words.last?.startTime ?? 0, 20.08, accuracy: 0.01)
     }
 
+    func testADroppedLineDoesNotPushTheNextLinePastItsOwnAudio() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let times = [10.4, 11.2, 12.0, 12.8, 13.6, 14.4, 15.2, 17.0]
+        let lines = times.enumerated().map { LyricLine(id: $0, timestamp: $1, text: $0 == 5 ? "ti" : "ka") }
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+        // Frame f is track -2 + 0.24 f. Lines 0-4 are heard 0-0.32 s after their LRC time. Line 5 ("ti")
+        // lands at 16.0 s, 1.6 s late, so it is dropped; line 6 is really sung before it, at 15.28 s
+        // (heard weakly), and line 7 at 17.2 s. Lines 0-5 align on the first chunk, 6-7 on the second.
+        var peaks: [Int: Int] = [75: 10, 76: 5]
+        for frame in [53, 56, 59, 62, 65, 72, 80] {
+            peaks[frame] = 14
+            peaks[frame + 1] = 4
+        }
+        model.peaksForCall = [peaks]
+        model.weakFrames = [72, 73]
+
+        let first = try await aligner.transcribe(chunk(start: 10.0))
+        let second = try await aligner.transcribe(chunk(start: 22.0))
+
+        XCTAssertEqual(first.count, 5, "line 5 is dropped")
+        XCTAssertEqual(second.first?.startTime ?? 0, 15.28, accuracy: 0.01, "line 6 starts before the dropped line ended")
+        XCTAssertEqual(aligner.lineOutcomes[5]?.outcome, .offsetOutlier)
+        XCTAssertEqual(aligner.lineOutcomes[6]?.outcome, .aligned)
+    }
+
     func testEngineAlignsOnlyMissingLinesInsideTheGapTheirAlignedNeighboursLeave() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
         let lines = [12.0, 14.0, 16.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "ka") }
