@@ -118,6 +118,14 @@ struct KaraokeLineView: View {
 
     @State private var textWidth: CGFloat = 0
 
+    /// Mask stops for the sweep's soft edge; the fade ends at `progress` so unsung glyphs stay unlit.
+    static func sweepFeather(progress: Double, textWidth: CGFloat) -> (solidEnd: Double, clearStart: Double) {
+        let featherFrac = min(0.25, Double(6 / max(1, textWidth)))
+        let edge = max(0.0, min(1.0, progress))
+        guard edge < 1 else { return (1, 1) }
+        return (max(0.0, edge - featherFrac), edge)
+    }
+
     static func isTimelinePaused(
         isPlaying: Bool,
         karaokeEnabled: Bool,
@@ -213,15 +221,12 @@ struct KaraokeLineView: View {
                     .foregroundStyle(sungColor)
                     .fixedSize(horizontal: true, vertical: false)
                     .mask {
-                        let w = max(1, textWidth)
-                        let featherFrac = min(0.25, Double(14 / w))
-                        let edge = max(0.0, min(1.0, progress))
-                        let fadeEnd = min(1.0, edge + featherFrac)
+                        let feather = Self.sweepFeather(progress: progress, textWidth: textWidth)
                         LinearGradient(
                             stops: [
                                 .init(color: .white, location: 0),
-                                .init(color: .white, location: edge),
-                                .init(color: .clear, location: fadeEnd),
+                                .init(color: .white, location: feather.solidEnd),
+                                .init(color: .clear, location: feather.clearStart),
                                 .init(color: .clear, location: 1),
                             ],
                             startPoint: .leading,
