@@ -9,6 +9,11 @@ if [[ "$FIRST_LINE" =~ ^(Merge|Revert)\  ]]; then
     exit 0
 fi
 
+# git commit --fixup/--squash prefixes; the subject after them is still checked
+while [[ "$FIRST_LINE" =~ ^(fixup|squash|amend)!\ (.*)$ ]]; do
+    FIRST_LINE="${BASH_REMATCH[2]}"
+done
+
 PATTERN='^(feat|fix|docs|style|refactor|perf|test|chore|build|ci|revert)(\((app|test|build|ci|docs|deps)\))?(!)?: .+$'
 
 if [[ ! "$FIRST_LINE" =~ $PATTERN ]]; then
