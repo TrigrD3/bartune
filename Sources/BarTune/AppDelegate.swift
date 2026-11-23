@@ -80,13 +80,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.spotifyMonitor.sendCommand(.playPause, expectedTrackId: trackId)
             },
             onSelectSource: { [weak self] track, source in
-                self?.selectLyricSource(source, for: track)
+                self?.selectLyricSource(source, for: track) ?? []
             },
-            onSaveCustom: { [weak self] track, lines in
-                try self?.saveCustomLyrics(lines, for: track)
+            onSaveCustom: { [weak self] track, lines, explicitEndIndices in
+                try self?.saveCustomLyrics(lines, for: track, explicitEndLineIndices: explicitEndIndices)
             },
             onDeleteCustom: { [weak self] track in
-                self?.deleteCustomLyrics(for: track)
+                self?.deleteCustomLyrics(for: track) ?? []
             }
         )
 
@@ -451,13 +451,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func selectLyricSource(_ source: TrackLyricSource, for track: TrackInfo) {
+    @discardableResult
+    func selectLyricSource(_ source: TrackLyricSource, for track: TrackInfo) -> [LyricLine] {
         state.setLyricSourceChoice(source, for: track.id)
-        guard lastLoadedTrack?.id == track.id else { return }
-        applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
+        if lastLoadedTrack?.id == track.id {
+            applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
+            return state.rawLyricLines
+        }
+        return linesForRetainedTrack(track, source: source)
     }
 
-    func saveCustomLyrics(_ lines: [LyricLine], for track: TrackInfo) throws {
+    func saveCustomLyrics(
+        _ lines: [LyricLine],
+        for track: TrackInfo,
+        explicitEndLineIndices: Set<Int>? = nil
+    ) throws {
         guard !lines.isEmpty else {
             throw CustomLyricsStoreError.emptyLyrics
         }
@@ -466,7 +474,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title: track.title,
             artist: track.artist,
             savedAt: Date(),
-            lines: lines
+            lines: lines,
+            explicitEndLineIndices: explicitEndLineIndices
         )
         try customLyricsStore.save(record)
         state.setLyricSourceChoice(.custom, for: track.id)
@@ -474,23 +483,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
     }
 
-    func deleteCustomLyrics(for track: TrackInfo) {
+    @discardableResult
+    func deleteCustomLyrics(for track: TrackInfo) -> [LyricLine] {
         customLyricsStore.remove(trackId: track.id)
         if state.lyricSourceChoice(for: track.id) == .custom {
             state.setLyricSourceChoice(nil, for: track.id)
         }
-        guard lastLoadedTrack?.id == track.id else { return }
-        applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
+        if lastLoadedTrack?.id == track.id {
+            applyResolvedLyricSource(for: track, fetchedLines: lastFetchedLines)
+            return state.rawLyricLines
+        }
+        let fallbackSource = LyricSourceResolver.effectiveSource(
+            choice: state.lyricSourceChoice(for: track.id),
+            hasCustomLyrics: false,
+            audioSyncEngine: state.audioSyncEngine
+        )
+        return linesForRetainedTrack(track, source: fallbackSource)
+    }
+
+    private func linesForRetainedTrack(_ track: TrackInfo, source: TrackLyricSource) -> [LyricLine] {
+        switch source {
+        case .custom:
+            return customLyricsStore.load(trackId: track.id)?.lines ?? []
+        case .defaultSource:
+            return LyricsDiskCache.default.load(trackId: track.id) ?? []
+        case .automatic:
+            if let synced = AudioSyncedLyricsCache.default.load(trackId: track.id)?.lines {
+                return synced
+            }
+            return LyricsDiskCache.default.load(trackId: track.id) ?? []
+        }
     }
 
     private func resyncCurrentTrackIfAutomatic() {
         guard let track = lastLoadedTrack else { return }
-        guard case .useAutomatic = resolvedAction(for: track, fetchedLines: lastFetchedLines) else {
+        guard case let .useAutomatic(lines) = resolvedAction(for: track, fetchedLines: lastFetchedLines) else {
             audioSyncManager.stop()
             state.audioSyncStatus = .idle
             return
         }
-        audioSyncManager.resyncCurrentTrack()
+        guard !lines.isEmpty else { return }
+        audioSyncManager.handleTrackLoaded(track: track, rawLines: lines, forceResync: true)
     }
 
     private func restartAudioSyncForCurrentTrack() {
@@ -507,7 +540,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             audioSyncManager.handleTrackLoaded(track: track, rawLines: lines)
-        case .useDefault, .useCustom:
+        case let .useDefault(lines):
+            state.setTrack(track, lyrics: lines)
+            audioSyncManager.stop()
+            state.audioSyncStatus = .idle
+            state.refreshActiveLineForCurrentPosition()
+        case .useCustom:
             audioSyncManager.stop()
             state.audioSyncStatus = .idle
         }

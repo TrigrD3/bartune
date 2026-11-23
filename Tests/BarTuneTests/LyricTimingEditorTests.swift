@@ -196,6 +196,46 @@ final class LyricTimingSessionTests: XCTestCase {
         XCTAssertTrue(session.stamp(at: 5.0))
         XCTAssertEqual(session.unstampedLineNumbers, [2, 3])
     }
+
+    func testExplicitLineEndPreservedAcrossSaveAndReopenWhenEqualToNextLineStart() {
+        var session = LyricTimingSession(lines: [
+            LyricLine(id: 0, timestamp: 10.0, text: "Line A"),
+            LyricLine(id: 1, timestamp: 15.0, text: "Line B"),
+        ])
+        session.setLineEndTimestamp(at: 0, to: 15.0)
+        let built = session.buildLyricLines()
+        let explicitEnds = session.explicitEndLineIndices
+        XCTAssertEqual(explicitEnds, [0])
+
+        var reopened = LyricTimingSession(lines: built, explicitEndIndices: explicitEnds)
+        XCTAssertEqual(reopened.lines[0].endTimestamp, 15.0)
+        reopened.setLineTimestamp(at: 1, to: 17.0)
+        let rebuilt = reopened.buildLyricLines()
+        XCTAssertEqual(rebuilt[0].duration ?? 0, 5.0, accuracy: 0.001, "explicit end at 15s must not stretch when B moves to 17s")
+    }
+
+    func testWordPassKeepsImportedTimestampsWhenOnlySpacingDiffers() {
+        var session = LyricTimingSession(lines: [
+            LyricLine(id: 0, timestamp: 10.0, text: "Wait  for me", words: [
+                WordTimestamp(timestamp: 10.0, duration: 0.4, text: "Wait  "),
+                WordTimestamp(timestamp: 10.5, duration: 0.3, text: "for "),
+                WordTimestamp(timestamp: 10.9, duration: 0.5, text: "me"),
+            ]),
+        ])
+        session.beginWordPass(forLine: 0)
+        XCTAssertEqual(session.lines[0].words.map(\.timestamp), [10.0, 10.5, 10.9])
+    }
+
+    func testUndoLineStampRestoresResolvedRowIndexAfterEarlierLineDeleted() {
+        var session = LyricTimingSession()
+        session.replaceWithPlainText("A\nB\nC")
+        session.beginLinePass(from: 1)
+        XCTAssertTrue(session.stamp(at: 12.0))
+        session.deleteLine(at: 0)
+        XCTAssertTrue(session.undoLastStamp())
+        XCTAssertEqual(session.nextLineIndex, 0, "cursor must point at B (now index 0), not stale index 1")
+        XCTAssertNil(session.lines[0].timestamp)
+    }
 }
 
 final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
@@ -353,23 +393,30 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         let safari = BrowserMediaMonitor.BrowserTarget(bundleId: "com.apple.Safari", appName: "Safari", isSafari: true)
         let tab = BrowserTabDescriptor(windowIndex: 1, tabIndex: 2, url: "https://music.youtube.com/watch?v=abc")
 
-        let chromeSeek = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(for: .seek(42.5), browser: chrome, tab: tab))
-        XCTAssertTrue(chromeSeek.contains("m.currentTime = 42.500"))
+        let chromeSeek = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(
+            for: .seek(12.5),
+            browser: chrome,
+            tab: tab,
+            expectedURL: tab.url,
+            chapterStart: 300.0
+        ))
+        XCTAssertTrue(chromeSeek.contains("m.currentTime = 312.500"))
+        XCTAssertTrue(chromeSeek.contains("__barTuneActiveMedia"))
+        XCTAssertTrue(chromeSeek.contains("location.href !== 'https://music.youtube.com/watch?v=abc'"))
         XCTAssertTrue(chromeSeek.contains("execute tab 2 of window 1 javascript"))
 
         let safariPlayPause = try XCTUnwrap(BrowserMediaMonitor.commandScriptSource(for: .playPause, browser: safari, tab: tab))
         XCTAssertTrue(safariPlayPause.contains("m.paused ? m.play() : m.pause()"))
         XCTAssertTrue(safariPlayPause.contains("do JavaScript"))
 
-        // Targeted editor seeks verify the player's current track and never fall back to another player.
+        // Targeted editor seeks strip the monitor's outer "spotify:" prefix and never fall back to another player.
         let guardedSpotify = try XCTUnwrap(SpotifyMonitor.transportScriptSource(
             for: .seek(12.5),
-            activeTrackId: "spotify:track:abc",
+            activeTrackId: "spotify:spotify:track:abc",
             runningBundleIds: ["com.spotify.client"],
-            expectedTrackId: "spotify:track:abc"
+            expectedTrackId: "spotify:spotify:track:abc"
         ))
-        XCTAssertTrue(guardedSpotify.contains("id of current track as string"))
-        XCTAssertTrue(guardedSpotify.contains("spotify:track:abc"))
+        XCTAssertTrue(guardedSpotify.contains("id of current track as string) is \"spotify:track:abc\""))
 
         let musicExitedNoFallback = SpotifyMonitor.transportScriptSource(
             for: .seek(12.5),
@@ -397,12 +444,16 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
             customLyricsStore: customStore,
             onSeek: { _, _ in },
             onTogglePlayPause: { _ in },
-            onSelectSource: { _, _ in },
-            onSaveCustom: { _, _ in throw CustomLyricsStoreError.emptyLyrics },
-            onDeleteCustom: { deletedTrackIds.append($0.id) }
+            onSelectSource: { _, _ in [] },
+            onSaveCustom: { _, _, _ in throw CustomLyricsStoreError.emptyLyrics },
+            onDeleteCustom: {
+                deletedTrackIds.append($0.id)
+                return []
+            }
         )
         XCTAssertEqual(model.activeTrack?.id, track.id)
         XCTAssertEqual(model.session.lines.count, 1)
+        XCTAssertFalse(model.hasUnsavedEdits)
 
         // Pausing a browser track clears state.currentTrack, but the editor must stay open with its session.
         state.setTrack(nil, lyrics: [])
@@ -416,8 +467,9 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         XCTAssertFalse(model.hasCustomLyrics)
         XCTAssertNotEqual(model.selectedSource, .custom)
 
-        // Unstamped lines block prepareCustomSave and report line numbers.
+        // Unstamped lines mark draft dirty, block prepareCustomSave, and report line numbers.
         model.session.addLine(after: 0, text: "Unstamped second line")
+        XCTAssertTrue(model.hasUnsavedEdits)
         XCTAssertNil(model.prepareCustomSave())
         XCTAssertTrue(try XCTUnwrap(model.statusMessage).contains("2"))
 
@@ -527,7 +579,7 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
 }
 
 private final class NoopAudioCapture: AudioCaptureProviding {
-    var onAudioSamples: ((CapturedAudio) -> Void)?
+    var onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
     func start(targetBundleIds: Set<String>) {}
     func stop() {}
 }

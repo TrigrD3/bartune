@@ -66,16 +66,18 @@ struct LyricTimingSession: Equatable, Sendable {
 
     var canUndoStamp: Bool { !stampUndoStack.isEmpty }
 
-    init(lines: [LyricLine] = []) {
+    init(lines: [LyricLine] = [], explicitEndIndices: Set<Int>? = nil) {
         self.lines = lines.enumerated().map { index, line in
             let nextStart = (index + 1 < lines.count) ? lines[index + 1].timestamp : nil
             let explicitEnd: Double?
             if let dur = line.duration {
-                let candidate = line.timestamp + dur
-                if let nextStart, abs(candidate - nextStart) < 0.005 {
+                let candidate = max(line.timestamp, line.timestamp + dur)
+                if let explicitEndIndices {
+                    explicitEnd = explicitEndIndices.contains(index) ? candidate : nil
+                } else if let nextStart, abs(candidate - nextStart) < 0.005 {
                     explicitEnd = nil
                 } else {
-                    explicitEnd = max(line.timestamp, candidate)
+                    explicitEnd = candidate
                 }
             } else {
                 explicitEnd = nil
@@ -155,13 +157,17 @@ struct LyricTimingSession: Equatable, Sendable {
         stampUndoStack.removeAll()
     }
 
+    private static func normalizedTextForWordComparison(_ text: String) -> String {
+        text.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
     mutating func updateLineText(at index: Int, to newText: String) {
         guard lines.indices.contains(index) else { return }
         guard lines[index].text != newText else { return }
         lines[index].text = newText
         if !lines[index].words.isEmpty {
-            let joined = lines[index].words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-            if joined != newText.trimmingCharacters(in: .whitespacesAndNewlines) {
+            let joined = Self.normalizedTextForWordComparison(lines[index].words.map(\.text).joined())
+            if joined != Self.normalizedTextForWordComparison(newText) {
                 lines[index].words = []
                 if case let .words(activeLine) = stampingMode, activeLine == index {
                     stampingMode = .off
@@ -230,8 +236,8 @@ struct LyricTimingSession: Equatable, Sendable {
     mutating func ensureWordsInitialized(forLine index: Int) {
         guard lines.indices.contains(index) else { return }
         let expected = Self.splitWords(for: lines[index].text)
-        let currentJoined = lines[index].words.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
-        let expectedJoined = expected.joined().trimmingCharacters(in: .whitespacesAndNewlines)
+        let currentJoined = Self.normalizedTextForWordComparison(lines[index].words.map(\.text).joined())
+        let expectedJoined = Self.normalizedTextForWordComparison(expected.joined())
         if lines[index].words.isEmpty || currentJoined != expectedJoined {
             lines[index].words = expected.map { EditableWord(text: $0) }
         }
@@ -298,10 +304,10 @@ struct LyricTimingSession: Equatable, Sendable {
     mutating func undoLastStamp() -> Bool {
         while let action = stampUndoStack.popLast() {
             switch action {
-            case let .lineTimestamp(lineId, previousTimestamp, previousNextLineIndex):
+            case let .lineTimestamp(lineId, previousTimestamp, _):
                 guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }) else { continue }
                 lines[lineIndex].timestamp = previousTimestamp
-                nextLineIndex = min(previousNextLineIndex, lines.count)
+                nextLineIndex = lineIndex
                 return true
             case let .lineEndTimestamp(lineId, previousEndTimestamp):
                 guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }) else { continue }
@@ -313,7 +319,7 @@ struct LyricTimingSession: Equatable, Sendable {
                 previousWordTimestamp,
                 previousWordDuration,
                 previousLineTimestamp,
-                previousNextWordIndex
+                _
             ):
                 guard let lineIndex = lines.firstIndex(where: { $0.id == lineId }),
                       let wordIndex = lines[lineIndex].words.firstIndex(where: { $0.id == wordId })
@@ -323,7 +329,9 @@ struct LyricTimingSession: Equatable, Sendable {
                 if wordIndex == 0 {
                     lines[lineIndex].timestamp = previousLineTimestamp
                 }
-                nextWordIndex = min(previousNextWordIndex, lines[lineIndex].words.count)
+                if case let .words(activeLine) = stampingMode, activeLine == lineIndex {
+                    nextWordIndex = wordIndex
+                }
                 return true
             }
         }
@@ -431,6 +439,19 @@ struct LyricTimingSession: Equatable, Sendable {
             let hasText = !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             return (hasText && line.timestamp == nil) ? (index + 1) : nil
         }
+    }
+
+    /// 0-based indices (within `buildLyricLines()`) whose end timestamp was explicitly set.
+    var explicitEndLineIndices: Set<Int> {
+        var indices: Set<Int> = []
+        var builtIndex = 0
+        for line in lines where line.timestamp != nil {
+            if let end = line.endTimestamp, let start = line.timestamp, end > start {
+                indices.insert(builtIndex)
+            }
+            builtIndex += 1
+        }
+        return indices
     }
 
     func buildLyricLines() -> [LyricLine] {
