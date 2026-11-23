@@ -1,8 +1,11 @@
 import AppKit
 import Combine
+import os
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Overlay clock vs player position on every poll; `scripts/playback-clock-report.py` summarizes it.
+    private static let clockLogger = Logger(subsystem: "com.arya.BarTune", category: "playback-clock")
     private let state: LyricsState
     private let spotifyMonitor: SpotifyMonitor
     private let lyricsFetcher: LyricsFetcher
@@ -323,6 +326,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             clearActivePlayback()
             return
         }
+        let clockError = track.id == lastFetchedTrackId
+            ? snapshot.sampledAt.flatMap { state.clockError(reportedPosition: snapshot.position, at: $0) }
+            : nil
+        let anchorBefore = state.playbackAnchorDate
 
         if track.id != lastFetchedTrackId {
             lastFetchedTrackId = track.id
@@ -357,6 +364,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             position: snapshot.position,
             playbackRate: snapshot.playbackRate
         )
+        if let clockError, snapshot.isPlaying {
+            let roundTrip = (snapshot.roundTrip ?? 0) * 1000
+            let reanchored = state.playbackAnchorDate != anchorBefore
+            Self.clockLogger.debug(
+                "clock track=\(track.id, privacy: .public) error_ms=\(clockError * 1000, format: .fixed(precision: 1), privacy: .public) rtt_ms=\(roundTrip, format: .fixed(precision: 1), privacy: .public) reanchored=\(reanchored, privacy: .public)"
+            )
+        }
         audioSyncManager.handlePlaybackStateChanged(isPlaying: snapshot.isPlaying, position: snapshot.position)
     }
 

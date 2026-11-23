@@ -34,6 +34,7 @@ scripts/
   convert-lyrics-aligner.py # Builds LyricsAligner.mlpackage (MMS forced-aligner → Core ML, 8-bit) for the Lyrics Alignment engine
   export-coverage.sh       # CI LCOV export; fails when the test binary, profdata, or report is missing
   fetch-jamendolyrics.sh   # Downloads JamendoLyrics (word-annotated, Creative Commons audio; never commit it) for AlignmentEvalTests
+  playback-clock-report.py # Per-track summary of the `playback-clock` debug log (overlay clock vs player position per poll)
   hooks/commit-msg         # Local Conventional Commits git hook
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
 .github/
