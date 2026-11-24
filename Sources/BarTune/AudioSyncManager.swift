@@ -565,7 +565,7 @@ final class AudioSyncManager {
             }
         } else if let cached = cache.load(trackId: track.id) {
             let current = rawLines.isEmpty
-                || cached.matchesSource(rawLines, comparingText: !state.replaceLyricsWithTranscription)
+                || cached.matchesSource(rawLines)
             let reliable = current && cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
             // A Lyrics Alignment record keeps filling in until no further play could lock another line.
             let fillsIn = engine == .lyricsAlignment && cached.engine == .lyricsAlignment
@@ -612,7 +612,7 @@ final class AudioSyncManager {
             return
         }
 
-        if !forceResync, !state.replaceLyricsWithTranscription, Self.hasPreexistingWordSync(rawLines) {
+        if !forceResync, Self.hasPreexistingWordSync(rawLines) {
             state.audioSyncStatus = .cached(engine)
             return
         }
@@ -1020,7 +1020,6 @@ final class AudioSyncManager {
         LyricsAudioAligner.align(
             lines: baseLines,
             recognizedWords: refinedHeardWords(),
-            replaceTextWithTranscription: state.replaceLyricsWithTranscription,
             regroupsCJKWords: false,
             splitsSyllables: state.syllableTiming
         )

@@ -1583,43 +1583,6 @@ final class AudioSyncManagerTests: XCTestCase {
 
     // MARK: - #113: Unrelated speech around a single common word stays absent from displayed & cached lyrics
 
-    @MainActor
-    func testTranscriptionOverwriteSingleCommonWordAbsentFromDisplayedAndCachedLyrics() async {
-        let state = LyricsState(userDefaults: defaults)
-        state.audioSyncEngine = .lyricsAlignment
-        state.replaceLyricsWithTranscription = true
-        state.playbackAnchorPosition = 10.0
-        state.playbackAnchorDate = Date()
-        state.isPlaying = false
-        let cache = AudioSyncedLyricsCache(directory: tempDir)
-        let fakeCapture = FakeAudioCapture()
-        let feed = LockedBox<[[RecognizedAudioWord]]>([])
-        let deps = alignerDependencies(capture: fakeCapture, feed: feed)
-        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
-        let track = sampleTrack()
-        let lines = [
-            LyricLine(id: 0, timestamp: 10.0, duration: 3.0, text: "We are the champions"),
-        ]
-        state.setTrack(track, lyrics: lines)
-        manager.handleTrackLoaded(track: track, rawLines: lines)
-        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
-        XCTAssertTrue(started)
-
-        // One common word ("the") with unrelated speech on either side.
-        let mixedWords = [
-            RecognizedAudioWord(text: "unrelated", startTime: 10.0, duration: 0.2, confidence: 0.95),
-            RecognizedAudioWord(text: "the", startTime: 10.4, duration: 0.2, confidence: 0.95),
-            RecognizedAudioWord(text: "chatter", startTime: 10.8, duration: 0.2, confidence: 0.95),
-        ]
-        let heard = await hear(mixedWords, manager: manager, capture: fakeCapture, feed: feed)
-        XCTAssertTrue(heard)
-
-        let displayedText = state.rawLyricLines.map(\.text).joined(separator: " ")
-        XCTAssertFalse(displayedText.contains("unrelated"))
-        XCTAssertFalse(displayedText.contains("chatter"))
-        XCTAssertNil(cache.load(trackId: track.id))
-    }
-
     // MARK: - #112: Include-only audio capture isolation & unresolved player handling
 
     @MainActor

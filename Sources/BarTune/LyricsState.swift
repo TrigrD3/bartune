@@ -350,7 +350,6 @@ final class LyricsState: ObservableObject {
         static let trackOffsets = "bartune.trackOffsets"
         static let trackLyricSources = "bartune.trackLyricSources"
         static let audioSyncEngine = "bartune.audioSyncEngine"
-        static let replaceLyricsWithTranscription = "bartune.replaceLyricsWithTranscription"
         static let syllableTiming = "bartune.syllableTiming"
         static let showSyncBadge = "bartune.showSyncBadge"
         static let lyricsColorPreset = "bartune.lyricsColorPreset"
@@ -537,10 +536,6 @@ final class LyricsState: ObservableObject {
 
     @Published var audioSyncEngine: AudioSyncEngine {
         didSet { userDefaults.set(audioSyncEngine.rawValue, forKey: Keys.audioSyncEngine) }
-    }
-
-    @Published var replaceLyricsWithTranscription: Bool {
-        didSet { userDefaults.set(replaceLyricsWithTranscription, forKey: Keys.replaceLyricsWithTranscription) }
     }
 
     /// Lyrics Alignment times words of several syllables one syllable at a time.
@@ -762,7 +757,6 @@ final class LyricsState: ObservableObject {
         } else {
             self.audioSyncEngine = .off
         }
-        self.replaceLyricsWithTranscription = ud.object(forKey: Keys.replaceLyricsWithTranscription) as? Bool ?? false
         self.syllableTiming = ud.object(forKey: Keys.syllableTiming) as? Bool ?? false
         self.showSyncBadge = ud.object(forKey: Keys.showSyncBadge) as? Bool ?? true
         if let rawPreset = ud.string(forKey: Keys.lyricsColorPreset),
