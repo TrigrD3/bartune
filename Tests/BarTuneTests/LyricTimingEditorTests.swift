@@ -594,6 +594,51 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
         XCTAssertNil(state.lyricSourceChoice(for: track.id))
         XCTAssertEqual(state.rawLyricLines, fetchedLines)
     }
+
+    @MainActor
+    func testEditorModelCachesRomajiAndMirrorsPlaybackState() async throws {
+        let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
+        let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("custom-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let state = LyricsState(userDefaults: ud)
+        state.romanizeJapanese = false
+        let track = TrackInfo(id: "spotify:track:romaji", title: "Track", artist: "Artist", album: "", duration: 120, artworkURL: nil)
+        state.setTrack(track, lyrics: [LyricLine(id: 0, timestamp: 1.0, text: "夢を見る")])
+
+        let model = LyricTimingEditorModel(
+            state: state,
+            customLyricsStore: CustomLyricsStore(directory: tempDir),
+            onSeek: { _, _ in },
+            onTogglePlayPause: { _ in },
+            onSelectSource: { _, _ in [] },
+            onSaveCustom: { _, _, _ in },
+            onDeleteCustom: { _ in [] }
+        )
+
+        XCTAssertFalse(model.isPlaying)
+        XCTAssertFalse(model.romanizeJapanese)
+        XCTAssertNil(model.romanizedLinePreview(for: "夢を見る"))
+
+        state.updatePlayback(isPlaying: false, position: 12.5)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(model.pausedPlaybackPosition, 12.5, accuracy: 0.01)
+
+        state.updatePlayback(isPlaying: true, position: 1.5)
+        state.romanizeJapanese = true
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertTrue(model.isPlaying)
+        XCTAssertTrue(model.romanizeJapanese)
+        let firstPreview = model.romanizedLinePreview(for: "夢を見る")
+        XCTAssertNotNil(firstPreview)
+        XCTAssertEqual(model.romanizedLinePreview(for: "夢を見る"), firstPreview)
+        let words = [EditableWord(text: "夢"), EditableWord(text: "を")]
+        XCTAssertEqual(model.romanizedWordPreviews(for: words).count, 2)
+    }
 }
 
 private final class NoopAudioCapture: AudioCaptureProviding {

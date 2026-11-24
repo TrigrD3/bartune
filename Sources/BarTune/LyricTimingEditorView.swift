@@ -10,6 +10,9 @@ final class LyricTimingEditorModel: ObservableObject {
     @Published var selectedSource: TrackLyricSource = .defaultSource
     @Published var hasCustomLyrics: Bool = false
     @Published var statusMessage: String?
+    @Published private(set) var isPlaying: Bool
+    @Published private(set) var pausedPlaybackPosition: Double
+    @Published private(set) var romanizeJapanese: Bool
 
     private let state: LyricsState
     private let customLyricsStore: CustomLyricsStore
@@ -19,6 +22,8 @@ final class LyricTimingEditorModel: ObservableObject {
     private let onSaveCustom: (TrackInfo, [LyricLine], Set<Int>) throws -> Void
     private let onDeleteCustom: (TrackInfo) -> [LyricLine]
     private var baselineLines: [EditableLine] = []
+    private var lineRomajiCache: [String: String?] = [:]
+    private var wordRomajiCache: [[String]: [String]] = [:]
     private var cancellables = Set<AnyCancellable>()
 
     var hasUnsavedEdits: Bool {
@@ -41,6 +46,9 @@ final class LyricTimingEditorModel: ObservableObject {
         self.onSelectSource = onSelectSource
         self.onSaveCustom = onSaveCustom
         self.onDeleteCustom = onDeleteCustom
+        self.isPlaying = state.isPlaying
+        self.pausedPlaybackPosition = state.currentPlaybackPosition()
+        self.romanizeJapanese = state.romanizeJapanese
         self.session = LyricTimingSession(lines: [])
         loadCurrentTrack()
 
@@ -54,6 +62,59 @@ final class LyricTimingEditorModel: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+
+        state.$isPlaying
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] playing in
+                guard let self else { return }
+                self.isPlaying = playing
+                if !playing {
+                    self.pausedPlaybackPosition = self.state.currentPlaybackPosition()
+                }
+            }
+            .store(in: &cancellables)
+
+        state.pausedPositionDidChange
+            .receive(on: RunLoop.main)
+            .sink { [weak self] pos in
+                guard let self, !self.state.isPlaying else { return }
+                if self.pausedPlaybackPosition != pos {
+                    self.pausedPlaybackPosition = pos
+                }
+            }
+            .store(in: &cancellables)
+
+        state.$romanizeJapanese
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] romanize in
+                self?.romanizeJapanese = romanize
+            }
+            .store(in: &cancellables)
+    }
+
+    func romanizedLinePreview(for text: String) -> String? {
+        guard romanizeJapanese else { return nil }
+        if let cached = lineRomajiCache[text] {
+            return cached
+        }
+        let preview = LyricTimingSession.romanizedPreview(forLine: text)
+        lineRomajiCache[text] = preview
+        return preview
+    }
+
+    func romanizedWordPreviews(for words: [EditableWord]) -> [String] {
+        guard romanizeJapanese else {
+            return Array(repeating: "", count: words.count)
+        }
+        let key = words.map(\.text)
+        if let cached = wordRomajiCache[key] {
+            return cached
+        }
+        let previews = LyricTimingSession.romanizedWordPreviews(for: words)
+        wordRomajiCache[key] = previews
+        return previews
     }
 
     var availableSources: [TrackLyricSource] {
@@ -72,6 +133,8 @@ final class LyricTimingEditorModel: ObservableObject {
         }
         activeTrack = track
         statusMessage = nil
+        lineRomajiCache.removeAll()
+        wordRomajiCache.removeAll()
 
         let customRecord = customLyricsStore.load(trackId: track.id)
         hasCustomLyrics = customRecord != nil
@@ -203,7 +266,7 @@ final class LyricTimingEditorModel: ObservableObject {
 }
 
 struct LyricTimingEditorView: View {
-    @ObservedObject var state: LyricsState
+    let state: LyricsState
     @ObservedObject var model: LyricTimingEditorModel
     @State private var showPasteSheet = false
     @State private var pasteBuffer = ""
@@ -342,10 +405,10 @@ struct LyricTimingEditorView: View {
                     Button {
                         model.togglePlayPause()
                     } label: {
-                        Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                        Image(systemName: model.isPlaying ? "pause.fill" : "play.fill")
                             .frame(width: 14)
                     }
-                    .help(state.isPlaying ? "Pause" : "Play")
+                    .help(model.isPlaying ? "Pause" : "Play")
 
                     Button {
                         model.nudgePlayback(by: 5.0)
@@ -355,8 +418,9 @@ struct LyricTimingEditorView: View {
                     .help("Forward 5 seconds")
                 }
 
-                TimelineView(.periodic(from: .now, by: 0.05)) { context in
-                    Text(LyricTimingSession.formatTime(state.currentPlaybackPosition(at: context.date)))
+                TimelineView(.animation(minimumInterval: 0.05, paused: !model.isPlaying)) { context in
+                    let pos = model.isPlaying ? state.currentPlaybackPosition(at: context.date) : model.pausedPlaybackPosition
+                    Text(LyricTimingSession.formatTime(pos))
                         .font(.system(.body, design: .monospaced))
                         .monospacedDigit()
                         .foregroundStyle(.primary)
@@ -470,8 +534,8 @@ struct LyricTimingEditorView: View {
                 if model.session.nextWordIndex < words.count {
                     let nextText = words[model.session.nextWordIndex].text.trimmingCharacters(in: .whitespaces)
                     let romajiHint: String = {
-                        guard state.romanizeJapanese else { return "" }
-                        let previews = LyricTimingSession.romanizedWordPreviews(for: words)
+                        guard model.romanizeJapanese else { return "" }
+                        let previews = model.romanizedWordPreviews(for: words)
                         let hint = previews.indices.contains(model.session.nextWordIndex)
                             ? previews[model.session.nextWordIndex]
                             : ""
@@ -549,7 +613,7 @@ struct LyricTimingEditorView: View {
                             LineEditorRow(
                                 index: index,
                                 line: line,
-                                romajiPreview: state.romanizeJapanese ? LyricTimingSession.romanizedPreview(forLine: line.text) : nil,
+                                romajiPreview: model.romanizedLinePreview(for: line.text),
                                 isSelected: model.selectedLineId == line.id,
                                 isNextStamp: model.session.stampingMode == .lines && model.session.nextLineIndex == index,
                                 isOutOfOrder: outOfOrder.contains(index),
@@ -633,17 +697,14 @@ struct LyricTimingEditorView: View {
                 let line = model.session.lines[idx]
                 let wordWarnings = model.session.outOfOrderWordIndices(inLine: idx)
                 let isWordStampingThisLine = model.session.stampingMode == .words(lineIndex: idx)
-                let wordRomaji = state.romanizeJapanese
-                    ? LyricTimingSession.romanizedWordPreviews(for: line.words)
-                    : Array(repeating: "", count: line.words.count)
+                let wordRomaji = model.romanizedWordPreviews(for: line.words)
 
                 VStack(alignment: .leading, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(line.text.isEmpty ? "(Empty line)" : line.text)
                             .font(.callout.weight(.medium))
                             .lineLimit(3)
-                        if state.romanizeJapanese,
-                           let romaji = LyricTimingSession.romanizedPreview(forLine: line.text) {
+                        if let romaji = model.romanizedLinePreview(for: line.text) {
                             Text(romaji)
                                 .font(.caption)
                                 .foregroundStyle(.secondary)

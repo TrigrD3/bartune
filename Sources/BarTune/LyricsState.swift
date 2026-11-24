@@ -488,6 +488,7 @@ final class LyricsState: ObservableObject {
     @Published var romanizeJapanese: Bool {
         didSet {
             userDefaults.set(romanizeJapanese, forKey: Keys.romanizeJapanese)
+            ensureRomanizedLinesIfNeeded()
             refreshCurrentLineText()
         }
     }
@@ -495,6 +496,7 @@ final class LyricsState: ObservableObject {
     @Published var romanizeKorean: Bool {
         didSet {
             userDefaults.set(romanizeKorean, forKey: Keys.romanizeKorean)
+            ensureRomanizedLinesIfNeeded()
             refreshCurrentLineText()
         }
     }
@@ -502,6 +504,7 @@ final class LyricsState: ObservableObject {
     @Published var romanizeChinese: Bool {
         didSet {
             userDefaults.set(romanizeChinese, forKey: Keys.romanizeChinese)
+            ensureRomanizedLinesIfNeeded()
             refreshCurrentLineText()
         }
     }
@@ -633,6 +636,8 @@ final class LyricsState: ObservableObject {
     }
 
     private let userDefaults: UserDefaults
+    private let pausedPositionSubject = PassthroughSubject<Double, Never>()
+    var pausedPositionDidChange: AnyPublisher<Double, Never> { pausedPositionSubject.eraseToAnyPublisher() }
     private var rawLines: [LyricLine] = []
     private var rawLinesAreSortedByTimestamp: Bool = true
     private var romanizedLines: [LyricLine] = []
@@ -825,25 +830,10 @@ final class LyricsState: ObservableObject {
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lyrics)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lyrics)
         isChineseSong = ChineseRomanizer.isChineseTrack(lyrics)
-        if isJapaneseSong {
-            romanizedLines = Self.romanizeLines(
-                lyrics,
-                using: JapaneseRomanizer.romanizeLine,
-                wordSpans: JapaneseRomanizer.romanizeWordSpans
-            )
-        } else {
-            romanizedLines = []
-        }
-        if isKoreanSong {
-            koreanRomanizedLines = Self.romanizeLines(lyrics, using: KoreanRomanizer.romanizeLine)
-        } else {
-            koreanRomanizedLines = []
-        }
-        if isChineseSong {
-            chineseRomanizedLines = Self.romanizeLines(lyrics, using: ChineseRomanizer.romanizeLine)
-        } else {
-            chineseRomanizedLines = []
-        }
+        romanizedLines = []
+        koreanRomanizedLines = []
+        chineseRomanizedLines = []
+        ensureRomanizedLinesIfNeeded()
 
         hasLyrics = !lyrics.isEmpty
         if let track {
@@ -851,6 +841,23 @@ final class LyricsState: ObservableObject {
         } else {
             trackSummary = "Not Playing"
             albumColors = nil
+        }
+    }
+
+    private func ensureRomanizedLinesIfNeeded() {
+        guard !rawLines.isEmpty else { return }
+        if romanizeJapanese, isJapaneseSong, romanizedLines.isEmpty {
+            romanizedLines = Self.romanizeLines(
+                rawLines,
+                using: JapaneseRomanizer.romanizeLine,
+                wordSpans: JapaneseRomanizer.romanizeWordSpans
+            )
+        }
+        if romanizeKorean, isKoreanSong, koreanRomanizedLines.isEmpty {
+            koreanRomanizedLines = Self.romanizeLines(rawLines, using: KoreanRomanizer.romanizeLine)
+        }
+        if romanizeChinese, isChineseSong, chineseRomanizedLines.isEmpty {
+            chineseRomanizedLines = Self.romanizeLines(rawLines, using: ChineseRomanizer.romanizeLine)
         }
     }
 
@@ -990,17 +997,17 @@ final class LyricsState: ObservableObject {
         isJapaneseSong = JapaneseRomanizer.isJapaneseTrack(lines)
         isKoreanSong = KoreanRomanizer.isKoreanTrack(lines)
         isChineseSong = ChineseRomanizer.isChineseTrack(lines)
-        romanizedLines = isJapaneseSong
+        romanizedLines = (romanizeJapanese && isJapaneseSong)
             ? Self.romanizeLines(
                 lines,
                 using: JapaneseRomanizer.romanizeLine,
                 wordSpans: JapaneseRomanizer.romanizeWordSpans
             )
             : []
-        koreanRomanizedLines = isKoreanSong
+        koreanRomanizedLines = (romanizeKorean && isKoreanSong)
             ? Self.romanizeLines(lines, using: KoreanRomanizer.romanizeLine)
             : []
-        chineseRomanizedLines = isChineseSong
+        chineseRomanizedLines = (romanizeChinese && isChineseSong)
             ? Self.romanizeLines(lines, using: ChineseRomanizer.romanizeLine)
             : []
         if !translationsById.isEmpty {
@@ -1088,6 +1095,9 @@ final class LyricsState: ObservableObject {
         if !keepsClock {
             playbackAnchorPosition = position
             playbackAnchorDate = now
+            if !isPlaying {
+                pausedPositionSubject.send(max(0.0, position))
+            }
         }
         self.playbackRate = playbackRate
         let lines = activeLines

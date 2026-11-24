@@ -19,7 +19,7 @@ struct ExtractedAlbumColors: Sendable {
 }
 
 actor AlbumArtColorExtractor {
-    private var cache: [String: ExtractedAlbumColors] = [:]
+    private var cache = LRUMemoryCache<ExtractedAlbumColors>()
 
     func extractColors(from urlString: String?) async -> ExtractedAlbumColors? {
         guard let urlString, !urlString.isEmpty, let url = URL(string: urlString) else {
