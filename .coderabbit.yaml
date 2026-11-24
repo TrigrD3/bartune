@@ -10,8 +10,7 @@ reviews:
   review_status: true
   collapse_walkthrough: true
   auto_review:
-    # Reviews run only on request: comment "@coderabbitai review" on the PR.
-    enabled: false
+    enabled: true
     drafts: false
     base_branches:
       - main
