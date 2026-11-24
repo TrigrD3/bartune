@@ -603,6 +603,53 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(anchorsSeen.withLock { $0.last }, [0], "only the locked line is kept as it is")
     }
 
+    /// Locked line IDs after one 7 s chunk from 10 s where line 1 ("Gamma delta", from 15.7 s) is nearly
+    /// confident and the voice comes in at `voiceStart`.
+    @MainActor
+    private func lockedAfterNearlyConfidentLine(voiceStart: Double) async throws -> [Int]? {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let words = ["Alpha", "beta", "Gamma", "delta"].enumerated().map { index, word in
+            RecognizedAudioWord(text: word, startTime: [10.7, 11.1, 15.7, 16.1][index], duration: 0.3, confidence: 0.1)
+        }
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 7.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(confident: [], nearlyConfident: [1]) { _ in words }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+
+        let rate = 16000
+        let audio = (0..<(7 * rate)).map { index -> Float in
+            let time = 10.0 + Double(index) / Double(rate)
+            let amplitude: Float = time >= voiceStart ? 0.5 : 0.005
+            return amplitude * sin(2 * Float.pi * 440 * Float(index) / Float(rate))
+        }
+        for second in 0..<7 {
+            fakeCapture.emit(samples: Array(audio[(second * rate)..<((second + 1) * rate)]), sampleRate: Double(rate))
+        }
+        _ = await waitUntil(timeout: 5) { cache.load(trackId: self.sampleTrack().id) != nil }
+        return try XCTUnwrap(cache.load(trackId: sampleTrack().id)).lockedLineIDs?.sorted()
+    }
+
+    @MainActor
+    func testLyricsAlignmentLocksANearlyConfidentLineThatStartsOnAVocalOnset() async throws {
+        let locked = try await lockedAfterNearlyConfidentLine(voiceStart: 15.7)
+        XCTAssertEqual(locked, [1])
+    }
+
+    @MainActor
+    func testLyricsAlignmentDoesNotLockANearlyConfidentLineInsideAHeldNote() async throws {
+        let locked = try await lockedAfterNearlyConfidentLine(voiceStart: 10.0)
+        XCTAssertEqual(locked, [])
+    }
+
     @MainActor
     func testLyricsAlignmentSettlesOnceAPlayLocksNothingNew() async {
         let state = LyricsState(userDefaults: defaults)
@@ -2021,17 +2068,20 @@ private final class FakeChunkEngine: AudioChunkTranscribing, LineAttemptReportin
     private let shutdowns = LockedBox<Int>(0)
     let attemptedLineIDs: Set<Int>
     let confidentLineIDs: Set<Int>
+    let nearlyConfidentLineIDs: Set<Int>
 
     var shutdownCount: Int { shutdowns.withLock { $0 } }
 
     init(
         attempted: Set<Int> = [],
         confident: Set<Int> = Set(0..<100),
+        nearlyConfident: Set<Int> = [],
         transcribe handler: @escaping @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]
     ) {
         self.handler = handler
         attemptedLineIDs = attempted
         confidentLineIDs = confident
+        nearlyConfidentLineIDs = nearlyConfident
     }
 
     // swiftlint:disable:next async_without_await

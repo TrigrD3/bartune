@@ -355,4 +355,43 @@ final class LyricsStateTests: XCTestCase {
         state.updatePlayback(isPlaying: false, position: 30.2)
         XCTAssertFalse(state.shouldShowOverlay)
     }
+
+    // MARK: - Romanized lines timed by syllable
+
+    /// The displayed text of `line`, shown after `before` (other lines of the same song).
+    private func romanizedText(of line: LyricLine, after before: [LyricLine] = [], set enable: (LyricsState) -> Void) throws -> String {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        enable(state)
+        state.applyAudioSyncedLines(before + [line])
+        state.updatePlayback(isPlaying: true, position: line.timestamp + 0.1)
+        return state.currentText
+    }
+
+    private func syllableLine(_ text: String, _ tokens: [String]) -> LyricLine {
+        LyricLine(id: 0, timestamp: 10.0, text: text, words: tokens.enumerated().map { index, token in
+            WordTimestamp(timestamp: 10.0 + Double(index) * 0.2, duration: 0.2, text: token)
+        })
+    }
+
+    func testRomajiKeepsALatinWordTimedBySyllableWhole() throws {
+        // A Japanese track (one line has kana) shows every line romanized, English lines included.
+        let japanese = LyricLine(id: 0, timestamp: 2.0, text: "まだ消えない未来")
+        var line = syllableLine("I'd sacrifice an angel", ["I'd ", "sa", "cri", "fice ", "an ", "an", "gel"])
+        line = LyricLine(id: 1, timestamp: line.timestamp, text: line.text, words: line.words)
+        let text = try romanizedText(of: line, after: [japanese]) { $0.romanizeJapanese = true }
+        XCTAssertEqual(text, "I'd sacrifice an angel")
+    }
+
+    func testKoreanRomanizationKeepsAWordTimedBySyllableWhole() throws {
+        let line = syllableLine("사랑해 너를", ["사", "랑", "해 ", "너", "를"])
+        let text = try romanizedText(of: line) { $0.romanizeKorean = true }
+        XCTAssertEqual(text.split(separator: " ").count, 2, text)
+    }
+
+    func testPinyinKeepsASpaceAfterEachCharacterTimedOnItsOwn() throws {
+        let line = syllableLine("我爱你", ["我", "爱", "你"])
+        let text = try romanizedText(of: line) { $0.romanizeChinese = true }
+        XCTAssertEqual(text.split(separator: " ").count, 3, text)
+    }
 }

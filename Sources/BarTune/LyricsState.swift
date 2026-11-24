@@ -864,6 +864,14 @@ final class LyricsState: ObservableObject {
 
     /// `wordSpans` romanizes a timed line's words in context and reports the source word range merged
     /// into each output word; without it each word is romanized alone with its original timing.
+    /// A romanized token is followed by a space when its source token ends a word, or is Han or kana, whose
+    /// romanization spaces each character. A syllable inside a Latin or Hangul word (Syllable Timing) has no
+    /// trailing space, so its romanization stays joined to the rest of the word.
+    private static func romanizedSeparator(after source: String, isLast: Bool) -> String {
+        let endsWord = isLast || source.last?.isWhitespace == true
+        return endsWord || JapaneseRomanizer.containsJapaneseOrCJK(source) ? " " : ""
+    }
+
     private static func romanizeLines(
         _ lyrics: [LyricLine],
         using transform: (String) -> String,
@@ -888,19 +896,22 @@ final class LyricsState: ObservableObject {
                                 duration = nil
                             }
                         }
+                        let source = line.words[span.sourceRange.upperBound].text
+                        let isLast = span.sourceRange.upperBound == line.words.count - 1
                         return WordTimestamp(
                             timestamp: first.timestamp,
                             duration: duration,
-                            text: span.text + " "
+                            text: span.text.trimmingCharacters(in: .whitespaces) + romanizedSeparator(after: source, isLast: isLast)
                         )
                     }
                 } else {
-                    line.words.map { w in
-                        let text = transform(w.text)
+                    line.words.enumerated().map { index, w in
+                        let text = transform(w.text).trimmingCharacters(in: .whitespaces)
+                        let separator = romanizedSeparator(after: w.text, isLast: index == line.words.count - 1)
                         return WordTimestamp(
                             timestamp: w.timestamp,
                             duration: w.duration,
-                            text: text.isEmpty ? "" : text + " "
+                            text: text.isEmpty ? "" : text + separator
                         )
                     }
                 }
