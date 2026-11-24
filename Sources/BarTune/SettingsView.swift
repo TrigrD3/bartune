@@ -494,14 +494,6 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                    Toggle("Replace Lyrics with Transcribed Audio", isOn: $state.replaceLyricsWithTranscription)
-
-                    Text(
-                        "Permanently saves the words recognized from audio (e.g. actual Japanese pronunciation) into the sync cache so repeat plays load with zero recalculation."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-
                     HStack {
                         Text("Status")
                         Spacer()

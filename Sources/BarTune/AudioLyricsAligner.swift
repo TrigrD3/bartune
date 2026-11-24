@@ -181,8 +181,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     }
 
     /// False when the lyrics changed since this record was aligned (e.g. a different version was fetched).
-    /// Transcription records rewrite line text, so only their line count is compared.
-    func matchesSource(_ sourceLines: [LyricLine], comparingText: Bool) -> Bool {
+    func matchesSource(_ sourceLines: [LyricLine]) -> Bool {
         func texts(_ lines: [LyricLine]) -> [String] {
             lines.map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         }
@@ -190,7 +189,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         if let sourceLineCount, sourceLineCount != source.count {
             return false
         }
-        return !comparingText || texts(lines) == source
+        return texts(lines) == source
     }
 
     /// Lyrics Alignment: attempted lines that stay settled because the play that heard them locked nothing new.
@@ -514,14 +513,11 @@ enum LyricsAudioAligner {
     }
 
     /// Aligns fetched lyric lines against recognized audio words to produce precise word-level karaoke timings.
-    /// When `replaceTextWithTranscription` is true, matched lines permanently use the recognized audio words
-    /// as their lyric text (useful when written lyrics differ from sung pronunciation).
     /// With `splitsSyllables`, a matched word that carries syllables is timed one syllable at a time.
     static func align(
         lines: [LyricLine],
         recognizedWords: [RecognizedAudioWord],
         searchWindow: Double = 8.0,
-        replaceTextWithTranscription: Bool = false,
         regroupsCJKWords: Bool = true,
         splitsSyllables: Bool = false
     ) -> AudioAlignmentResult {
@@ -532,9 +528,8 @@ enum LyricsAudioAligner {
         let heardWords = recognizedWords
             .filter { !normalizeToken($0.text).isEmpty }
             .sorted { $0.startTime < $1.startTime }
-        // Transcription mode writes the heard words into the lyrics, so it keeps their own boundaries;
-        // so do lyric tokens from Lyrics Alignment, which joining across lines would break.
-        let sortedRecognized = replaceTextWithTranscription || !regroupsCJKWords ? heardWords : regroupCJKWords(heardWords)
+        // Lyric tokens from Lyrics Alignment keep their own boundaries; joining across lines would break them.
+        let sortedRecognized = regroupsCJKWords ? regroupCJKWords(heardWords) : heardWords
 
         guard !sortedRecognized.isEmpty else {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
@@ -624,48 +619,6 @@ enum LyricsAudioAligner {
             }
             let meaningfulTokenCount = lineTokens.filter { !$0.normalized.isEmpty }.count
             let minMatches = meaningfulTokenCount <= 2 ? 1 : max(2, meaningfulTokenCount / 3)
-
-            if replaceTextWithTranscription {
-                let windowWords = sortedRecognized.filter {
-                    $0.startTime >= max(lastConsumedWordStart, shiftedStart - 0.6) && $0.startTime < min(shiftedEnd + 0.4, nextShiftedStart)
-                }
-                let startIsEligible = { (start: Double) in abs(start - shiftedStart) <= 2.5 && start >= minAllowedStart }
-                if let matchedSpan = Self.matchedTranscriptionSpan(
-                    lineTokens: lineTokens,
-                    recognized: windowWords,
-                    acceptsStart: startIsEligible
-                ), let startTs = matchedSpan.first?.startTime {
-                    matchedLineCount += 1
-                    matchedLineIDs.append(line.id)
-                    matchedWordCount += matchedSpan.count
-                    let transcribedWords: [WordTimestamp] = matchedSpan.enumerated().map { idx, word in
-                        let suffix = (idx + 1 < matchedSpan.count) ? " " : ""
-                        return WordTimestamp(
-                            timestamp: word.startTime,
-                            duration: max(0.05, word.duration),
-                            text: word.text + suffix
-                        )
-                    }
-                    let transcribedText = transcribedWords.map(\.text).joined()
-                    let actualWordEnd = matchedSpan.map(\.endTime).max() ?? shiftedEnd
-                    let clampedEnd = nextShiftedStart > startTs + 0.3 ? min(actualWordEnd, nextShiftedStart) : actualWordEnd
-                    let emittedDuration = max(0.3, clampedEnd - startTs)
-                    lastConsumedWordStart = max(lastConsumedWordStart, (matchedSpan.map(\.startTime).max() ?? startTs) + 0.001)
-                    previousLineEnd = max(previousLineEnd, startTs + emittedDuration)
-                    previousEmittedTimestamp = startTs
-                    alignedLines.append(
-                        LyricLine(
-                            id: line.id,
-                            timestamp: startTs,
-                            duration: emittedDuration,
-                            text: transcribedText,
-                            words: transcribedWords
-                        )
-                    )
-                }
-                // In transcript-only mode, omit untranscribed static fallback lines.
-                continue
-            }
 
             // A matched line's end is only where its last word's audio ran out, which can be stretched past
             // the next line's first word. If nothing starts after that end, the next line may start after
@@ -851,136 +804,6 @@ enum LyricsAudioAligner {
             }
         }
         return false
-    }
-
-    /// Guards transcription-text overwrite so unrelated desktop speech cannot replace a song's lyrics.
-    static func transcriptionMatchesLine(lineTokens: [DisplayToken], recognized: [RecognizedAudioWord]) -> Bool {
-        matchedTranscriptionSpan(lineTokens: lineTokens, recognized: recognized) != nil
-    }
-
-    /// Returns the tightest contiguous span of `recognized` words showing ordered overlap
-    /// across a meaningful portion of `lineTokens`, trimming unrelated surrounding speech.
-    static func matchedTranscriptionSpan(
-        lineTokens: [DisplayToken],
-        recognized: [RecognizedAudioWord],
-        acceptsStart: (Double) -> Bool = { _ in true }
-    ) -> [RecognizedAudioWord]? {
-        let lineNorms = lineTokens.map(\.normalized).filter { !$0.isEmpty }
-        guard !lineNorms.isEmpty, !recognized.isEmpty else { return nil }
-
-        let recEntries: [(windowIndex: Int, word: RecognizedAudioWord, norm: String)] = recognized.enumerated().compactMap { idx, word in
-            let norm = normalizeToken(word.text)
-            guard !norm.isEmpty else { return nil }
-            return (idx, word, norm)
-        }
-        guard !recEntries.isEmpty else { return nil }
-
-        let requiredMatches = lineNorms.count <= 1 ? 1 : max(2, (lineNorms.count + 1) / 2)
-        let maxTokenGap = 4
-        let maxTotalSpan = max(lineNorms.count + 3, lineNorms.count * 2)
-
-        var bestSpan: ClosedRange<Int>?
-        var bestMatchCount = 0
-        var bestSpanLength = Int.max
-
-        for lineStart in 0..<lineNorms.count {
-            for recStart in 0..<recEntries.count
-                where tokensMatch(lineNorms[lineStart], recEntries[recStart].norm) && acceptsStart(recEntries[recStart].word.startTime) {
-                var matchCount = 1
-                var prevRecIdx = recStart
-                var lastTime = recEntries[recStart].word.startTime
-                var cursor = recStart + 1
-
-                if lineStart + 1 < lineNorms.count {
-                    for lineIdx in (lineStart + 1)..<lineNorms.count {
-                        let limit = min(recEntries.count, prevRecIdx + maxTokenGap + 1)
-                        guard cursor < limit else { break }
-                        for cIdx in cursor..<limit where tokensMatch(lineNorms[lineIdx], recEntries[cIdx].norm) {
-                            let candidateTime = recEntries[cIdx].word.startTime
-                            if candidateTime - lastTime > 3.5 {
-                                break
-                            }
-                            matchCount += 1
-                            prevRecIdx = cIdx
-                            lastTime = candidateTime
-                            cursor = cIdx + 1
-                            break
-                        }
-                    }
-                }
-
-                guard matchCount >= requiredMatches else { continue }
-                let startWinIdx = recEntries[recStart].windowIndex
-                let endWinIdx = recEntries[prevRecIdx].windowIndex
-                let spanLength = endWinIdx - startWinIdx + 1
-                guard spanLength <= maxTotalSpan else { continue }
-
-                if matchCount > bestMatchCount
-                    || (matchCount == bestMatchCount && spanLength < bestSpanLength) {
-                    bestMatchCount = matchCount
-                    bestSpanLength = spanLength
-                    bestSpan = startWinIdx...endWinIdx
-                }
-            }
-        }
-
-        if let bestSpan {
-            return Array(recognized[bestSpan])
-        }
-
-        // Ordered character subsequence fallback over a contiguous span (handles CJK segmentation / minor diffs).
-        // Space-delimited lyrics must meet the token overlap above.
-        guard containsCJKWithoutSpaces(lineTokens.map(\.display).joined()) else { return nil }
-        let lineJoined = lineNorms.joined()
-        let lineChars = Array(lineJoined)
-        guard lineChars.count >= 4 else { return nil }
-
-        let maxRecTokens = min(recEntries.count, max(lineNorms.count * 2, 4))
-        var bestFallbackSpan: ClosedRange<Int>?
-        var bestLCS = 0
-        var bestScore = 0.0
-
-        for start in 0..<recEntries.count where acceptsStart(recEntries[start].word.startTime) {
-            var spanChars: [Character] = []
-            for end in start..<min(recEntries.count, start + maxRecTokens) {
-                spanChars.append(contentsOf: recEntries[end].norm)
-                guard recEntries[end].word.startTime - recEntries[start].word.startTime <= 5.0 else { break }
-                guard spanChars.count >= 4 else { continue }
-                let lcs = longestCommonSubsequenceLength(lineChars, spanChars)
-                let lineCoverage = Double(lcs) / Double(lineChars.count)
-                let spanCoverage = Double(lcs) / Double(spanChars.count)
-                guard lineCoverage >= 0.70, spanCoverage >= 0.70 else { continue }
-                let score = (2.0 * Double(lcs)) / Double(lineChars.count + spanChars.count)
-                if lcs > bestLCS || (lcs == bestLCS && score > bestScore) {
-                    bestLCS = lcs
-                    bestScore = score
-                    bestFallbackSpan = recEntries[start].windowIndex...recEntries[end].windowIndex
-                }
-            }
-        }
-
-        if let bestFallbackSpan {
-            return Array(recognized[bestFallbackSpan])
-        }
-        return nil
-    }
-
-    private static func longestCommonSubsequenceLength(_ lhs: [Character], _ rhs: [Character]) -> Int {
-        guard !lhs.isEmpty, !rhs.isEmpty else { return 0 }
-        var dp = [Int](repeating: 0, count: rhs.count + 1)
-        for ch in lhs {
-            var prevDiag = 0
-            for j in 0..<rhs.count {
-                let saved = dp[j + 1]
-                if ch == rhs[j] {
-                    dp[j + 1] = prevDiag + 1
-                } else {
-                    dp[j + 1] = max(dp[j + 1], dp[j])
-                }
-                prevDiag = saved
-            }
-        }
-        return dp[rhs.count]
     }
 
     private static func interpolateWordTimestamps(
