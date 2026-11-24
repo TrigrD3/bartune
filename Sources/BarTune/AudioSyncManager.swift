@@ -462,6 +462,8 @@ final class AudioSyncManager {
     private var attemptedLineIDs: Set<Int> = []
     /// Lines the engine aligned confidently on this play.
     private var confidentLineIDs: Set<Int> = []
+    /// Lines aligned just below that on this play; they lock on a vocal onset.
+    private var nearlyConfidentLineIDs: Set<Int> = []
     private var acceptedSessionLines: [Int: LyricLine] = [:]
     private var activeTrackDuration: Double = 0
     private(set) var recognizedWords: [RecognizedAudioWord] = []
@@ -543,6 +545,7 @@ final class AudioSyncManager {
         lockedThisPlay = [:]
         attemptedLineIDs = []
         confidentLineIDs = []
+        nearlyConfidentLineIDs = []
         acceptedSessionLines = [:]
         activeTrackDuration = track.duration
         vocalEnvelope = VocalEnvelope()
@@ -966,6 +969,7 @@ final class AudioSyncManager {
             if let reporter = engine as? LineAttemptReporting {
                 self.attemptedLineIDs.formUnion(reporter.attemptedLineIDs)
                 self.confidentLineIDs.formUnion(reporter.confidentLineIDs)
+                self.nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
             }
             self.applyLyricsAlignment()
             self.dispatchChunkIfReady(trackId: trackId, generation: generation)
@@ -1108,14 +1112,33 @@ final class AudioSyncManager {
         }
     }
 
+    /// The vocal level rise (dB) at a nearly confident line's start that locks it. Tuned on JamendoLyrics
+    /// (English): with `onsetLockConfidence` it adds a fifth more locked lines, about 93% of them within
+    /// 300 ms of the sung start on songs it was not tuned on.
+    nonisolated static let onsetLockRise: Float = 3
+
+    /// Whether an aligned line locks: a confident one always, a nearly confident one when its start sits on a vocal onset.
+    nonisolated static func locks(_ line: LyricLine, confident: Set<Int>, nearlyConfident: Set<Int>, envelope: VocalEnvelope) -> Bool {
+        if confident.contains(line.id) { return true }
+        guard nearlyConfident.contains(line.id), let start = line.words.first?.timestamp,
+              let rise = envelope.onsetRise(at: start)
+        else { return false }
+        return rise >= onsetLockRise
+    }
+
     /// Lyrics Alignment locks each confidently aligned line and keeps listening until no further play could
     /// lock another (see `lyricsAlignmentProgress`), saving after each chunk so a later play only listens for the rest.
     private func applyLyricsAlignment() {
         guard !baseLines.isEmpty else { return }
         let fresh = alignHeardWords()
         // Only a line aligned from this play's audio can lock, never one carried over unlocked.
-        let alignedNow = Set(fresh.matchedLineIDs).intersection(confidentLineIDs).subtracting(lockedLineIDs)
-        for line in fresh.lines where alignedNow.contains(line.id) {
+        let alignedNow = Set(fresh.matchedLineIDs).subtracting(lockedLineIDs)
+        for line in fresh.lines where alignedNow.contains(line.id) && Self.locks(
+            line,
+            confident: confidentLineIDs,
+            nearlyConfident: nearlyConfidentLineIDs,
+            envelope: vocalEnvelope
+        ) {
             lockedThisPlay[line.id] = line
         }
         let result = keepingLockedAndAccepted(fresh)

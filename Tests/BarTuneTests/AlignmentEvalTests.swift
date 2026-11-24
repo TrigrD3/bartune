@@ -178,8 +178,9 @@ final class AlignmentEvalTests: XCTestCase {
             let frozen = locked.merging(lockedNow) { old, _ in old }
             let matched = matchedNow.union(accepted.keys).union(frozen.keys)
             var shown = result.lines.map { frozen[$0.id] ?? (matchedNow.contains($0.id) ? $0 : accepted[$0.id] ?? $0) }
-            let confident = reporter.confidentLineIDs
-            for line in shown where matched.contains(line.id) && confident.contains(line.id) && frozen[line.id] == nil {
+            let confident = reporter.confidentLineIDs, nearlyConfident = reporter.nearlyConfidentLineIDs
+            for line in shown where matched.contains(line.id) && frozen[line.id] == nil
+                && AudioSyncManager.locks(line, confident: confident, nearlyConfident: nearlyConfident, envelope: envelope) {
                 lockedNow[line.id] = line
             }
             shown = shown.map { locked[$0.id] ?? lockedNow[$0.id] ?? $0 }

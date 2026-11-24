@@ -176,6 +176,7 @@ final class LyricsForcedAlignerTests: XCTestCase {
 
         XCTAssertEqual(words.count, 2, "an unconfident line is still shown")
         XCTAssertEqual(aligner.confidentLineIDs, [10])
+        XCTAssertEqual(aligner.nearlyConfidentLineIDs, [11], "a weakly heard line may still lock on a vocal onset")
         XCTAssertEqual(aligner.attemptedLineIDs, [10, 11], "the anchor isn't attempted")
     }
 
