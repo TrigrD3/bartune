@@ -112,10 +112,10 @@ struct SettingsView: View {
     @State private var lyricsAlignerInstalled: Bool = false
     @State private var isDownloadingAligner: Bool = false
     @State private var alignerDownloadError: String?
-    @State private var metricsTracker = ResourceMetricsTracker()
+    /// Held unobserved so samples re-render only `AppPerformanceSection`; averages survive tab switches.
+    @State private var resourceMetrics = ResourceMetricsModel()
     @State private var permissions = AppPermissionsSnapshot.empty
     @State private var showInstallConfirmation: Bool = false
-    private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
 
     var body: some View {
         HStack(spacing: 0) {
@@ -240,58 +240,11 @@ struct SettingsView: View {
                 }
             }
 
-            Section("App Performance") {
-                HStack {
-                    Text("CPU Usage")
-                    Spacer()
-                    Text(String(
-                        format: "%.1f%% (avg %.1f%%)",
-                        metricsTracker.latestCPUPercent,
-                        metricsTracker.averageCPUPercent
-                    ))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                }
-
-                HStack {
-                    Text("Memory Usage")
-                    Spacer()
-                    let currentMem = ByteCountFormatter.string(
-                        fromByteCount: Int64(metricsTracker.latestMemoryBytes),
-                        countStyle: .memory
-                    )
-                    let avgMem = ByteCountFormatter.string(
-                        fromByteCount: Int64(metricsTracker.averageMemoryBytes),
-                        countStyle: .memory
-                    )
-                    Text("\(currentMem) (avg \(avgMem))")
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                }
-
-                HStack {
-                    Text("Averaged over \(metricsTracker.sampleCount) \(metricsTracker.sampleCount == 1 ? "sample" : "samples")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Reset Average") {
-                        metricsTracker.reset()
-                        refreshResourceMetrics()
-                    }
-                    .controlSize(.small)
-                    .disabled(metricsTracker.sampleCount <= 1)
-                }
-            }
+            AppPerformanceSection(metrics: resourceMetrics)
         }
         .formStyle(.grouped)
         .onAppear {
-            refreshResourceMetrics()
             refreshPermissions()
-        }
-        .onReceive(resourceTimer) { _ in
-            if selectedTab == .general {
-                refreshResourceMetrics()
-            }
         }
     }
 
@@ -1187,11 +1140,6 @@ struct SettingsView: View {
         }
     }
 
-    private func refreshResourceMetrics() {
-        let metrics = AppResourceMetrics.sample()
-        metricsTracker.record(cpuPercent: metrics.cpuPercent, memoryBytes: metrics.memoryBytes)
-    }
-
     private func refreshPermissions() {
         permissions = AppPermissionsChecker.current()
     }
@@ -1468,6 +1416,73 @@ private struct CachedSongFileSheet: View {
         let mins = Int(clamped) / 60
         let secs = clamped - Double(mins * 60)
         return String(format: "%02d:%05.2f", mins, secs)
+    }
+}
+
+@MainActor
+final class ResourceMetricsModel: ObservableObject {
+    @Published var tracker = ResourceMetricsTracker()
+
+    func sample() {
+        let metrics = AppResourceMetrics.sample()
+        tracker.record(cpuPercent: metrics.cpuPercent, memoryBytes: metrics.memoryBytes)
+    }
+}
+
+/// Owns the 2 s metrics timer so each sample re-renders only this section, not the whole Settings form (#200).
+private struct AppPerformanceSection: View {
+    @ObservedObject var metrics: ResourceMetricsModel
+    private let resourceTimer = Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        Section("App Performance") {
+            HStack {
+                Text("CPU Usage")
+                Spacer()
+                Text(String(
+                    format: "%.1f%% (avg %.1f%%)",
+                    metrics.tracker.latestCPUPercent,
+                    metrics.tracker.averageCPUPercent
+                ))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Text("Memory Usage")
+                Spacer()
+                let currentMem = ByteCountFormatter.string(
+                    fromByteCount: Int64(metrics.tracker.latestMemoryBytes),
+                    countStyle: .memory
+                )
+                let avgMem = ByteCountFormatter.string(
+                    fromByteCount: Int64(metrics.tracker.averageMemoryBytes),
+                    countStyle: .memory
+                )
+                Text("\(currentMem) (avg \(avgMem))")
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack {
+                Text("Averaged over \(metrics.tracker.sampleCount) \(metrics.tracker.sampleCount == 1 ? "sample" : "samples")")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Reset Average") {
+                    metrics.tracker.reset()
+                    metrics.sample()
+                }
+                .controlSize(.small)
+                .disabled(metrics.tracker.sampleCount <= 1)
+            }
+        }
+        .onAppear {
+            metrics.sample()
+        }
+        .onReceive(resourceTimer) { _ in
+            metrics.sample()
+        }
     }
 }
 
