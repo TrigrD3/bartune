@@ -145,6 +145,19 @@ struct VocalEnvelope {
         segments.last { $0.start <= range.lowerBound && range.upperBound <= $0.end }
     }
 
+    /// How much louder (dB) the 0.25 s after `time` is than 0.35–0.05 s before it; nil unless one segment holds both.
+    /// A line whose words the aligner barely heard is locked only when its start sits on such a rise.
+    func onsetRise(at time: Double) -> Float? {
+        guard let segment = segment(covering: (time - 0.35)...(time + 0.25)) else { return nil }
+        func mean(_ from: Double, _ to: Double) -> Float? {
+            let low = max(0, segment.frame(at: from)), high = min(segment.levels.count - 1, segment.frame(at: to))
+            guard high > low else { return nil }
+            return segment.levels[low...high].reduce(0, +) / Float(high - low + 1)
+        }
+        guard let after = mean(time, time + 0.25), let before = mean(time - 0.35, time - 0.05) else { return nil }
+        return after - before
+    }
+
     /// The level below which the given share of all frames fall, once at least 5 s were heard.
     func percentile(_ share: Double) -> Float? {
         let all = segments.flatMap(\.levels)

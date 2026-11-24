@@ -27,6 +27,13 @@ final class VocalWaveformTests: XCTestCase {
 
     // MARK: - Envelope
 
+    func testOnsetRiseIsLargeWhereTheVoiceStartsAndSmallInsideAHeldNote() throws {
+        let env = envelope([(1.0, 0.005), (1.0, 0.5)])
+        XCTAssertGreaterThan(try XCTUnwrap(env.onsetRise(at: 1.0)), 20)
+        XCTAssertLessThan(try abs(XCTUnwrap(env.onsetRise(at: 1.6))), 1)
+        XCTAssertNil(env.onsetRise(at: 0.2), "the audio before the start wasn't heard")
+    }
+
     func testEnvelopeIsLoudWhereTheVoiceBandSoundsAndQuietElsewhere() {
         let env = envelope([(1, 0), (1, 0.5)], start: 30)
         XCTAssertEqual(env.segments.count, 1)

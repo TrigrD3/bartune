@@ -298,6 +298,8 @@ protocol LineAttemptReporting: AnyObject {
     var attemptedLineIDs: Set<Int> { get }
     /// Aligned lines whose words the model heard clearly enough to lock.
     var confidentLineIDs: Set<Int> { get }
+    /// Aligned lines just below that, locked only when the vocal envelope rises at their start.
+    var nearlyConfidentLineIDs: Set<Int> { get }
 }
 
 final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
@@ -321,6 +323,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private var done = Set<Int>()
     private let anchoredIndices: Set<Int>
     private var confident = Set<Int>()
+    private var nearlyConfident = Set<Int>()
 
     // The current run of contiguous audio; a seek or rate change starts a new one.
     private var runStartTime = 0.0
@@ -339,6 +342,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     /// A line whose words average at least this confidence is locked. Tuned on JamendoLyrics (English):
     /// 93% of such lines start within 300 ms of the sung onset, against 70% of all aligned lines.
     static let lockConfidence = 0.15
+    /// A line from this confidence up is locked when its start sits on a vocal onset (`VocalEnvelope.onsetRise`).
+    static let onsetLockConfidence = 0.08
 
     static let sampleRate = 16000
 
@@ -408,6 +413,12 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         lock.lock()
         defer { lock.unlock() }
         return Set(confident.map { lines[$0].id })
+    }
+
+    var nearlyConfidentLineIDs: Set<Int> {
+        lock.lock()
+        defer { lock.unlock() }
+        return Set(nearlyConfident.subtracting(confident).map { lines[$0].id })
     }
 
     // swiftlint:disable:next async_without_await
@@ -603,7 +614,11 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 let median = lineOffsets.sorted()[lineOffsets.count / 2]
                 if abs(offset - median) > maxOffsetDeviation {
                     dropped.insert(line)
+                    continue
                 }
+            }
+            if meanConfidence >= Self.onsetLockConfidence {
+                nearlyConfident.insert(line)
             }
         }
         return zip(words, wordLines).filter { !dropped.contains($0.1) }.map(\.0)
