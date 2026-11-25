@@ -78,6 +78,7 @@ struct VocalEnvelope {
     static let maxFrames = 120_000
 
     private(set) var segments: [Segment] = []
+    private(set) var totalFrameCount = 0
     private var midFilter = VoiceBandFilter(sampleRate: 16000)
     private var sideFilter = VoiceBandFilter(sampleRate: 16000)
     private var sampleRate = 0.0
@@ -137,6 +138,7 @@ struct VocalEnvelope {
                 segments[segIdx].levels.append(10 * log10(centre + 1e-10))
                 segments[segIdx].minPeaks.append(max(-1.0, min(0.0, frameMin)))
                 segments[segIdx].maxPeaks.append(min(1.0, max(0.0, frameMax)))
+                totalFrameCount += 1
                 midEnergy = 0
                 sideEnergy = 0
                 frameMin = 0
@@ -150,18 +152,18 @@ struct VocalEnvelope {
     private var samplesPerFrame: Double { (sampleRate * Self.frameSeconds).rounded() }
 
     private mutating func trimToCapacity() {
-        var total = segments.reduce(0) { $0 + $1.levels.count }
-        while total > Self.maxFrames, segments.count > 1 {
-            total -= segments.removeFirst().levels.count
+        while totalFrameCount > Self.maxFrames, segments.count > 1 {
+            totalFrameCount -= segments.removeFirst().levels.count
         }
         // One continuous segment past capacity keeps its newest frames.
-        if total > Self.maxFrames, var only = segments.first {
-            let excess = total - Self.maxFrames
+        if totalFrameCount > Self.maxFrames, var only = segments.first {
+            let excess = totalFrameCount - Self.maxFrames
             only.levels.removeFirst(excess)
             if only.minPeaks.count >= excess { only.minPeaks.removeFirst(excess) }
             if only.maxPeaks.count >= excess { only.maxPeaks.removeFirst(excess) }
             only.start += Double(excess) * only.step
             segments[0] = only
+            totalFrameCount -= excess
         }
     }
 
@@ -223,6 +225,7 @@ struct VocalEnvelope {
 
         var merged = VocalEnvelope()
         merged.segments = keptCached + keptLive
+        merged.totalFrameCount = merged.segments.reduce(0) { $0 + $1.levels.count }
         return merged.segments.isEmpty ? nil : merged
     }
 

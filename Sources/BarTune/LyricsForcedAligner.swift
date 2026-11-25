@@ -649,6 +649,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
 /// The Core ML conversion of the MMS forced-aligner, run on the Neural Engine.
 final class CoreMLAcousticModel: CTCAcousticModel, @unchecked Sendable {
     private let model: MLModel
+    private let lock = NSLock()
+    private let inputArray: MLMultiArray
+    private let inputProvider: MLDictionaryFeatureProvider
     let windowSampleCount: Int
     let frameCount: Int
     let vocabSize: Int
@@ -663,20 +666,34 @@ final class CoreMLAcousticModel: CTCAcousticModel, @unchecked Sendable {
               let output = model.modelDescription.outputDescriptionsByName["logprobs"]?.multiArrayConstraint?.shape,
               input.count == 2, output.count == 3
         else { return nil }
+        let sampleCount = input[1].intValue
+        guard let reusableInput = try? MLMultiArray(shape: [1, NSNumber(value: sampleCount)], dataType: .float32),
+              let reusableProvider = try? MLDictionaryFeatureProvider(dictionary: ["audio": reusableInput])
+        else { return nil }
         self.model = model
-        windowSampleCount = input[1].intValue
+        inputArray = reusableInput
+        inputProvider = reusableProvider
+        windowSampleCount = sampleCount
         frameCount = output[1].intValue
         vocabSize = output[2].intValue
     }
 
     func logProbabilities(window: [Float]) throws -> [Float] {
-        let input = try MLMultiArray(shape: [1, NSNumber(value: windowSampleCount)], dataType: .float32)
-        let destination = input.dataPointer.bindMemory(to: Float.self, capacity: windowSampleCount)
-        for index in 0..<min(window.count, windowSampleCount) {
-            destination[index] = window[index]
+        lock.lock()
+        defer { lock.unlock() }
+        let destination = inputArray.dataPointer.bindMemory(to: Float.self, capacity: windowSampleCount)
+        let copyCount = min(window.count, windowSampleCount)
+        if copyCount > 0 {
+            window.withUnsafeBufferPointer { source in
+                if let base = source.baseAddress {
+                    destination.update(from: base, count: copyCount)
+                }
+            }
         }
-        let provider = try MLDictionaryFeatureProvider(dictionary: ["audio": input])
-        guard let output = try model.prediction(from: provider).featureValue(for: "logprobs")?.multiArrayValue else {
+        if copyCount < windowSampleCount {
+            destination.advanced(by: copyCount).initialize(repeating: 0, count: windowSampleCount - copyCount)
+        }
+        guard let output = try model.prediction(from: inputProvider).featureValue(for: "logprobs")?.multiArrayValue else {
             return []
         }
         // Rows can be padded, so elements are read through the strides, not the flat subscript.
@@ -707,10 +724,81 @@ final class CoreMLAcousticModel: CTCAcousticModel, @unchecked Sendable {
     }
 }
 
+/// Reuses the compiled acoustic model across tracks so Core ML avoids re-running ANECompiler on every song.
+final class AcousticModelCache: @unchecked Sendable {
+    private struct Key: Hashable {
+        let url: URL
+        let modificationDate: Date?
+    }
+
+    private final class PendingLoad {
+        var model: CTCAcousticModel?
+        var finished = false
+    }
+
+    private let condition = NSCondition()
+    private var inFlight: [Key: PendingLoad] = [:]
+    private var generation = 0
+    private var currentKey: Key?
+    private var cached: CTCAcousticModel?
+
+    func load(
+        compiledURL: URL,
+        modificationDate: Date?,
+        loader: (URL) -> CTCAcousticModel?
+    ) -> CTCAcousticModel? {
+        let key = Key(url: compiledURL.standardizedFileURL, modificationDate: modificationDate)
+        condition.lock()
+        defer { condition.unlock() }
+        if currentKey != key {
+            currentKey = key
+            cached = nil
+        }
+        if let cached { return cached }
+        if let pending = inFlight[key] {
+            while !pending.finished {
+                condition.wait()
+            }
+            return pending.model
+        }
+
+        let pending = PendingLoad()
+        inFlight[key] = pending
+        let loadGeneration = generation
+        condition.unlock()
+        let model = loader(key.url)
+        condition.lock()
+
+        if generation == loadGeneration {
+            inFlight[key] = nil
+            if currentKey == key { cached = model }
+        }
+        // Callers already waiting on this load receive its result even after invalidation.
+        pending.model = model
+        pending.finished = true
+        condition.broadcast()
+        return model
+    }
+
+    func invalidate() {
+        condition.lock()
+        generation += 1
+        inFlight.removeAll()
+        currentKey = nil
+        cached = nil
+        condition.unlock()
+    }
+}
+
 /// Where the Core ML alignment model lives, and how a sync session loads it.
 enum LyricsAlignerModel {
     static let packageName = "LyricsAligner.mlpackage"
     static let compiledName = "LyricsAligner.mlmodelc"
+    private static let sharedModelCache = AcousticModelCache()
+
+    static func releaseCachedModel() {
+        sharedModelCache.invalidate()
+    }
 
     static var directory: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -770,6 +858,7 @@ enum LyricsAlignerModel {
         guard ditto.terminationStatus == 0, fileManager.fileExists(atPath: unpacked.path) else {
             throw InstallError.unpackFailed
         }
+        releaseCachedModel()
         for name in [packageName, compiledName] {
             try? fileManager.removeItem(at: directory.appendingPathComponent(name))
         }
@@ -782,8 +871,9 @@ enum LyricsAlignerModel {
             || fileManager.fileExists(atPath: directory.appendingPathComponent(packageName).path)
     }
 
-    /// Returns an aligner for `lines`, compiling an installed `.mlpackage` once; nil when the model is
-    /// missing, fails to load, or the Mac has no Neural Engine (the model's CPU path returns NaN).
+    /// Returns an aligner for `lines`, compiling an installed `.mlpackage` once and reusing the loaded
+    /// `CoreMLAcousticModel` across tracks until released; nil when the model is missing, fails to load,
+    /// or the Mac has no Neural Engine (the model's CPU path returns NaN).
     static func launch(
         lines: [LyricLine],
         anchors: [Int: ClosedRange<Double>] = [:],
@@ -795,11 +885,15 @@ enum LyricsAlignerModel {
             let fileManager = FileManager.default
             if !fileManager.fileExists(atPath: compiled.path), fileManager.fileExists(atPath: package.path) {
                 guard let temporary = try? await MLModel.compileModel(at: package) else { return nil }
+                releaseCachedModel()
                 try? fileManager.removeItem(at: compiled)
                 guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
             }
+            let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
             return await Task.detached(priority: .utility) {
-                CoreMLAcousticModel(compiledModelURL: compiled).map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
+                sharedModelCache.load(compiledURL: compiled, modificationDate: modDate) {
+                    CoreMLAcousticModel(compiledModelURL: $0)
+                }.map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
             }.value
         #else
             return nil

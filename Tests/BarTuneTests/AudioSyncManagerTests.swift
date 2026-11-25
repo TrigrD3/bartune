@@ -856,6 +856,33 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedAlignerRestartReleasesThePreviouslyCachedModelAfterIdle() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        let capture = FakeAudioCapture()
+        let nextEngine = LockedBox<FakeChunkEngine?>(FakeChunkEngine { _ in [] })
+        var deps = makeDependencies(capture: capture, launchAligner: { _, _ in
+            nextEngine.withLock { engine in
+                defer { engine = nil }
+                return engine
+            }
+        })
+        let released = expectation(description: "Released the cached model after restart failed")
+        deps.idleModelReleaseSleep = { _ in }
+        deps.releaseCachedModel = { released.fulfill() }
+
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines(), forceResync: true)
+        await fulfillment(of: [released], timeout: 2)
+        XCTAssertFalse(manager.isLiveSyncActive)
+        XCTAssertEqual(capture.startCount, 1)
+    }
+
+    @MainActor
     func testAudioSampleBufferIsBoundedAndDispatchesCappedChunks() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
@@ -1043,6 +1070,24 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     // MARK: - #115: Seek discards partial audio chunk
+
+    func testSeekRetainsStereoSuffixAtFirstPostSeekSample() throws {
+        let batch = CapturedAudio(
+            samples: [1, 2, 3, 4], side: [-1, -2, -3, -4], sampleRate: 4,
+            captureDelay: 1.5, capturedAt: 10
+        )
+        let suffix = try XCTUnwrap(batch.trimmingBefore(10.375, deliveredAt: 11.5))
+        XCTAssertEqual(suffix.samples, [3, 4])
+        XCTAssertEqual(suffix.side, [-3, -4])
+        XCTAssertEqual(suffix.capturedAt, 10.5)
+        XCTAssertEqual(suffix.captureDelay, 1)
+        XCTAssertNil(batch.trimmingBefore(11, deliveredAt: 11.5))
+    }
+
+    func testSeekRetainsSampleExactlyOnBoundary() {
+        let batch = CapturedAudio(samples: [1, 2, 3, 4], sampleRate: 10, capturedAt: 10)
+        XCTAssertEqual(batch.trimmingBefore(10.3, deliveredAt: 10.4)?.samples, [4])
+    }
 
     @MainActor
     func testAlignerDiscardsPartialChunkOnSameTrackSeek() async {
@@ -1657,6 +1702,31 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testRetiredCaptureStreamCannotDeliverSamplesToNextSession() async throws {
+        let target: Set<String> = ["com.spotify.client"]
+        let backend = FakeSystemAudioCaptureBackend(initialApps: Array(target))
+        let capture = SystemAudioCapture(backend: backend)
+        capture.onAudioSamples = { _ in XCTFail("Retired stream delivered audio") }
+        try await capture.start(targetBundleIds: target)
+        let retired = try XCTUnwrap(backend.startedStreams.last)
+        capture.stop()
+
+        let received = LockedBox<[[Float]]>([])
+        capture.onAudioSamples = { audio in received.withLock { $0.append(audio.samples) } }
+        try await capture.start(targetBundleIds: target)
+        let current = try XCTUnwrap(backend.startedStreams.last)
+
+        // Contiguous half-batches would combine if the retired stream could still write to the new batcher.
+        retired.emit(CapturedAudio(samples: [1], sampleRate: 10, capturedAt: 100))
+        current.emit(CapturedAudio(samples: [2], sampleRate: 10, capturedAt: 100.1))
+        XCTAssertTrue(received.withLock { $0.isEmpty })
+        current.emit(CapturedAudio(samples: [3], sampleRate: 10, capturedAt: 100.2))
+        retired.emit(CapturedAudio(samples: [4], sampleRate: 10, capturedAt: 100.1))
+        XCTAssertEqual(received.withLock { $0 }, [[2, 3]])
+        capture.stop()
+    }
+
+    @MainActor
     func testSystemAudioCaptureLeavesCaptureStoppedWhenPlayerUnresolved() async {
         let backend = FakeSystemAudioCaptureBackend(initialApps: ["com.apple.Finder", "com.apple.Safari"])
         let capture = SystemAudioCapture(backend: backend)
@@ -1849,9 +1919,12 @@ final class AudioSyncManagerTests: XCTestCase {
         let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
         XCTAssertTrue(chromeStarted)
 
+        let chromeHandler = fakeCapture.onAudioSamples
         // Chrome audio captured but still queued for main-actor delivery when the handoff lands.
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
         manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
+        // A Chrome callback already executing on the audio queue can finish after the handoff.
+        chromeHandler?(CapturedAudio(samples: [0.2], sampleRate: 100))
         fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
 
@@ -2853,6 +2926,241 @@ final class AudioSyncManagerTests: XCTestCase {
         manager.stop()
     }
 
+    func testAudioCaptureBatcherCoalescesContiguousBuffersAndFlushesOnGapOrFormatChange() throws {
+        var batcher = AudioCaptureBatcher(targetDuration: 0.20)
+        var emitted: [CapturedAudio] = []
+        // Ten contiguous 20 ms stereo buffers at 16 kHz (320 samples each) coalesce into one 200 ms batch.
+        for i in 0..<10 {
+            let start = 100.0 + Double(i) * 0.02
+            let mid = [Float](repeating: Float(i + 1) * 0.01, count: 320)
+            let side = [Float](repeating: 0.005, count: 320)
+            emitted.append(contentsOf: batcher.append(CapturedAudio(
+                samples: mid,
+                side: side,
+                sampleRate: 16000,
+                captureDelay: 0.03,
+                capturedAt: start
+            ), deliveryUptime: start + 0.03))
+        }
+        XCTAssertEqual(emitted.count, 1)
+        let firstBatch = try XCTUnwrap(emitted.first)
+        XCTAssertEqual(firstBatch.samples.count, 3200)
+        XCTAssertEqual(firstBatch.side.count, 3200)
+        XCTAssertEqual(try XCTUnwrap(firstBatch.capturedAt), 100.0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(firstBatch.captureDelay), 0.21, accuracy: 0.0001)
+
+        // A partial buffer followed by a >50 ms timing gap flushes the prior partial buffer immediately.
+        XCTAssertTrue(batcher.append(CapturedAudio(
+            samples: [Float](repeating: 0.1, count: 320),
+            side: [Float](repeating: 0.0, count: 320),
+            sampleRate: 16000,
+            captureDelay: 0.02,
+            capturedAt: 100.20
+        )).isEmpty)
+        let gapFlushed = batcher.append(CapturedAudio(
+            samples: [Float](repeating: 0.2, count: 320),
+            side: [Float](repeating: 0.0, count: 320),
+            sampleRate: 16000,
+            captureDelay: 0.02,
+            capturedAt: 100.50
+        ), deliveryUptime: 100.52)
+        XCTAssertEqual(gapFlushed.count, 1)
+        XCTAssertEqual(gapFlushed[0].samples.count, 320)
+        XCTAssertEqual(try XCTUnwrap(gapFlushed[0].capturedAt), 100.20, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(gapFlushed[0].captureDelay), 0.32, accuracy: 0.0001)
+
+        // A mono/sample-rate switch flushes the buffered stereo chunk before starting the new format.
+        let formatFlushed = batcher.append(CapturedAudio(
+            samples: [Float](repeating: 0.3, count: 320),
+            side: [],
+            sampleRate: 48000,
+            captureDelay: 0.01,
+            capturedAt: 100.52
+        ))
+        XCTAssertEqual(formatFlushed.count, 1)
+        XCTAssertEqual(formatFlushed[0].sampleRate, 16000)
+        XCTAssertEqual(formatFlushed[0].side.count, 320)
+
+        let remaining = try XCTUnwrap(batcher.flush())
+        XCTAssertEqual(remaining.sampleRate, 48000)
+        XCTAssertTrue(remaining.side.isEmpty)
+        XCTAssertNil(batcher.flush())
+    }
+
+    func testStreamConfigurationMinimizesVideoFrameWork() {
+        let config = SystemAudioCapture.makeStreamConfiguration()
+        XCTAssertTrue(config.capturesAudio)
+        XCTAssertTrue(config.excludesCurrentProcessAudio)
+        XCTAssertEqual(config.sampleRate, 16000)
+        XCTAssertEqual(config.channelCount, 2)
+        XCTAssertFalse(config.showsCursor)
+        XCTAssertEqual(config.queueDepth, 3)
+        XCTAssertGreaterThanOrEqual(config.minimumFrameInterval.seconds, 60.0)
+    }
+
+    @MainActor
+    func testChunkInferenceRunsAtBackgroundPriority() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let observedPriority = LockedBox<TaskPriority?>(nil)
+        var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine { _ in
+                observedPriority.withLock { $0 = Task.currentPriority }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
+        let ran = await waitUntil { observedPriority.withLock { $0 != nil } }
+        XCTAssertTrue(ran)
+        XCTAssertEqual(observedPriority.withLock { $0 }, .background)
+        manager.stop()
+    }
+
+    @MainActor
+    func testIdleModelReleaseFiresAfterStopAndCancelsWhenNextTrackStartsSyncing() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let fakeCapture = FakeAudioCapture()
+        let releaseCount = LockedBox<Int>(0)
+        let clock = ControlledNotifyClock()
+        let cancellations = LockedBox(0)
+
+        var deps = makeDependencies(capture: fakeCapture)
+        deps.releaseCachedModel = { releaseCount.withLock { $0 += 1 } }
+        deps.idleModelReleaseSleep = { delay in
+            try await withTaskCancellationHandler {
+                try await clock.sleep(until: clock.now().advanced(by: delay))
+            } onCancel: {
+                cancellations.withLock { $0 += 1 }
+            }
+        }
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let track2 = TrackInfo(id: "spotify:track:idle-2", title: "Two", artist: "A", album: "", duration: 120, artworkURL: nil)
+        let track3 = TrackInfo(id: "spotify:track:idle-3", title: "Three", artist: "A", album: "", duration: 120, artworkURL: nil)
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started1 = await waitUntil { fakeCapture.startCount == 1 }
+        XCTAssertTrue(started1)
+        manager.stop()
+        let firstTimerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(firstTimerArmed)
+
+        clock.advance(by: .seconds(59))
+        let wordSynced = LyricLine(id: 0, timestamp: 0, text: "Already timed", words: [
+            WordTimestamp(timestamp: 0, duration: 1, text: "Already "),
+            WordTimestamp(timestamp: 1, duration: 1, text: "timed"),
+        ])
+        manager.handleTrackLoaded(track: track2, rawLines: [wordSynced])
+        XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
+        XCTAssertTrue(clock.hasPendingWaiter)
+        XCTAssertEqual(cancellations.withLock { $0 }, 0)
+
+        manager.handleTrackLoaded(track: track3, rawLines: sampleLines())
+        let started3 = await waitUntil { fakeCapture.startCount == 2 }
+        XCTAssertTrue(started3)
+        XCTAssertEqual(cancellations.withLock { $0 }, 1)
+        XCTAssertFalse(clock.hasPendingWaiter)
+        XCTAssertEqual(releaseCount.withLock { $0 }, 0)
+
+        manager.stop()
+        let finalTimerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(finalTimerArmed)
+        clock.advance(by: .seconds(60))
+        let released = await waitUntil { releaseCount.withLock { $0 == 1 } }
+        XCTAssertTrue(released)
+    }
+
+    @MainActor
+    func testLateCancelledAlignerStartupSchedulesAnotherIdleModelRelease() async {
+        await checkLateCancelledStartup(startReplacement: false)
+    }
+
+    @MainActor
+    func testLateCancelledAlignerStartupDoesNotReleaseActiveReplacement() async {
+        await checkLateCancelledStartup(startReplacement: true)
+    }
+
+    @MainActor
+    private func checkLateCancelledStartup(startReplacement: Bool) async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        let capture = FakeAudioCapture()
+        let clock = ControlledNotifyClock()
+        let releaseCount = LockedBox(0)
+        let staleEngine = FakeChunkEngine { _ in [] }
+        let launchStarted = expectation(description: "First aligner launch started")
+        let releaseLaunch = LockedBox<CheckedContinuation<Void, Never>?>(nil)
+        let launchCount = LockedBox(0)
+        var deps = makeDependencies(capture: capture, launchAligner: { _, _ in
+            let count = launchCount.withLock { value -> Int in
+                value += 1
+                return value
+            }
+            if count == 1 {
+                await withCheckedContinuation { continuation in
+                    releaseLaunch.withLock { $0 = continuation }
+                    launchStarted.fulfill()
+                }
+                return staleEngine
+            }
+            return FakeChunkEngine { _ in [] }
+        })
+        deps.releaseCachedModel = { releaseCount.withLock { $0 += 1 } }
+        deps.idleModelReleaseSleep = { delay in
+            try await clock.sleep(until: clock.now().advanced(by: delay))
+        }
+
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        await fulfillment(of: [launchStarted], timeout: 2)
+        manager.stop()
+
+        let firstTimerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(firstTimerArmed)
+        clock.advance(by: .seconds(60))
+        let firstReleaseFired = await waitUntil { releaseCount.withLock { $0 == 1 } }
+        XCTAssertTrue(firstReleaseFired)
+
+        if startReplacement {
+            manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines(), forceResync: true)
+            let replacementStarted = await waitUntil { manager.isLiveSyncActive }
+            XCTAssertTrue(replacementStarted)
+        }
+        releaseLaunch.withLock { continuation in
+            continuation?.resume()
+            continuation = nil
+        }
+        let staleEngineShutDown = await waitUntil { staleEngine.shutdownCount == 1 }
+        XCTAssertTrue(staleEngineShutDown)
+        if startReplacement {
+            XCTAssertFalse(clock.hasPendingWaiter)
+            clock.advance(by: .seconds(60))
+            XCTAssertEqual(releaseCount.withLock { $0 }, 1)
+        } else {
+            let secondTimerArmed = await waitUntil { clock.hasPendingWaiter }
+            XCTAssertTrue(secondTimerArmed)
+            clock.advance(by: .seconds(59))
+            XCTAssertTrue(clock.hasPendingWaiter)
+            XCTAssertEqual(releaseCount.withLock { $0 }, 1)
+            clock.advance(by: .seconds(1))
+            let secondReleaseFired = await waitUntil { releaseCount.withLock { $0 == 2 } }
+            XCTAssertTrue(secondReleaseFired)
+            XCTAssertEqual(capture.startCount, 0)
+        }
+    }
+
     private func sampleLines() -> [LyricLine] {
         [
             LyricLine(id: 0, timestamp: 10.0, text: "Hello world from test"),
@@ -2950,8 +3258,17 @@ private final class FakeSystemAudioStream: SystemAudioStreamControlling, @unchec
 
     var stopCount: Int { stopCounter.withLock { $0 } }
 
-    init(includedApplications: [CaptureApplication]) {
+    private let output: AudioCaptureStreamOutput
+    private let audioQueue: DispatchQueue
+
+    init(includedApplications: [CaptureApplication], output: AudioCaptureStreamOutput, audioQueue: DispatchQueue) {
+        self.output = output
+        self.audioQueue = audioQueue
         capturedBundleIds = Set(includedApplications.map(\.bundleIdentifier))
+    }
+
+    func emit(_ audio: CapturedAudio) {
+        audioQueue.sync { output.append(audio) }
     }
 
     func stopCapture() async {
@@ -2986,12 +3303,12 @@ private final class FakeSystemAudioCaptureBackend: SystemAudioCaptureBackend, @u
     func startStream(
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
-        output: SCStreamOutput,
+        output: AudioCaptureStreamOutput,
         audioQueue: DispatchQueue
     ) async -> SystemAudioStreamControlling {
         await Task.yield()
         onStartStream?()
-        let stream = FakeSystemAudioStream(includedApplications: includedApplications)
+        let stream = FakeSystemAudioStream(includedApplications: includedApplications, output: output, audioQueue: audioQueue)
         stateBox.withLock { $0.streams.append(stream) }
         return stream
     }
