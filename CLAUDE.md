@@ -39,6 +39,7 @@ scripts/
 build.sh                   # Release .app packager (--install for /Applications, --dmg for dist/*.dmg)
 .github/
   PULL_REQUEST_TEMPLATE.md # PR body sections every PR fills in (see Git Workflow)
+  release.yml              # GitHub release-notes category configuration
   filters.yml              # Shared dorny/paths-filter config (skips macOS jobs on docs-only PRs)
   dependabot.yml           # Weekly dependency updates for github-actions & swift
   workflows/ci.yml         # CI: changes -> lint + test + codecov + .app bundle verification (macos-26)
@@ -47,6 +48,7 @@ build.sh                   # Release .app packager (--install for /Applications,
   workflows/pr-title.yml   # Enforces Conventional Commits on PR titles
   workflows/dependabot-auto-merge.yml # Enables auto-merge for Dependabot patch/minor PRs
   workflows/issue-severity-labeler.yml # Auto-labels issue severity from template dropdown or keyword fallback
+  scripts/build-release-notes.mjs # Generates descriptive stable release notes from PR Summary sections + install steps + merged PRs (tested with node --test)
   scripts/classify-issue-severity.mjs # Pure issue severity classifier (tested with node --test)
   scripts/ci-workflows.test.mjs # Workflow permission & coverage-export checks (node --test, not run in CI)
 .codecov.yml               # Soft-gated Codecov coverage reporting config
@@ -111,7 +113,7 @@ swiftformat Sources Tests
 ## Distribution
 
 - `VERSION` is the single source of truth for the stable release version (read by `build.sh` and `release.yml`); only `BARTUNE_RELEASE=1` builds (stable `v*` releases) report it. Every other build follows the newest `vX.Y.Z` tag: `X.Y.(Z + commits since that tag)`, e.g. `v0.4.0` + 15 commits = `0.4.15`, restarting at `0.5.0` once `v0.5.0` is tagged. Because PATCH numbers belong to builds from main, stable releases bump MINOR or MAJOR (`X.Y.0`); a stable patch release would make later main builds sort below builds already shipped. `build.sh` also stamps `CFBundleVersion` (total commit count), `BarTuneGitCommit` (short hash) and `BarTuneReleaseChannel` (`stable`/`dev`); never hand-edit those Info.plist values.
-- Stable releases are on-demand only via `.github/workflows/release.yml`: either push a `vX.Y.Z` tag (matching `VERSION`, or the job fails) or run **Build & Release DMG** via `workflow_dispatch` with `publish: true`. This builds `BarTune-X.Y.Z.dmg` + `.sha256`, creates the GitHub Release, and updates `Casks/bartune.rb` in `TrigrD3/homebrew-tap` (using `HOMEBREW_TAP_TOKEN`; without that secret the tap step is skipped, so `brew upgrade` won't see the release). A tag with a nonzero PATCH fails the job (see the rule above).
+- Stable releases are on-demand only via `.github/workflows/release.yml`: either push a `vX.Y.Z` tag (matching `VERSION`, or the job fails) or run **Build & Release DMG** via `workflow_dispatch` with `publish: true`. This builds `BarTune-X.Y.Z.dmg` + `.sha256`, generates descriptive release notes via `.github/scripts/build-release-notes.mjs` (pulling each merged PR's `## Summary`, install/upgrade steps, and full merged PR list), creates the GitHub Release, and updates `Casks/bartune.rb` in `TrigrD3/homebrew-tap` (using `HOMEBREW_TAP_TOKEN`; without that secret the tap step is skipped, so `brew upgrade` won't see the release). A tag with a nonzero PATCH fails the job (see the rule above).
 - Pushes to `main` build `BarTune-X.Y.Z.dmg` (version per the rule above) and replace the assets of the rolling `dev` pre-release ("Latest (main)"), moving the `dev` tag to that commit. A queued run superseded by a newer push may be skipped, and a rerun of a commit older than the current `dev` tag publishes nothing. Being a pre-release, it never becomes `/releases/latest` and never reaches Homebrew; the in-app updater reads it only on the *Latest from main* channel.
 - PRs targeting `main` run the DMG build as a CI check. Only the `publish-stable` and `publish-main` jobs get `contents: write`; the `build` job that runs PR code stays read-only.
 - Users install via `brew install --cask TrigrD3/tap/bartune`.
