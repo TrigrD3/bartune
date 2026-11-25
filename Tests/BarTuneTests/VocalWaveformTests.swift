@@ -166,4 +166,98 @@ final class VocalWaveformTests: XCTestCase {
         let twice = WaveformTimingRefiner.refine(once, envelope: env, timingError: 0.06)
         XCTAssertEqual(twice.words, once)
     }
+
+    func testMergedForDisplayRetainsNonOverlappingCachedSegmentsWhenLiveResumes() throws {
+        var cached = VocalEnvelope()
+        cached.append(mid: tone(10.0, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1)
+
+        var live = VocalEnvelope()
+        live.append(mid: tone(1.0, amplitude: 0.6), side: [], sampleRate: sampleRate, startTime: 4.0, rate: 1)
+
+        let merged = try XCTUnwrap(VocalEnvelope.mergedForDisplay(cached: cached, live: live))
+        XCTAssertEqual(merged.segments.count, 3)
+        guard merged.segments.count == 3 else { return }
+        XCTAssertEqual(merged.segments[0].start, 0.0, accuracy: 0.001)
+        XCTAssertEqual(merged.segments[0].end, 4.0, accuracy: 0.02)
+        XCTAssertEqual(merged.segments[1].start, 4.0, accuracy: 0.001)
+        XCTAssertEqual(merged.segments[1].end, 5.0, accuracy: 0.02)
+        XCTAssertEqual(merged.segments[2].start, 5.0, accuracy: 0.02)
+        XCTAssertEqual(merged.segments[2].end, 10.0, accuracy: 0.02)
+        XCTAssertNotNil(merged.segment(covering: 0.5...3.5))
+        XCTAssertNotNil(merged.segment(covering: 4.1...4.9))
+        XCTAssertNotNil(merged.segment(covering: 5.5...9.5))
+    }
+
+    func testMergedForDisplayReplacesLiveOverlapsAndPreservesFreshIntroUnderCapacity() {
+        // Live-to-live replay overlap: newer capture at 2..4 s replaces older live peaks at 2..4 s.
+        var live = VocalEnvelope()
+        live.append(mid: tone(6.0, amplitude: 0.2), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1)
+        live.append(mid: tone(2.0, amplitude: 0.8), side: [], sampleRate: sampleRate, startTime: 2.0, rate: 1)
+
+        let deduped = VocalEnvelope.mergedForDisplay(cached: nil, live: live)
+        XCTAssertEqual(deduped?.segments.count, 3)
+        // Ensure no two segments overlap in track time.
+        if let segs = deduped?.segments {
+            for idx in 0..<(segs.count - 1) {
+                XCTAssertLessThanOrEqual(segs[idx].end, segs[idx + 1].start + 0.011)
+            }
+        }
+
+        // Capacity eviction drops older cached segments first, never a freshly captured intro at 0..1 s.
+        var cached = VocalEnvelope()
+        cached.append(mid: tone(4.0, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 10.0, rate: 1)
+        var freshIntro = VocalEnvelope()
+        freshIntro.append(mid: tone(1.0, amplitude: 0.6), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1)
+
+        let capped = VocalEnvelope.mergedForDisplay(cached: cached, live: freshIntro, capacity: 250)
+        XCTAssertNotNil(capped?.segment(covering: 0.1...0.9), "fresh live intro must survive capacity trimming")
+        let totalFrames = capped?.segments.reduce(0) { $0 + $1.levels.count } ?? 0
+        XCTAssertLessThanOrEqual(totalFrames, 250)
+
+        // Partial excess eviction slices only the excess frames from the oldest segment instead of dropping it whole.
+        var multiCached = VocalEnvelope()
+        multiCached.append(mid: tone(3.0, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 10.0, rate: 1) // 300 frames
+        multiCached.append(mid: tone(1.0, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 20.0, rate: 1) // 100 frames
+        var tinyLive = VocalEnvelope()
+        tinyLive.append(mid: tone(0.1, amplitude: 0.6), side: [], sampleRate: sampleRate, startTime: 30.0, rate: 1) // 10 frames
+        let tightlyCapped = VocalEnvelope.mergedForDisplay(cached: multiCached, live: tinyLive, capacity: 400)
+        let keptTotal = tightlyCapped?.segments.reduce(0) { $0 + $1.levels.count } ?? 0
+        XCTAssertEqual(keptTotal, 400, "should slice only 10 excess frames instead of dropping the 300-frame segment")
+        XCTAssertEqual(tightlyCapped?.segments.count, 3)
+
+        // Capture order survives across consecutive cache merges: 50 s -> 0 s -> 10 s evicts 50 s, keeping [0 s, 10 s].
+        var seg50 = VocalEnvelope()
+        seg50.append(mid: tone(1.0, amplitude: 0.5), side: [], sampleRate: sampleRate, startTime: 50.0, rate: 1) // 100 frames
+        var seg0 = VocalEnvelope()
+        seg0.append(mid: tone(1.0, amplitude: 0.6), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1) // 100 frames
+        var seg10 = VocalEnvelope()
+        seg10.append(mid: tone(1.0, amplitude: 0.7), side: [], sampleRate: sampleRate, startTime: 10.0, rate: 1) // 100 frames
+        let cachedAfterIntro = VocalEnvelope.mergedPreservingCaptureOrder(cached: seg50, live: seg0, capacity: 200)
+        let displayAfterMid = VocalEnvelope.mergedForDisplay(cached: cachedAfterIntro, live: seg10, capacity: 200)
+        XCTAssertEqual(displayAfterMid?.segments.map(\.start) ?? [], [0.0, 10.0])
+    }
+
+    func testSubtractingPreservesExactFractionalFrameBoundariesWithoutGap() throws {
+        // Cached segment 10.00...10.50 (50 frames @ 0.01 s) with live segment 10.10...10.20 (10 frames).
+        // (10.1 - 10.0) / 0.01 is 9.999999999999964 in IEEE-754; snapping near-integer boundaries keeps
+        // all 10 left frames (10.00...10.10) and all 30 right frames (10.20...10.50) with zero gap.
+        var cached = VocalEnvelope()
+        cached.append(mid: tone(0.5, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 10.0, rate: 1)
+        var live = VocalEnvelope()
+        live.append(mid: tone(0.1, amplitude: 0.7), side: [], sampleRate: sampleRate, startTime: 10.1, rate: 1)
+
+        let merged = try XCTUnwrap(VocalEnvelope.mergedForDisplay(cached: cached, live: live))
+        XCTAssertEqual(merged.segments.count, 3)
+        guard merged.segments.count == 3 else { return }
+        let segs = merged.segments
+        XCTAssertEqual(segs[0].start, 10.0, accuracy: 0.0001)
+        XCTAssertEqual(segs[0].levels.count, 10)
+        XCTAssertEqual(segs[0].end, 10.1, accuracy: 0.0001)
+        XCTAssertEqual(segs[1].start, 10.1, accuracy: 0.0001)
+        XCTAssertEqual(segs[1].levels.count, 10)
+        XCTAssertEqual(segs[1].end, 10.2, accuracy: 0.0001)
+        XCTAssertEqual(segs[2].start, 10.2, accuracy: 0.0001)
+        XCTAssertEqual(segs[2].levels.count, 30)
+        XCTAssertEqual(segs[2].end, 10.5, accuracy: 0.0001)
+    }
 }

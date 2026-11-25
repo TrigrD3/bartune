@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Combine
 import CoreGraphics
 import CoreMedia
 import Foundation
@@ -430,6 +431,10 @@ final class AudioSyncManager {
         ) async -> AudioChunkTranscribing? = {
             await LyricsAlignerModel.launch(lines: $0, anchors: $1)
         }
+        var vocalEnvelopeNow: @Sendable () -> ContinuousClock.Instant = { .now }
+        var vocalEnvelopeSleep: @Sendable (ContinuousClock.Instant) async throws -> Void = {
+            try await Task.sleep(until: $0, clock: .continuous)
+        }
 
         static func live() -> Dependencies {
             Dependencies(
@@ -469,6 +474,50 @@ final class AudioSyncManager {
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     /// Voice-band loudness of this play's captured audio, used to refine heard word timings.
     private(set) var vocalEnvelope = VocalEnvelope()
+    private var vocalEnvelopeCache = LRUMemoryCache<VocalEnvelope>(capacity: 12)
+    private var vocalEnvelopeRevision: UInt64 = 0
+    private var cachedDisplayEnvelope: (trackId: String, revision: UInt64, envelope: VocalEnvelope?)?
+    private let vocalEnvelopeDidChangeSubject = PassthroughSubject<String, Never>()
+    private var nextVocalEnvelopeNotifyAt = ContinuousClock.now
+    private var pendingVocalEnvelopeNotification: Task<Void, Never>?
+
+    var vocalEnvelopeDidChange: AnyPublisher<String, Never> {
+        vocalEnvelopeDidChangeSubject.eraseToAnyPublisher()
+    }
+
+    private func notifyVocalEnvelopeChanged(for trackId: String, throttled: Bool) {
+        let now = dependencies.vocalEnvelopeNow()
+        let deadline = nextVocalEnvelopeNotifyAt
+        if throttled, now < deadline {
+            guard pendingVocalEnvelopeNotification == nil else { return }
+            let sleepUntil = dependencies.vocalEnvelopeSleep
+            pendingVocalEnvelopeNotification = Task { [weak self] in
+                try? await sleepUntil(deadline)
+                guard !Task.isCancelled, let self, self.activeTrackId == trackId else { return }
+                self.notifyVocalEnvelopeChanged(for: trackId, throttled: false)
+            }
+            return
+        }
+        pendingVocalEnvelopeNotification?.cancel()
+        pendingVocalEnvelopeNotification = nil
+        nextVocalEnvelopeNotifyAt = now.advanced(by: .milliseconds(200))
+        vocalEnvelopeDidChangeSubject.send(trackId)
+    }
+
+    func vocalEnvelope(for trackId: String?) -> VocalEnvelope? {
+        if let trackId, trackId == activeTrackId {
+            if let cached = cachedDisplayEnvelope,
+               cached.trackId == trackId,
+               cached.revision == vocalEnvelopeRevision {
+                return cached.envelope
+            }
+            let merged = VocalEnvelope.mergedForDisplay(cached: vocalEnvelopeCache[trackId], live: vocalEnvelope)
+            cachedDisplayEnvelope = (trackId, vocalEnvelopeRevision, merged)
+            return merged
+        }
+        guard let trackId else { return vocalEnvelope.segments.isEmpty ? nil : vocalEnvelope }
+        return VocalEnvelope.mergedForDisplay(cached: vocalEnvelopeCache[trackId], live: VocalEnvelope())
+    }
     private(set) var isLiveSyncActive: Bool = false
     private var syncGeneration: UInt64 = 0
     private var captureTargetGeneration: UInt64 = 0
@@ -509,9 +558,21 @@ final class AudioSyncManager {
         self.cache = cache
         self.dependencies = dependencies
         self.diagnostics = diagnostics ?? AudioSyncDiagnosticsModel()
+        self.nextVocalEnvelopeNotifyAt = dependencies.vocalEnvelopeNow()
+    }
+
+    private func cacheActiveVocalEnvelopeIfNonEmpty() {
+        guard let prevId = activeTrackId, !vocalEnvelope.segments.isEmpty else { return }
+        if let merged = VocalEnvelope.mergedPreservingCaptureOrder(cached: vocalEnvelopeCache[prevId], live: vocalEnvelope) {
+            vocalEnvelopeCache[prevId] = merged
+            vocalEnvelopeRevision &+= 1
+            cachedDisplayEnvelope = nil
+            notifyVocalEnvelopeChanged(for: prevId, throttled: false)
+        }
     }
 
     func stop() {
+        cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
         captureTargetGeneration &+= 1
         isLiveSyncActive = false
@@ -521,6 +582,8 @@ final class AudioSyncManager {
         alignerStartupTask = nil
         chunkProcessingTask?.cancel()
         chunkProcessingTask = nil
+        pendingVocalEnvelopeNotification?.cancel()
+        pendingVocalEnvelopeNotification = nil
         chunkEngine?.shutdown()
         chunkEngine = nil
         audioSampleBuffer.removeAll(keepingCapacity: false)
@@ -548,7 +611,15 @@ final class AudioSyncManager {
         nearlyConfidentLineIDs = []
         acceptedSessionLines = [:]
         activeTrackDuration = track.duration
+        // Always start a fresh live envelope so WaveformTimingRefiner never mixes levels across plays;
+        // `vocalEnvelope(for:)` falls back to `vocalEnvelopeCache` for timeline display until new frames arrive.
         vocalEnvelope = VocalEnvelope()
+        if forceResync {
+            vocalEnvelopeCache.removeValue(forKey: track.id)
+        }
+        vocalEnvelopeRevision &+= 1
+        cachedDisplayEnvelope = nil
+        notifyVocalEnvelopeChanged(for: track.id, throttled: false)
         if trackChanged {
             diagnostics.clear()
         }
@@ -566,9 +637,10 @@ final class AudioSyncManager {
             if !rawLines.isEmpty {
                 cache.remove(trackId: track.id)
             }
-        } else if let cached = cache.load(trackId: track.id) {
+        } else if let loaded = cache.load(trackId: track.id) {
             let current = rawLines.isEmpty
-                || cached.matchesSource(rawLines)
+                || loaded.matchesSource(rawLines)
+            let cached = (current && !rawLines.isEmpty) ? loaded.remapped(to: rawLines) : loaded
             let reliable = current && cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
             // A Lyrics Alignment record keeps filling in until no further play could lock another line.
             let fillsIn = engine == .lyricsAlignment && cached.engine == .lyricsAlignment
@@ -591,10 +663,15 @@ final class AudioSyncManager {
                 cachedAlignedLineCount = cached.alignedLineCount
                 if fillsIn {
                     let aligned = Self.alignedLineIDs(in: cached.lines)
-                    anchoredLines = Dictionary(uniqueKeysWithValues: cached.lines.filter { locked.contains($0.id) }.map { ($0.id, $0) })
+                    anchoredLines = Dictionary(
+                        cached.lines.filter { locked.contains($0.id) }.map { ($0.id, $0) },
+                        uniquingKeysWith: { _, latest in latest }
+                    )
                     // Lines shown but not locked stay as they are until this play aligns them again.
-                    acceptedSessionLines = Dictionary(uniqueKeysWithValues: cached.lines
-                        .filter { aligned.contains($0.id) && !locked.contains($0.id) }.map { ($0.id, $0) })
+                    acceptedSessionLines = Dictionary(
+                        cached.lines.filter { aligned.contains($0.id) && !locked.contains($0.id) }.map { ($0.id, $0) },
+                        uniquingKeysWith: { _, latest in latest }
+                    )
                     attemptedLineIDs = cached.settledLineIDs
                 } else {
                     priorHeardWords = cached.heardWords ?? []
@@ -876,6 +953,8 @@ final class AudioSyncManager {
                 if let chunkStart = self.chunkStartPos, sampleRate > 0 {
                     let deliveryStart = chunkStart
                         + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
+                    let previousFrameCount = self.vocalEnvelope.segments.reduce(0) { $0 + $1.levels.count }
+                    let previousEnd = self.vocalEnvelope.segments.last?.end
                     self.vocalEnvelope.append(
                         mid: samples,
                         side: audio.side,
@@ -883,6 +962,12 @@ final class AudioSyncManager {
                         startTime: deliveryStart,
                         rate: self.chunkPlaybackRate
                     )
+                    let updatedFrameCount = self.vocalEnvelope.segments.reduce(0) { $0 + $1.levels.count }
+                    if updatedFrameCount > 0,
+                       updatedFrameCount > previousFrameCount || self.vocalEnvelope.segments.last?.end != previousEnd {
+                        self.vocalEnvelopeRevision &+= 1
+                        self.notifyVocalEnvelopeChanged(for: track.id, throttled: previousFrameCount > 0)
+                    }
                 }
                 self.audioSampleBuffer.append(contentsOf: samples)
 
@@ -986,14 +1071,22 @@ final class AudioSyncManager {
         return state.playbackAnchorPosition + (state.isPlaying ? elapsed * state.playbackRate : 0.0)
     }
 
-    /// Words from earlier plays fill only the stretches this play hasn't heard; this play's words win.
+    /// Words from earlier plays fill only the stretches this play hasn't heard; this play's words win,
+    /// without letting fresh words tagged to one lyric evict retained words tagged to a different lyric.
     nonisolated static func mergeHeardWords(
         prior: [RecognizedAudioWord],
         current: [RecognizedAudioWord],
         margin: Double = 1.0
     ) -> [RecognizedAudioWord] {
         let kept = prior.filter { old in
-            !current.contains { $0.startTime - margin < old.endTime && old.startTime < $0.endTime + margin }
+            !current.contains { fresh in
+                if let oldLineId = old.sourceLineId,
+                   let freshLineId = fresh.sourceLineId,
+                   oldLineId != freshLineId {
+                    return false
+                }
+                return fresh.startTime - margin < old.endTime && old.startTime < fresh.endTime + margin
+            }
         }
         return (kept + current).sorted { $0.startTime < $1.startTime }
     }
@@ -1032,16 +1125,240 @@ final class AudioSyncManager {
     private func keepingLockedAndAccepted(_ result: AudioAlignmentResult) -> AudioAlignmentResult {
         let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !lockedThisPlay.isEmpty || !preserved.isEmpty else { return result }
+        let minLineGap = 0.15
+        let isNonEmpty: (LyricLine) -> Bool = { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let lockedIDs = Set(anchoredLines.keys).union(lockedThisPlay.keys)
         let resultMatched = Set(result.matchedLineIDs)
-        let matched = resultMatched.union(anchoredLines.keys).union(lockedThisPlay.keys).union(preserved.keys)
-        let lines = result.lines.map { line -> LyricLine in
+        let baseByID = Dictionary(uniqueKeysWithValues: baseLines.map { ($0.id, $0) })
+
+        var lines: [LyricLine] = []
+        lines.reserveCapacity(result.lines.count)
+        var freshUnlockedIndices: [Int] = []
+        var restoredUnlockedIndices: [Int] = []
+        var matched: Set<Int> = []
+        for (idx, line) in result.lines.enumerated() {
             if let locked = anchoredLines[line.id] ?? lockedThisPlay[line.id] {
-                return locked
+                lines.append(locked)
+                matched.insert(line.id)
+            } else if resultMatched.contains(line.id) {
+                lines.append(line)
+                matched.insert(line.id)
+                freshUnlockedIndices.append(idx)
+            } else if let kept = preserved[line.id] {
+                lines.append(kept)
+                matched.insert(line.id)
+                restoredUnlockedIndices.append(idx)
+            } else {
+                lines.append(line)
             }
-            if resultMatched.contains(line.id) {
-                return line
+        }
+
+        // Drop freshly matched unlocked lines that leave less than `minLineGap` per intervening non-empty
+        // line against locked anchors so fallback rows always have monotonic room to sit in between.
+        for idx in freshUnlockedIndices where isNonEmpty(lines[idx]) {
+            let candidate = lines[idx]
+            let conflictsPrevLocked: Bool = if let prevIdx = lines[..<idx].lastIndex(where: { isNonEmpty($0) && lockedIDs.contains($0.id) }) {
+                candidate.timestamp < lines[prevIdx].timestamp + Double(lines[(prevIdx + 1)..<idx].filter(isNonEmpty).count + 1) * minLineGap
+            } else {
+                false
             }
-            return preserved[line.id] ?? line
+            let conflictsNextLocked: Bool = if let nextIdx = lines[(idx + 1)...].firstIndex(where: { isNonEmpty($0) && lockedIDs.contains($0.id) }) {
+                candidate.timestamp + Double(lines[(idx + 1)..<nextIdx].filter(isNonEmpty).count + 1) * minLineGap > lines[nextIdx].timestamp
+            } else {
+                false
+            }
+            if conflictsPrevLocked || conflictsNextLocked {
+                lines[idx] = baseByID[candidate.id] ?? result.lines[idx]
+                matched.remove(candidate.id)
+            }
+        }
+
+        // Drop unlocked preserved lines whose timestamps conflict with locked or surviving freshly matched
+        // neighbors (including required spacing for intervening non-empty fallback rows).
+        let authoritativeIDs = matched.subtracting(restoredUnlockedIndices.map { lines[$0].id })
+        for idx in restoredUnlockedIndices {
+            let candidate = lines[idx]
+            guard isNonEmpty(candidate) else { continue }
+            let conflictsPrev: Bool = if let prevIdx = lines[..<idx].lastIndex(where: { isNonEmpty($0) && matched.contains($0.id) }) {
+                candidate.timestamp < lines[prevIdx].timestamp + Double(lines[(prevIdx + 1)..<idx].filter(isNonEmpty).count + 1) * minLineGap
+            } else {
+                false
+            }
+            let conflictsNext: Bool = if let nextIdx = lines[(idx + 1)...].firstIndex(where: { isNonEmpty($0) && authoritativeIDs.contains($0.id) }) {
+                candidate.timestamp + Double(lines[(idx + 1)..<nextIdx].filter(isNonEmpty).count + 1) * minLineGap > lines[nextIdx].timestamp
+            } else {
+                false
+            }
+            if conflictsPrev || conflictsNext {
+                lines[idx] = baseByID[candidate.id] ?? result.lines[idx]
+                matched.remove(candidate.id)
+            }
+        }
+
+        // Resolve any remaining pair of matched non-empty lines that leaves insufficient room for
+        // intervening unmatched non-empty lines (preferring locked lines over unlocked ones).
+        var lastMatchedNonEmptyIdx: Int?
+        for idx in lines.indices where isNonEmpty(lines[idx]) && matched.contains(lines[idx].id) {
+            if let prevIdx = lastMatchedNonEmptyIdx {
+                let requiredGap = Double(lines[(prevIdx + 1)..<idx].filter(isNonEmpty).count + 1) * minLineGap
+                if lines[idx].timestamp < lines[prevIdx].timestamp + requiredGap {
+                    if !lockedIDs.contains(lines[idx].id) {
+                        let id = lines[idx].id
+                        lines[idx] = baseByID[id] ?? result.lines[idx]
+                        matched.remove(id)
+                        continue
+                    } else if !lockedIDs.contains(lines[prevIdx].id) {
+                        let prevId = lines[prevIdx].id
+                        lines[prevIdx] = baseByID[prevId] ?? result.lines[prevIdx]
+                        matched.remove(prevId)
+                    }
+                }
+            }
+            lastMatchedNonEmptyIdx = idx
+        }
+
+        // Forward monotonicity pass bounded by both preceding and upcoming matched lines so fallback
+        // rows and blank markers stay monotonic without inverting against a tight later matched line.
+        // Precompute non-empty prefix counts and next matched non-empty index once in O(N).
+        var nonEmptyPrefix = [Int](repeating: 0, count: lines.count + 1)
+        for idx in lines.indices {
+            nonEmptyPrefix[idx + 1] = nonEmptyPrefix[idx] + (isNonEmpty(lines[idx]) ? 1 : 0)
+        }
+        var nextMatchedAfter = [Int?](repeating: nil, count: lines.count)
+        var upcomingMatched: Int?
+        for idx in lines.indices.reversed() {
+            nextMatchedAfter[idx] = upcomingMatched
+            if isNonEmpty(lines[idx]), matched.contains(lines[idx].id) {
+                upcomingMatched = idx
+            }
+        }
+
+        var prevEmittedTimestamp: Double?
+        var prevLineEnd: Double = 0.0
+        var prevBlankTimestamp: Double?
+        for idx in lines.indices {
+            let line = lines[idx]
+            if isNonEmpty(line) {
+                if matched.contains(line.id) {
+                    prevEmittedTimestamp = line.timestamp
+                    let end = line.duration.map { line.timestamp + $0 }
+                        ?? line.words.last.map { $0.timestamp + ($0.duration ?? 0) }
+                        ?? (line.timestamp + 0.25)
+                    prevLineEnd = max(line.timestamp + 0.25, end)
+                    prevBlankTimestamp = nil
+                } else {
+                    let hasPrev = prevEmittedTimestamp != nil || prevBlankTimestamp != nil
+                    let preferredMin = max(
+                        prevEmittedTimestamp.map { $0 + 0.25 } ?? 0,
+                        prevLineEnd,
+                        prevBlankTimestamp.map { $0 + 0.01 } ?? 0
+                    )
+                    let hardMin = max(
+                        prevEmittedTimestamp.map { $0 + minLineGap } ?? 0,
+                        prevBlankTimestamp ?? 0
+                    )
+                    let nextMatchedIdx = nextMatchedAfter[idx]
+                    let maxStart: Double? = nextMatchedIdx.map { nextIdx in
+                        let remainingNonEmpty = nonEmptyPrefix[nextIdx] - nonEmptyPrefix[idx]
+                        return max(0.0, lines[nextIdx].timestamp - Double(remainingNonEmpty) * minLineGap)
+                    }
+                    let targetStart: Double?
+                    if let upper = maxStart {
+                        if hasPrev {
+                            if hardMin <= upper {
+                                let lower = max(hardMin, min(preferredMin, upper))
+                                let clamped = min(upper, max(lower, line.timestamp))
+                                targetStart = clamped != line.timestamp ? clamped : nil
+                            } else if let nextIdx = nextMatchedIdx {
+                                let fallback = min(lines[nextIdx].timestamp, max(prevEmittedTimestamp ?? 0, upper))
+                                targetStart = fallback != line.timestamp ? fallback : nil
+                            } else {
+                                targetStart = nil
+                            }
+                        } else if line.timestamp > upper {
+                            targetStart = upper
+                        } else {
+                            targetStart = nil
+                        }
+                    } else if hasPrev, line.timestamp < preferredMin {
+                        targetStart = preferredMin
+                    } else {
+                        targetStart = nil
+                    }
+                    if let targetStart {
+                        let shift = targetStart - line.timestamp
+                        let shiftedWords = line.words.map { word in
+                            WordTimestamp(timestamp: max(0, word.timestamp + shift), duration: word.duration, text: word.text)
+                        }
+                        lines[idx] = LyricLine(
+                            id: line.id,
+                            timestamp: targetStart,
+                            duration: line.duration,
+                            text: line.text,
+                            words: shiftedWords
+                        )
+                    }
+                    let placed = lines[idx]
+                    let hasCompressedBlankBefore = prevBlankTimestamp != nil && idx > 0
+                        && lines[idx - 1].timestamp < prevLineEnd
+                    if placed.timestamp < prevLineEnd || hasCompressedBlankBefore {
+                        LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: placed.timestamp)
+                    }
+                    prevEmittedTimestamp = placed.timestamp
+                    let placedEnd = placed.timestamp + max(0.25, placed.duration ?? 0.25)
+                    prevLineEnd = nextMatchedIdx.map { min(lines[$0].timestamp, placedEnd) } ?? placedEnd
+                    prevBlankTimestamp = nil
+                }
+            } else {
+                let hasPrev = prevEmittedTimestamp != nil || prevBlankTimestamp != nil
+                let hardBlankFloor = max(prevEmittedTimestamp ?? 0, prevBlankTimestamp ?? 0)
+                let nextMatchedIdx = nextMatchedAfter[idx]
+                let blankStep: Double
+                let maxBlank: Double?
+                if let nextIdx = nextMatchedIdx {
+                    let remainingNonEmpty = nonEmptyPrefix[nextIdx] - nonEmptyPrefix[idx + 1]
+                    let remainingBlanks = (nextIdx - idx - 1) - remainingNonEmpty
+                    let blanksToFit = remainingBlanks + 1
+                    let nonEmptyCeiling = max(hardBlankFloor, lines[nextIdx].timestamp - Double(remainingNonEmpty) * minLineGap)
+                    let availableSlack = max(0.0, nonEmptyCeiling - hardBlankFloor)
+                    blankStep = min(0.01, availableSlack / Double(blanksToFit + 1))
+                    maxBlank = max(hardBlankFloor, nonEmptyCeiling - Double(blanksToFit) * blankStep)
+                } else {
+                    blankStep = 0.01
+                    maxBlank = nil
+                }
+                let minBlank = max(
+                    prevLineEnd,
+                    prevEmittedTimestamp.map { $0 + blankStep } ?? 0,
+                    prevBlankTimestamp.map { $0 + blankStep } ?? 0
+                )
+                let targetBlank: Double?
+                if let upper = maxBlank {
+                    let lower = hasPrev ? max(hardBlankFloor, min(minBlank, upper)) : 0.0
+                    let clamped = min(upper, max(lower, line.timestamp))
+                    targetBlank = clamped != line.timestamp ? clamped : nil
+                } else if hasPrev, line.timestamp < minBlank {
+                    targetBlank = minBlank
+                } else {
+                    targetBlank = nil
+                }
+                if let targetBlank {
+                    lines[idx] = LyricLine(
+                        id: line.id,
+                        timestamp: targetBlank,
+                        duration: line.duration,
+                        text: line.text,
+                        words: line.words
+                    )
+                }
+                prevBlankTimestamp = lines[idx].timestamp
+            }
+        }
+
+        // Reconcile preceding boundaries for matched lines so restoring a locked line's held tail
+        // trims cleanly against an earlier recovered next line and keeps intervening blanks ordered.
+        for idx in lines.indices where isNonEmpty(lines[idx]) && matched.contains(lines[idx].id) {
+            LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: lines[idx].timestamp)
         }
         return AudioAlignmentResult(
             lines: lines,
@@ -1105,7 +1422,8 @@ final class AudioSyncManager {
                     confidence: 1,
                     syllables: group.count > 1
                         ? group.map { RecognizedAudioWord.Syllable(text: $0.text, startTime: $0.timestamp) }
-                        : nil
+                        : nil,
+                    sourceLineId: line.id
                 )
             }
         }
@@ -1130,17 +1448,22 @@ final class AudioSyncManager {
     private func applyLyricsAlignment() {
         guard !baseLines.isEmpty else { return }
         let fresh = alignHeardWords()
-        // Only a line aligned from this play's audio can lock, never one carried over unlocked.
-        let alignedNow = Set(fresh.matchedLineIDs).subtracting(lockedLineIDs)
-        for line in fresh.lines where alignedNow.contains(line.id) && Self.locks(
+        let result = keepingLockedAndAccepted(fresh)
+        // Only a line aligned from this play's audio that survived conflict resolution against existing
+        // locks can lock itself, never a conflicting match or one carried over unlocked.
+        let survivedNewMatches = Set(fresh.matchedLineIDs)
+            .intersection(result.matchedLineIDs)
+            .subtracting(lockedLineIDs)
+        var lockedNewLine = false
+        for line in result.lines where survivedNewMatches.contains(line.id) && Self.locks(
             line,
             confident: confidentLineIDs,
             nearlyConfident: nearlyConfidentLineIDs,
             envelope: vocalEnvelope
         ) {
             lockedThisPlay[line.id] = line
+            lockedNewLine = true
         }
-        let result = keepingLockedAndAccepted(fresh)
         let lines = baseLines
         diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
         let progress = Self.lyricsAlignmentProgress(lockedIDs: lockedLineIDs, settledIDs: settledLineIDs, lines: baseLines)
@@ -1149,12 +1472,19 @@ final class AudioSyncManager {
             state.audioSyncStatus = .unavailable("Lyrics script is not supported by Lyrics Alignment")
             return
         }
-        if result.matchedLineCount > 0, result.matchedLineCount >= cachedAlignedLineCount {
-            let matchedIDs = Set(result.matchedLineIDs)
-            for line in result.lines where matchedIDs.contains(line.id) {
-                acceptedSessionLines[line.id] = line
-            }
-            persistAlignment(result, engine: .lyricsAlignment)
+        // Treat a newly acquired lock as progress even if it displaced multiple unlocked cached lines
+        // and temporarily lowered `matchedLineCount`, while still refusing to downgrade legacy caches
+        // whose lines weren't tracked in `acceptedSessionLines`.
+        let matchedIDs = Set(result.matchedLineIDs)
+        let displacedAcceptedCount = acceptedSessionLines.keys.filter { !matchedIDs.contains($0) }.count
+        let newLockDisplacedCache = lockedNewLine
+            && (result.matchedLineCount + displacedAcceptedCount >= cachedAlignedLineCount)
+        if result.matchedLineCount > 0, newLockDisplacedCache || result.matchedLineCount >= cachedAlignedLineCount {
+            acceptedSessionLines = Dictionary(
+                result.lines.filter { matchedIDs.contains($0.id) }.map { ($0.id, $0) },
+                uniquingKeysWith: { _, latest in latest }
+            )
+            persistAlignment(result, engine: .lyricsAlignment, forceUpdateCount: newLockDisplacedCache)
             state.applyAudioSyncedLines(result.lines)
         }
         if progress.isFinished {
@@ -1177,7 +1507,7 @@ final class AudioSyncManager {
         persistAlignment(result, engine: engine)
     }
 
-    private func persistAlignment(_ result: AudioAlignmentResult, engine: AudioSyncEngine) {
+    private func persistAlignment(_ result: AudioAlignmentResult, engine: AudioSyncEngine, forceUpdateCount: Bool = false) {
         guard let trackId = activeTrackId else { return }
         let sourceCount = baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         let record = AudioSyncedLyricsRecord(
@@ -1194,7 +1524,9 @@ final class AudioSyncManager {
             lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil
         )
         cache.save(record)
-        cachedAlignedLineCount = max(cachedAlignedLineCount, result.matchedLineCount)
+        cachedAlignedLineCount = forceUpdateCount
+            ? result.matchedLineCount
+            : max(cachedAlignedLineCount, result.matchedLineCount)
     }
 
     struct AudioChunkRequest: Sendable {

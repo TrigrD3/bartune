@@ -109,6 +109,8 @@ struct RecognizedAudioWord: Equatable, Codable, Sendable {
     let confidence: Double
     /// Lyrics Alignment: the word's syllables when it has more than one; their texts spell `text`.
     var syllables: [Syllable]?
+    /// Lyrics Alignment: originating `LyricLine.id` from forced alignment so wide windows never steal adjacent lines' words.
+    var sourceLineId: Int?
 
     var endTime: Double { startTime + max(0.04, duration) }
 }
@@ -190,6 +192,74 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
             return false
         }
         return texts(lines) == source
+    }
+
+    /// Rebuilds the cached alignment onto `sourceLines`'s exact row layout and IDs (plus remapping
+    /// heard-word `sourceLineId`, locked, and attempted IDs) when `matchesSource(sourceLines)` holds
+    /// but blank rows shifted `LRCParser`'s row IDs.
+    func remapped(to sourceLines: [LyricLine]) -> AudioSyncedLyricsRecord {
+        let cachedNonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let sourceNonEmpty = sourceLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        guard cachedNonEmpty.count == sourceNonEmpty.count, !cachedNonEmpty.isEmpty else { return self }
+        var idMap: [Int: Int] = [:]
+        idMap.reserveCapacity(cachedNonEmpty.count)
+        var changed = lines.count != sourceLines.count
+        for (oldLine, newLine) in zip(cachedNonEmpty, sourceNonEmpty) {
+            idMap[oldLine.id] = newLine.id
+            if oldLine.id != newLine.id { changed = true }
+        }
+        guard changed else { return self }
+
+        var cachedIter = cachedNonEmpty.makeIterator()
+        var remappedLines: [LyricLine] = []
+        remappedLines.reserveCapacity(sourceLines.count)
+        var lastNonEmptyEnd: Double?
+        for source in sourceLines {
+            if source.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let ts = lastNonEmptyEnd.map { max(source.timestamp, $0) } ?? source.timestamp
+                remappedLines.append(LyricLine(
+                    id: source.id,
+                    timestamp: ts,
+                    duration: source.duration,
+                    text: source.text,
+                    words: source.words
+                ))
+            } else if let oldLine = cachedIter.next() {
+                LyricsAudioAligner.reconcilePrecedingBoundary(
+                    in: &remappedLines,
+                    before: remappedLines.count,
+                    targetStart: oldLine.timestamp
+                )
+                let remappedLine = LyricLine(
+                    id: source.id,
+                    timestamp: oldLine.timestamp,
+                    duration: oldLine.duration,
+                    text: oldLine.text,
+                    words: oldLine.words
+                )
+                remappedLines.append(remappedLine)
+                lastNonEmptyEnd = oldLine.timestamp + (oldLine.duration ?? 0.25)
+            }
+        }
+        let remappedWords = heardWords?.map { word -> RecognizedAudioWord in
+            guard let oldId = word.sourceLineId, let mappedId = idMap[oldId], mappedId != oldId else { return word }
+            var copy = word
+            copy.sourceLineId = mappedId
+            return copy
+        }
+        return AudioSyncedLyricsRecord(
+            trackId: trackId,
+            engine: engine,
+            syncedAt: syncedAt,
+            medianOffset: medianOffset,
+            alignedLineCount: alignedLineCount,
+            sourceLineCount: sourceLineCount,
+            lines: remappedLines,
+            heardWords: remappedWords,
+            lockedLineIDs: lockedLineIDs?.compactMap { idMap[$0] },
+            attemptedLineIDs: attemptedLineIDs?.compactMap { idMap[$0] },
+            lockedAtPlayStart: lockedAtPlayStart
+        )
     }
 
     /// Lyrics Alignment: attempted lines that stay settled because the play that heard them locked nothing new.
@@ -535,7 +605,21 @@ enum LyricsAudioAligner {
             return AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
         }
 
-        let normalizedRec = sortedRecognized.map { normalizeToken($0.text) }
+        let recognizedTokens = sortedRecognized.map { RecognizedToken(word: $0, normalized: normalizeToken($0.text)) }
+        let tokensByLine = Dictionary(grouping: recognizedTokens, by: \.word.sourceLineId)
+        // Try forced-aligned words before legacy words so a replay cannot consume another line's onset.
+        func sources(for lineId: Int) -> [[RecognizedToken]] {
+            [tokensByLine[lineId], tokensByLine[nil]].compactMap { $0 }
+        }
+
+        var nextNonEmptyTimestamp: [Double?] = Array(repeating: nil, count: lines.count)
+        var upcomingNonEmpty: Double?
+        for idx in lines.indices.reversed() {
+            nextNonEmptyTimestamp[idx] = upcomingNonEmpty
+            if !lines[idx].text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                upcomingNonEmpty = lines[idx].timestamp
+            }
+        }
 
         // Pass 1: estimate global offset from confident, temporally coherent line matches.
         var offsetSamples: [Double] = []
@@ -544,19 +628,17 @@ enum LyricsAudioAligner {
             let meaningfulCount = lineTokens.filter { !$0.normalized.isEmpty }.count
             guard meaningfulCount > 0 else { continue }
             let minMatches = meaningfulCount <= 2 ? 1 : max(2, meaningfulCount / 3)
-            let nextTs = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : (line.timestamp + 4.5)
-            let lineEnd = line.duration.map { line.timestamp + $0 } ?? nextTs
-            let matches = matchLineTokens(
-                lineTokens: lineTokens,
-                expectedStart: line.timestamp,
-                window: (line.timestamp - searchWindow)...(lineEnd + searchWindow),
-                recognized: sortedRecognized,
-                normalizedRec: normalizedRec
-            )
-            if matches.count >= minMatches,
-               let first = matches.first(where: { $0.tokenIndex == 0 }),
-               abs(first.word.startTime - line.timestamp) <= 5.0 {
-                offsetSamples.append(first.word.startTime - line.timestamp)
+            let nextTs = nextNonEmptyTimestamp[lineIdx] ?? (line.timestamp + max(5.0, line.duration ?? 5.0))
+            let lineEnd = max(line.duration.map { line.timestamp + $0 } ?? nextTs, nextTs)
+            let searchSpan = (line.timestamp - searchWindow)...(lineEnd + searchWindow)
+            for source in sources(for: line.id) {
+                let matches = matchLineTokens(lineTokens, in: source, window: searchSpan, expectedStart: line.timestamp)
+                if matches.count >= minMatches,
+                   let first = matches.first(where: { $0.tokenIndex == 0 }),
+                   abs(first.word.startTime - line.timestamp) <= 5.0 {
+                    offsetSamples.append(first.word.startTime - line.timestamp)
+                    break
+                }
             }
         }
 
@@ -575,7 +657,10 @@ enum LyricsAudioAligner {
         }
 
         let shift = medianOffset ?? 0.0
-        let localPadding = min(searchWindow, medianOffset != nil ? 1.5 : 2.0)
+        // Lyrics Alignment already constrains each line inside `LyricsForcedAligner.lineWindow` (3.0 s),
+        // so match that reach here instead of clipping lines whose fetched start is late or whose end is early.
+        let localPadding = min(searchWindow, regroupsCJKWords ? (medianOffset != nil ? 1.5 : 2.0) : 3.0)
+        let maxLineShift = regroupsCJKWords ? 2.5 : 3.5
         var alignedLines: [LyricLine] = []
         alignedLines.reserveCapacity(lines.count)
         var matchedLineCount = 0
@@ -583,91 +668,142 @@ enum LyricsAudioAligner {
         var matchedWordCount = 0
         /// Later lines only match words starting after this: just past the last matched word's start, not
         /// its end, because a stretched last word can run right up to the next line's first word.
+        /// Keep line-owned progress separate so a preceding legacy untagged match cannot block the next
+        /// line's forced-aligned onset (which takes priority and reconciles the preceding line's tail).
         var lastConsumedWordStart: Double = 0.0
+        var lastOwnedConsumedWordStart: Double = 0.0
         var previousLineEnd: Double = 0.0
         var previousEmittedTimestamp: Double?
         var previousBlankTimestamp: Double?
 
-        // Pass 2: align each line inside a tight, monotonic window so adjacent lines never steal words or overlap.
+        // Pass 2: align each line inside a monotonic window so adjacent lines never steal words or overlap.
         lineLoop: for (lineIdx, line) in lines.enumerated() {
             let lineTokens = tokenizeLine(line.text)
             let isNonEmpty = !line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            let nextTs = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : (line.timestamp + 4.5)
-            let rawLineDur = max(0.4, line.duration ?? (nextTs - line.timestamp))
+            let nextNonEmptyTs = nextNonEmptyTimestamp[lineIdx]
+            let nominalEndTs = nextNonEmptyTs ?? (line.timestamp + max(5.0, line.duration ?? 5.0))
+            // An early explicit `duration` or early blank marker in the fetched lyrics must not stop
+            // Lyrics Alignment from matching words that continue through the actual vocal end.
+            let rawLineDur: Double = if regroupsCJKWords {
+                max(0.4, line.duration ?? (nominalEndTs - line.timestamp))
+            } else {
+                max(0.4, max(line.duration ?? 0, nominalEndTs - line.timestamp))
+            }
             let shiftedStart = max(0, line.timestamp + shift)
             let shiftedEnd = shiftedStart + rawLineDur
-            let nextShiftedStart = (lineIdx + 1 < lines.count) ? max(0, nextTs + shift) : (shiftedEnd + localPadding)
+            let nextShiftedStart = nextNonEmptyTs.map { max(0, $0 + shift) } ?? (shiftedEnd + localPadding)
+            let nextAnyTs: Double? = (lineIdx + 1 < lines.count) ? lines[lineIdx + 1].timestamp : nil
+            let nextUntaggedBound = nextAnyTs.map { max(0, $0 + shift) } ?? nextShiftedStart
             // A blank marker only needs to stay ordered, so it adds no lyric spacing.
             let minAllowedStart = max(
                 previousEmittedTimestamp.map { $0 + 0.25 } ?? 0,
                 previousLineEnd,
                 previousBlankTimestamp.map { $0 + 0.01 } ?? 0
             )
-            let windowEnd = min(shiftedEnd + localPadding, nextShiftedStart + 0.4)
-            // Words before `floor` would be rejected below, so they can't outrank a later eligible one.
-            let matchesAfter = { (floor: Double) -> [TokenMatch] in
-                let windowStart = max(0, lastConsumedWordStart, floor, shiftedStart - localPadding)
-                return windowEnd > windowStart
-                    ? matchLineTokens(
-                        lineTokens: lineTokens,
-                        expectedStart: shiftedStart,
-                        window: windowStart...windowEnd,
-                        recognized: sortedRecognized,
-                        normalizedRec: normalizedRec
-                    )
-                    : []
-            }
+            // In Lyrics Alignment, `LyricsForcedAligner` tags words with `sourceLineId` and searches up to
+            // `line.end + lineWindow` (3.0 s), so retain the unshifted forced-alignment reach for tagged
+            // line-owned words while keeping the tighter shifted + next-row (including blank) cap for legacy untagged words.
+            let untaggedWindowEnd = min(shiftedEnd + localPadding, nextUntaggedBound + 0.4)
+            let ownedWindowEnd = max(shiftedEnd, line.timestamp + rawLineDur) + localPadding
+            let firstMeaningfulTokenIndex = lineTokens.firstIndex { !$0.normalized.isEmpty }
             let meaningfulTokenCount = lineTokens.filter { !$0.normalized.isEmpty }.count
             let minMatches = meaningfulTokenCount <= 2 ? 1 : max(2, meaningfulTokenCount / 3)
 
-            // A matched line's end is only where its last word's audio ran out, which can be stretched past
-            // the next line's first word. If nothing starts after that end, the next line may start after
-            // the last word's start instead, trimming the line before rather than losing its own match.
-            let trimmablePrevious = alignedLines.last.flatMap { $0.id == matchedLineIDs.last ? $0 : nil }
-            var floors = [minAllowedStart]
-            if let previous = trimmablePrevious {
-                let lastWordStart = previous.words.last?.timestamp ?? previous.timestamp
-                let relaxed = max(previous.timestamp + 0.25, lastWordStart + 0.001)
-                if relaxed < minAllowedStart { floors.append(relaxed) }
+            // The previous non-empty line's end (a held-note tail or an unmatched line's fetched duration)
+            // can run past where this line's vocal actually begins, even across an intervening blank marker.
+            // Allow a relaxed floor back to the previous line's last heard word (or timestamp + 0.25 s if
+            // unmatched) and reconcile its tail + any intervening blanks when relaxing recovers earlier words.
+            let trimmablePreviousIndex = alignedLines.lastIndex { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            let interveningBlankCount = trimmablePreviousIndex.map { alignedLines.count - 1 - $0 } ?? 0
+            func floors(forLineOwned isLineOwnedMatch: Bool) -> [Double] {
+                var result = [minAllowedStart]
+                let consumedFloor = isLineOwnedMatch ? lastOwnedConsumedWordStart : lastConsumedWordStart
+                if let prevIdx = trimmablePreviousIndex {
+                    let previous = alignedLines[prevIdx]
+                    let relaxedBase = max(previous.timestamp + 0.25, consumedFloor)
+                    let relaxed = relaxedBase + Double(interveningBlankCount) * 0.01
+                    if relaxed < minAllowedStart { result.append(relaxed) }
+                } else if !alignedLines.isEmpty, minAllowedStart > 0 {
+                    // Leading blank markers before the first lyric line must not block early vocals;
+                    // `reconcilePrecedingBoundary` pulls those blanks back before `best.start`.
+                    result.append(0.0)
+                }
+                return result
             }
 
-            for floor in floors {
-                let matches = matchesAfter(floor)
-                guard matches.count >= minMatches else { continue }
-                let builtWords = interpolateWordTimestamps(
-                    tokens: lineTokens,
-                    matches: Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) }),
-                    fallbackStart: max(shiftedStart, floor),
-                    fallbackEnd: max(shiftedEnd, floor + 0.4),
-                    splitsSyllables: splitsSyllables
-                )
-                let newLineStart = builtWords.first?.timestamp ?? shiftedStart
-                let rawEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
-
-                if abs(newLineStart - shiftedStart) <= 2.5, newLineStart >= floor {
-                    let clampedEnd = nextShiftedStart > newLineStart + 0.3 ? min(rawEnd, nextShiftedStart) : rawEnd
-                    let newDuration = max(0.3, clampedEnd - newLineStart)
-                    if let previous = trimmablePrevious, newLineStart < previousLineEnd {
-                        alignedLines[alignedLines.count - 1] = Self.trimmed(previous, toEnd: newLineStart)
-                    }
-                    matchedLineCount += 1
-                    matchedLineIDs.append(line.id)
-                    matchedWordCount += matches.count
-                    lastConsumedWordStart = max(lastConsumedWordStart, (matches.map(\.word.startTime).max() ?? newLineStart) + 0.001)
-                    previousLineEnd = newLineStart + newDuration
-                    previousEmittedTimestamp = newLineStart
-
-                    alignedLines.append(
-                        LyricLine(
-                            id: line.id,
-                            timestamp: newLineStart,
-                            duration: newDuration,
-                            text: line.text,
-                            words: builtWords
-                        )
+            var bestCandidate: (matches: [TokenMatch], words: [WordTimestamp], start: Double, end: Double, hasFirstToken: Bool, isLineOwned: Bool)?
+            for source in sources(for: line.id) {
+                let isLineOwnedMatch = !regroupsCJKWords && source.first?.word.sourceLineId == line.id
+                let earliestStart = isLineOwnedMatch ? min(shiftedStart, line.timestamp) : shiftedStart
+                let windowEnd = isLineOwnedMatch ? ownedWindowEnd : untaggedWindowEnd
+                let consumedFloor = isLineOwnedMatch ? lastOwnedConsumedWordStart : lastConsumedWordStart
+                for floor in floors(forLineOwned: isLineOwnedMatch) {
+                    let windowStart = max(0, consumedFloor, floor, earliestStart - localPadding)
+                    guard windowEnd > windowStart else { continue }
+                    let matches = matchLineTokens(lineTokens, in: source, window: windowStart...windowEnd, expectedStart: shiftedStart)
+                    guard matches.count >= minMatches else { continue }
+                    let matchMap = Dictionary(uniqueKeysWithValues: matches.map { ($0.tokenIndex, $0.word) })
+                    let builtWords = interpolateWordTimestamps(
+                        tokens: lineTokens,
+                        matches: matchMap,
+                        fallbackSpan: max(shiftedStart, floor)...max(shiftedEnd, floor + 0.4),
+                        minStart: floor,
+                        splitsSyllables: splitsSyllables
                     )
-                    continue lineLoop
+                    let newLineStart = builtWords.first?.timestamp ?? shiftedStart
+                    let rawEnd = builtWords.last.map { $0.timestamp + ($0.duration ?? 0.2) } ?? shiftedEnd
+
+                    let withinShift = abs(newLineStart - shiftedStart) <= maxLineShift
+                        || (isLineOwnedMatch && abs(newLineStart - line.timestamp) <= maxLineShift)
+                    guard withinShift, newLineStart >= floor else { continue }
+                    let hasFirstToken = firstMeaningfulTokenIndex.map { matchMap[$0] != nil } ?? false
+                    if let currentBest = bestCandidate {
+                        let strictlyBetter = matches.count > currentBest.matches.count
+                            || (matches.count == currentBest.matches.count && hasFirstToken && !currentBest.hasFirstToken)
+                        if strictlyBetter {
+                            bestCandidate = (matches, builtWords, newLineStart, rawEnd, hasFirstToken, isLineOwnedMatch)
+                        }
+                    } else {
+                        bestCandidate = (matches, builtWords, newLineStart, rawEnd, hasFirstToken, isLineOwnedMatch)
+                    }
                 }
+                if bestCandidate != nil { break }
+            }
+
+            if let best = bestCandidate {
+                let clampedEnd: Double = if regroupsCJKWords, nextShiftedStart > best.start + 0.3 {
+                    min(best.end, nextShiftedStart)
+                } else {
+                    // Do not cut off Lyrics Alignment at an unaligned fetched next-line timestamp;
+                    // if the next line actually aligns earlier, `reconcilePrecedingBoundary` trims this tail cleanly.
+                    best.end
+                }
+                let newDuration = max(0.3, clampedEnd - best.start)
+                var emittedLine = LyricLine(
+                    id: line.id,
+                    timestamp: best.start,
+                    duration: newDuration,
+                    text: line.text,
+                    words: best.words
+                )
+                if clampedEnd < best.end {
+                    emittedLine = Self.trimmed(emittedLine, toEnd: best.start + newDuration)
+                }
+                Self.reconcilePrecedingBoundary(in: &alignedLines, before: alignedLines.count, targetStart: best.start)
+                matchedLineCount += 1
+                matchedLineIDs.append(line.id)
+                matchedWordCount += best.matches.count
+                let maxMatchedStart = (best.matches.map(\.word.startTime).max() ?? best.start) + 0.001
+                lastConsumedWordStart = max(lastConsumedWordStart, maxMatchedStart)
+                if best.isLineOwned {
+                    lastOwnedConsumedWordStart = max(lastOwnedConsumedWordStart, maxMatchedStart)
+                }
+                previousLineEnd = best.start + newDuration
+                previousEmittedTimestamp = best.start
+                previousBlankTimestamp = nil
+
+                alignedLines.append(emittedLine)
+                continue lineLoop
             }
 
             let baseStart = (medianOffset.map { abs($0) >= 0.15 ? max(0, line.timestamp + $0) : line.timestamp }) ?? line.timestamp
@@ -689,6 +825,7 @@ enum LyricsAudioAligner {
 
             if isNonEmpty {
                 previousEmittedTimestamp = fallbackStart
+                previousBlankTimestamp = nil
                 if let dur = line.duration {
                     previousLineEnd = max(previousLineEnd, fallbackStart + max(0.25, dur))
                 } else {
@@ -718,17 +855,91 @@ enum LyricsAudioAligner {
     }
 
     /// `line` cut to end at `end`, with any word running past it shortened to fit.
-    private static func trimmed(_ line: LyricLine, toEnd end: Double) -> LyricLine {
-        LyricLine(
+    static func trimmed(_ line: LyricLine, toEnd end: Double) -> LyricLine {
+        let clampedEnd = max(line.timestamp, end)
+        return LyricLine(
             id: line.id,
             timestamp: line.timestamp,
-            duration: end - line.timestamp,
+            duration: clampedEnd - line.timestamp,
             text: line.text,
             words: line.words.map { word in
-                guard word.timestamp + (word.duration ?? 0) > end else { return word }
-                return WordTimestamp(timestamp: word.timestamp, duration: end - word.timestamp, text: word.text)
+                guard word.timestamp + (word.duration ?? 0) > clampedEnd else { return word }
+                let clampedStart = min(word.timestamp, clampedEnd)
+                return WordTimestamp(timestamp: clampedStart, duration: max(0.0, clampedEnd - clampedStart), text: word.text)
             }
         )
+    }
+
+    /// Trims the preceding non-empty line (and pulls back any intervening blank markers) when a newly
+    /// aligned or recovered line starts before the preceding line's end or an intervening blank's timestamp.
+    static func reconcilePrecedingBoundary(in lines: inout [LyricLine], before targetIndex: Int, targetStart: Double) {
+        guard targetIndex > 0, targetIndex <= lines.count else { return }
+        let precedingRange = 0..<targetIndex
+        guard let prevIdx = precedingRange.last(where: { !isEmptyLine(lines[$0]) }) else {
+            let count = targetIndex
+            let eps = min(0.01, max(0.0, targetStart) / Double(count + 1))
+            for idx in 0..<count {
+                let slot = max(0.0, targetStart - Double(count - idx) * eps)
+                if lines[idx].timestamp >= slot {
+                    lines[idx] = LyricLine(
+                        id: lines[idx].id,
+                        timestamp: slot,
+                        duration: lines[idx].duration,
+                        text: lines[idx].text,
+                        words: lines[idx].words
+                    )
+                }
+            }
+            return
+        }
+        let prev = lines[prevIdx]
+        guard targetStart >= prev.timestamp else { return }
+        let prevEnd = prev.duration.map { prev.timestamp + $0 }
+            ?? prev.words.last.map { $0.timestamp + ($0.duration ?? 0) }
+            ?? prev.timestamp
+        let blankStart = prevIdx + 1
+        let blankCount = targetIndex - blankStart
+        let eps = blankCount > 0 ? min(0.01, max(0.0, targetStart - prev.timestamp) / Double(blankCount + 2)) : 0.0
+        var ceiling = targetStart
+        if blankCount > 0 {
+            for offset in stride(from: blankCount - 1, through: 0, by: -1) {
+                let idx = blankStart + offset
+                let maxAllowed = max(prev.timestamp, ceiling - eps)
+                // Also clamp stale blanks sitting below `prevEnd` up into `[prev.timestamp, maxAllowed]`
+                // so a shifted preceding line is never crushed down to an unadjusted earlier blank timestamp.
+                let minAllowed = min(maxAllowed, max(prev.timestamp, prevEnd) + Double(offset) * eps)
+                let currentTs = lines[idx].timestamp
+                let adjusted: Double? = if currentTs > maxAllowed || currentTs >= ceiling {
+                    maxAllowed
+                } else if currentTs < minAllowed {
+                    minAllowed
+                } else {
+                    nil
+                }
+                if let adjusted {
+                    lines[idx] = LyricLine(
+                        id: lines[idx].id,
+                        timestamp: adjusted,
+                        duration: lines[idx].duration,
+                        text: lines[idx].text,
+                        words: lines[idx].words
+                    )
+                }
+                ceiling = lines[idx].timestamp
+            }
+        }
+        if prevEnd > ceiling {
+            lines[prevIdx] = trimmed(prev, toEnd: ceiling)
+        }
+    }
+
+    private static func isEmptyLine(_ line: LyricLine) -> Bool {
+        line.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private struct RecognizedToken {
+        let word: RecognizedAudioWord
+        let normalized: String
     }
 
     private struct TokenMatch {
@@ -737,16 +948,12 @@ enum LyricsAudioAligner {
     }
 
     private static func matchLineTokens(
-        lineTokens: [DisplayToken],
-        expectedStart: Double,
+        _ lineTokens: [DisplayToken],
+        in source: [RecognizedToken],
         window: ClosedRange<Double>,
-        recognized: [RecognizedAudioWord],
-        normalizedRec: [String]
+        expectedStart: Double
     ) -> [TokenMatch] {
-        var candidates: [(recIdx: Int, word: RecognizedAudioWord, norm: String)] = []
-        for (i, word) in recognized.enumerated() where window.contains(word.startTime) {
-            candidates.append((i, word, normalizedRec[i]))
-        }
+        let candidates = source.filter { window.contains($0.word.startTime) }
         guard !candidates.isEmpty else { return [] }
 
         func scan(startingAt initialCursor: Int) -> [TokenMatch] {
@@ -757,9 +964,9 @@ enum LyricsAudioAligner {
             for (tokenIdx, token) in lineTokens.enumerated() {
                 guard !token.normalized.isEmpty else { continue }
                 let searchLimit = min(candidates.count, cursor + 8)
-                for cIdx in cursor..<searchLimit where tokensMatch(token.normalized, candidates[cIdx].norm) {
+                for cIdx in cursor..<searchLimit where tokensMatch(token.normalized, candidates[cIdx].normalized) {
                     let word = candidates[cIdx].word
-                    if let prevTime = lastMatchTime, word.startTime - prevTime > 3.5 {
+                    if word.sourceLineId == nil, let prevTime = lastMatchTime, word.startTime - prevTime > 3.5 {
                         break
                     }
                     matches.append(TokenMatch(tokenIndex: tokenIdx, word: word))
@@ -775,7 +982,7 @@ enum LyricsAudioAligner {
         // and pick the temporally coherent run with the most matches, breaking ties by proximity to expectedStart.
         var startIndices: [Int] = [0]
         if let firstNorm = lineTokens.first(where: { !$0.normalized.isEmpty })?.normalized {
-            for (idx, cand) in candidates.enumerated() where idx > 0 && tokensMatch(firstNorm, cand.norm) {
+            for (idx, cand) in candidates.enumerated() where idx > 0 && tokensMatch(firstNorm, cand.normalized) {
                 startIndices.append(idx)
             }
         }
@@ -809,8 +1016,8 @@ enum LyricsAudioAligner {
     private static func interpolateWordTimestamps(
         tokens: [DisplayToken],
         matches: [Int: RecognizedAudioWord],
-        fallbackStart: Double,
-        fallbackEnd: Double,
+        fallbackSpan: ClosedRange<Double>,
+        minStart: Double = 0.0,
         splitsSyllables: Bool
     ) -> [WordTimestamp] {
         guard !tokens.isEmpty else { return [] }
@@ -824,8 +1031,8 @@ enum LyricsAudioAligner {
             return durs.reduce(0, +) / Double(max(1, durs.count))
         }()
 
-        var starts = Array(repeating: fallbackStart, count: tokens.count)
-        var ends = Array(repeating: fallbackEnd, count: tokens.count)
+        var starts = Array(repeating: fallbackSpan.lowerBound, count: tokens.count)
+        var ends = Array(repeating: fallbackSpan.upperBound, count: tokens.count)
 
         for idx in anchorIndices {
             if let word = matches[idx] {
@@ -840,7 +1047,7 @@ enum LyricsAudioAligner {
             let step = max(0.08, min(0.35, avgWordDur))
             for i in 0..<firstAnchor {
                 let offsetFromAnchor = Double(firstAnchor - i) * step
-                starts[i] = max(0, anchorStart - offsetFromAnchor)
+                starts[i] = max(minStart, anchorStart - offsetFromAnchor)
                 ends[i] = max(starts[i], anchorStart - Double(firstAnchor - i - 1) * step)
             }
         }
