@@ -1,3 +1,7 @@
+## Summary
+
+<!-- Plain-language overview for reviewers and release notes: what does this PR do for users or maintainers? -->
+
 ## What changed and why
 
 <!-- One or two lines. Link the issue: "Closes #<number>". -->
@@ -17,8 +21,8 @@ No behaviour to test (docs, CI, pure refactor): write "n/a". See CONTRIBUTING.md
 
 <!-- Delete this section if you used none. Models go here, not in commit trailers. -->
 
-- Written with: <!-- e.g. the model and tool that wrote most of the change -->
-- Reviewed or simplified with: <!-- models used for review passes, if any -->
+- Written with: <!-- model name, reasoning/effort level, and tool (e.g. Model Name (High) in Tool) -->
+- Reviewed or simplified with: <!-- models, reasoning/effort levels, and rounds used for review passes, if any -->
 
 ## Checklist
 

@@ -98,7 +98,7 @@ A test counts when it fails without your change:
 ### Hygiene
 
 - No AI tool trailers (`Co-Authored-By:` for an assistant or session links) in commit messages; human co-authors are welcome.
-- If you used AI tools, say so in the PR template's **AI assistance** section instead: which model wrote the change, and which ones you used to review or simplify it.
+- If you used AI tools, say so in the PR template's **AI assistance** section instead: include the model name, reasoning/effort level, and tool that wrote the change, plus the models and effort levels used to review or simplify it.
 - No machine-local absolute paths or personal credentials in code, tests, or PR descriptions.
 
 ## Submitting a PR
@@ -107,7 +107,7 @@ A test counts when it fails without your change:
 2. Rebase your branch onto `origin/main` before opening the PR.
 3. Ensure `swift test`, `bash scripts/lint.sh`, and `./build.sh` all pass locally.
 4. Use a Conventional Commit PR title (checked by `Conventional PR Title`).
-5. Fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md): what changed and why with `Closes #<number>`, the Tests evidence, AI assistance (or delete it), and the checklist. This applies to PRs opened with `gh pr create --body` too: reproduce the template's headings.
+5. Fill in every section of [`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md): a plain-language Summary, what changed and why with `Closes #<number>`, the Tests evidence, AI assistance (or delete it), and the checklist. This applies to PRs opened with `gh pr create --body` too: reproduce the template's headings.
 6. Docs-only PRs (`*.md`, `docs/**`) automatically skip macOS CI builds via `.github/filters.yml`.
 7. CodeRabbit doesn't review automatically. When the PR is ready, comment `@coderabbitai review` to request a review. Its comments are advisory: resolving them is not required to merge.
 
