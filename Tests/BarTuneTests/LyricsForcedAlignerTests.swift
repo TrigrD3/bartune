@@ -522,6 +522,117 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the old compiled model must be rebuilt from the new package")
     }
 
+    func testAcousticModelCacheReusesModelAcrossTracksAndInvalidatesOnChangeOrRelease() throws {
+        let cache = AcousticModelCache()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricsAligner.mlmodelc")
+        let t1 = Date(timeIntervalSince1970: 1_700_000_000)
+        let t2 = Date(timeIntervalSince1970: 1_700_000_100)
+        var loadCount = 0
+
+        let first = try XCTUnwrap(cache.load(compiledURL: url, modificationDate: t1) { _ in
+            loadCount += 1
+            return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        })
+        let second = try XCTUnwrap(cache.load(compiledURL: url, modificationDate: t1) { _ in
+            loadCount += 1
+            return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        })
+        XCTAssertEqual(loadCount, 1, "same URL and modification date must reuse the cached acoustic model")
+        XCTAssertIdentical(first, second)
+
+        let reloadedAfterMod = try XCTUnwrap(cache.load(compiledURL: url, modificationDate: t2) { _ in
+            loadCount += 1
+            return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        })
+        XCTAssertEqual(loadCount, 2, "a changed modification date must reload the acoustic model")
+        XCTAssertNotIdentical(first, reloadedAfterMod)
+
+        cache.invalidate()
+        let reloadedAfterInvalidate = try XCTUnwrap(cache.load(compiledURL: url, modificationDate: t2) { _ in
+            loadCount += 1
+            return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        })
+        XCTAssertEqual(loadCount, 3, "explicit invalidation must release and reload the cached model")
+        XCTAssertNotIdentical(reloadedAfterMod, reloadedAfterInvalidate)
+    }
+
+    func testConcurrentAcousticModelLoadsShareTheBlockedLoader() {
+        let cache = AcousticModelCache()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricsAligner.mlmodelc")
+        let date = Date()
+        let model = FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        let firstStarted = expectation(description: "First loader started")
+        let firstFinished = expectation(description: "First lookup returned")
+        let release = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            let first = cache.load(compiledURL: url, modificationDate: date) { _ in
+                firstStarted.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                return model
+            }
+            XCTAssertIdentical(first, model)
+            firstFinished.fulfill()
+        }
+        wait(for: [firstStarted], timeout: 2)
+
+        let secondStarted = expectation(description: "Concurrent lookup started")
+        let secondFinished = expectation(description: "Concurrent lookup returned")
+        let duplicateLoad = expectation(description: "Concurrent lookup invoked its loader")
+        duplicateLoad.isInverted = true
+        DispatchQueue.global().async {
+            secondStarted.fulfill()
+            let second = cache.load(compiledURL: url, modificationDate: date) { _ in
+                duplicateLoad.fulfill()
+                return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+            }
+            XCTAssertIdentical(second, model)
+            secondFinished.fulfill()
+        }
+        wait(for: [secondStarted], timeout: 2)
+        wait(for: [duplicateLoad], timeout: 0.1)
+        release.signal()
+        wait(for: [firstFinished, secondFinished], timeout: 2)
+    }
+
+    func testInvalidatingDuringAnAcousticModelLoadPreventsStalePublication() {
+        let cache = AcousticModelCache()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricsAligner.mlmodelc")
+        let date = Date()
+        let started = expectation(description: "Loader started")
+        let finished = expectation(description: "Invalidated load finished")
+        let release = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            _ = cache.load(compiledURL: url, modificationDate: date) { _ in
+                started.fulfill()
+                XCTAssertEqual(release.wait(timeout: .now() + 5), .success)
+                return FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+            }
+            finished.fulfill()
+        }
+        wait(for: [started], timeout: 2)
+        cache.invalidate()
+        release.signal()
+        wait(for: [finished], timeout: 2)
+
+        let replacement = FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+        XCTAssertIdentical(cache.load(compiledURL: url, modificationDate: date) { _ in replacement }, replacement)
+    }
+
+    func testFailedAcousticModelReloadEvictsThePreviousVersion() {
+        let cache = AcousticModelCache()
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("LyricsAligner.mlmodelc")
+        let date = Date()
+        weak var previous: FakeAcousticModel?
+        _ = cache.load(compiledURL: url, modificationDate: date) { _ in
+            let model = FakeAcousticModel(windowSampleCount: 16000, frameCount: 50)
+            previous = model
+            return model
+        }
+        XCTAssertNotNil(previous)
+        XCTAssertNil(cache.load(compiledURL: url, modificationDate: date.addingTimeInterval(1)) { _ in nil })
+        XCTAssertNil(previous, "A failed reload must release the stale model")
+    }
+
     private func chunk(start: Double, isFinal: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },

@@ -79,6 +79,12 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertEqual(env.segments[0].levels.count, VocalEnvelope.maxFrames)
         XCTAssertEqual(env.segments[0].start, 10, accuracy: 1e-6)
         XCTAssertEqual(env.segments[0].end, Double(frames) * 0.01, accuracy: 1e-6)
+        XCTAssertEqual(env.totalFrameCount, env.segments.reduce(0) { $0 + $1.levels.count })
+
+        env.append(mid: [Float](repeating: 0.1, count: 1000), side: [], sampleRate: 1000, startTime: 2000, rate: 1)
+        XCTAssertEqual(env.segments.count, 1)
+        XCTAssertEqual(env.segments[0].levels.count, 100)
+        XCTAssertEqual(env.totalFrameCount, env.segments.reduce(0) { $0 + $1.levels.count })
     }
 
     func testPlaybackRateScalesFrameTimes() {
@@ -259,5 +265,16 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertEqual(segs[2].start, 10.2, accuracy: 0.0001)
         XCTAssertEqual(segs[2].levels.count, 30)
         XCTAssertEqual(segs[2].end, 10.5, accuracy: 0.0001)
+        XCTAssertEqual(merged.totalFrameCount, 50)
+    }
+
+    func testTotalFrameCountTracksAppendsAndCapacityTrims() {
+        var envelope = VocalEnvelope()
+        XCTAssertEqual(envelope.totalFrameCount, 0)
+        envelope.append(mid: tone(0.5, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1)
+        XCTAssertEqual(envelope.totalFrameCount, 50)
+        envelope.append(mid: tone(0.25, amplitude: 0.5), side: [], sampleRate: sampleRate, startTime: 5.0, rate: 1)
+        XCTAssertEqual(envelope.totalFrameCount, 75)
+        XCTAssertEqual(envelope.totalFrameCount, envelope.segments.reduce(0) { $0 + $1.levels.count })
     }
 }

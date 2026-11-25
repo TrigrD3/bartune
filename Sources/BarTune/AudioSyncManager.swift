@@ -17,6 +17,32 @@ struct CapturedAudio: Sendable {
     var captureDelay: Double?
     /// Monotonic capture timestamp (`ProcessInfo.processInfo.systemUptime` domain) measured before extraction.
     var capturedAt: Double?
+
+    func firstSampleUptime(deliveredAt: Double) -> Double {
+        capturedAt ?? (deliveredAt - (captureDelay ?? 0))
+    }
+
+    func trimmingBefore(_ boundary: Double, deliveredAt: Double) -> CapturedAudio? {
+        // A callback already queued for the main actor at the seek contains only old audio.
+        guard deliveredAt > boundary else { return nil }
+        let start = firstSampleUptime(deliveredAt: deliveredAt)
+        guard start < boundary else { return self }
+
+        guard sampleRate > 0, !samples.isEmpty,
+              start + Double(samples.count - 1) / sampleRate >= boundary
+        else { return nil }
+        var count = Int((boundary - start) * sampleRate)
+        // Compare in the timestamp domain so rounding cannot discard a frame exactly at the boundary.
+        if start + Double(count) / sampleRate < boundary { count += 1 }
+        let retainedStart = start + Double(count) / sampleRate
+        return CapturedAudio(
+            samples: Array(samples.dropFirst(count)),
+            side: Array(side.dropFirst(count)),
+            sampleRate: sampleRate,
+            captureDelay: max(0, deliveredAt - retainedStart),
+            capturedAt: retainedStart
+        )
+    }
 }
 
 protocol AudioCaptureProviding: AnyObject {
@@ -238,7 +264,7 @@ protocol SystemAudioCaptureBackend: Sendable {
     func startStream(
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
-        output: SCStreamOutput,
+        output: AudioCaptureStreamOutput,
         audioQueue: DispatchQueue
     ) async throws -> SystemAudioStreamControlling
 }
@@ -270,7 +296,7 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
     func startStream(
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
-        output: SCStreamOutput,
+        output: AudioCaptureStreamOutput,
         audioQueue: DispatchQueue
     ) async throws -> SystemAudioStreamControlling {
         guard let scDisplay = display.scDisplay else {
@@ -282,17 +308,7 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
         }
 
         let scFilter = SCContentFilter(display: scDisplay, including: scApps, exceptingWindows: [])
-
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true
-        config.sampleRate = 16000
-        // Stereo lets the vocal envelope weigh the centre of the mix; recognition gets the mono mix.
-        config.channelCount = 2
-        // Minimal video footprint since we only consume audio buffers.
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+        let config = SystemAudioCapture.makeStreamConfiguration()
 
         let newStream = SCStream(filter: scFilter, configuration: config, delegate: nil)
         try newStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: audioQueue)
@@ -301,7 +317,82 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
     }
 }
 
-final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding, @unchecked Sendable {
+/// Coalesces frequent ScreenCaptureKit audio callbacks (~20 ms) on `audioQueue` into coarser batches
+/// (~200 ms) to reduce MainActor wakeups without distorting capture timestamps or gap detection.
+struct AudioCaptureBatcher {
+    let targetDuration: Double
+    private var samples: [Float] = []
+    private var side: [Float] = []
+    private var sampleRate: Double = 0
+    private var firstCapturedAt: Double?
+    private var firstCaptureDelay: Double?
+    private var hasSide = false
+
+    init(targetDuration: Double = 0.20) {
+        self.targetDuration = targetDuration
+    }
+
+    mutating func append(_ audio: CapturedAudio, deliveryUptime: Double = ProcessInfo.processInfo.systemUptime) -> [CapturedAudio] {
+        guard !audio.samples.isEmpty, audio.sampleRate > 0 else { return [] }
+        let incomingHasSide = audio.side.count == audio.samples.count
+        var ready: [CapturedAudio] = []
+
+        if !samples.isEmpty {
+            let rateChanged = abs(audio.sampleRate - sampleRate) > 0.5
+            let sideChanged = incomingHasSide != hasSide
+            let gapDetected: Bool = if let firstAt = firstCapturedAt, let nextAt = audio.capturedAt {
+                abs(nextAt - (firstAt + Double(samples.count) / sampleRate)) > 0.05
+            } else {
+                false
+            }
+            if rateChanged || sideChanged || gapDetected, let flushed = flush(deliveryUptime: deliveryUptime) {
+                ready.append(flushed)
+            }
+        }
+
+        if samples.isEmpty {
+            sampleRate = audio.sampleRate
+            firstCapturedAt = audio.capturedAt
+            firstCaptureDelay = audio.captureDelay
+            hasSide = incomingHasSide
+            let targetSamples = max(audio.samples.count, Int((audio.sampleRate * targetDuration).rounded()))
+            samples.reserveCapacity(targetSamples)
+            if incomingHasSide {
+                side.reserveCapacity(targetSamples)
+            }
+        }
+
+        samples.append(contentsOf: audio.samples)
+        if hasSide {
+            side.append(contentsOf: audio.side)
+        }
+
+        if Double(samples.count) / sampleRate >= targetDuration, let flushed = flush(deliveryUptime: deliveryUptime) {
+            ready.append(flushed)
+        }
+        return ready
+    }
+
+    mutating func flush(deliveryUptime: Double = ProcessInfo.processInfo.systemUptime) -> CapturedAudio? {
+        guard !samples.isEmpty else { return nil }
+        let out = CapturedAudio(
+            samples: samples,
+            side: hasSide ? side : [],
+            sampleRate: sampleRate,
+            captureDelay: firstCapturedAt.map { max(firstCaptureDelay ?? 0, deliveryUptime - $0) } ?? firstCaptureDelay,
+            capturedAt: firstCapturedAt
+        )
+        samples.removeAll(keepingCapacity: false)
+        side.removeAll(keepingCapacity: false)
+        sampleRate = 0
+        firstCapturedAt = nil
+        firstCaptureDelay = nil
+        hasSide = false
+        return out
+    }
+}
+
+final class SystemAudioCapture: AudioCaptureProviding, @unchecked Sendable {
     private let callbackLock = NSLock()
     private var _onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
     var onAudioSamples: (@Sendable (CapturedAudio) -> Void)? {
@@ -321,10 +412,27 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
     @MainActor private var stream: SystemAudioStreamControlling?
     @MainActor private var sessionID: UInt64 = 0
     private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
+    @MainActor private var streamOutput: AudioCaptureStreamOutput?
+
+    static func makeStreamConfiguration() -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.capturesAudio = true
+        config.excludesCurrentProcessAudio = true
+        config.sampleRate = 16000
+        // Stereo lets the vocal envelope weigh the centre of the mix; recognition gets the mono mix.
+        config.channelCount = 2
+        // Minimal video footprint since we only consume audio buffers; a long frame interval avoids
+        // waking WindowServer/replayd for 1 FPS video readbacks.
+        config.width = 2
+        config.height = 2
+        config.showsCursor = false
+        config.queueDepth = 3
+        config.minimumFrameInterval = CMTime(value: 600, timescale: 1)
+        return config
+    }
 
     init(backend: SystemAudioCaptureBackend = LiveSystemAudioCaptureBackend()) {
         self.backend = backend
-        super.init()
     }
 
     static func resolveTargetApplications(
@@ -356,12 +464,23 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
             throw SystemAudioCaptureError.unresolvedPlayer
         }
 
-        let newStream = try await backend.startStream(
-            display: display,
-            includedApplications: includedApps,
-            output: self,
-            audioQueue: audioQueue
-        )
+        let output = AudioCaptureStreamOutput(onAudioSamples: onAudioSamples)
+        streamOutput = output
+        let newStream: SystemAudioStreamControlling
+        do {
+            newStream = try await backend.startStream(
+                display: display,
+                includedApplications: includedApps,
+                output: output,
+                audioQueue: audioQueue
+            )
+        } catch {
+            if streamOutput === output {
+                streamOutput = nil
+            }
+            audioQueue.async { output.retire() }
+            throw error
+        }
 
         guard sessionID == currentSession else {
             await newStream.stopCapture()
@@ -374,11 +493,30 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
     @MainActor
     func stop() {
         sessionID &+= 1
+        if let output = streamOutput {
+            streamOutput = nil
+            audioQueue.async { output.retire() }
+        }
         guard let activeStream = stream else { return }
         stream = nil
         Task {
             await activeStream.stopCapture()
         }
+    }
+}
+
+/// One output per stream. All callbacks and retirement run on the serial audio queue.
+final class AudioCaptureStreamOutput: NSObject, SCStreamOutput, @unchecked Sendable {
+    private var batcher = AudioCaptureBatcher()
+    private var onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
+
+    init(onAudioSamples: (@Sendable (CapturedAudio) -> Void)?) {
+        self.onAudioSamples = onAudioSamples
+    }
+
+    func retire() {
+        onAudioSamples = nil
+        _ = batcher.flush()
     }
 
     func stream(
@@ -386,7 +524,7 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
         didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        guard type == .audio, sampleBuffer.isValid else { return }
+        guard onAudioSamples != nil, type == .audio, sampleBuffer.isValid else { return }
         guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
               let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)
         else { return }
@@ -409,7 +547,15 @@ final class SystemAudioCapture: NSObject, SCStreamOutput, AudioCaptureProviding,
             side = []
         }
         guard !mid.isEmpty else { return }
-        onAudioSamples?(CapturedAudio(samples: mid, side: side, sampleRate: sampleRate, captureDelay: delay, capturedAt: capturedAt))
+        let captured = CapturedAudio(samples: mid, side: side, sampleRate: sampleRate, captureDelay: delay, capturedAt: capturedAt)
+        append(captured)
+    }
+
+    func append(_ captured: CapturedAudio) {
+        guard let onAudioSamples else { return }
+        for batch in batcher.append(captured) {
+            onAudioSamples(batch)
+        }
     }
 }
 
@@ -434,6 +580,11 @@ final class AudioSyncManager {
         var vocalEnvelopeNow: @Sendable () -> ContinuousClock.Instant = { .now }
         var vocalEnvelopeSleep: @Sendable (ContinuousClock.Instant) async throws -> Void = {
             try await Task.sleep(until: $0, clock: .continuous)
+        }
+        var releaseCachedModel: @Sendable () -> Void = { LyricsAlignerModel.releaseCachedModel() }
+        var idleModelReleaseDelay: Duration = .seconds(60)
+        var idleModelReleaseSleep: @Sendable (Duration) async throws -> Void = {
+            try await Task.sleep(for: $0)
         }
 
         static func live() -> Dependencies {
@@ -539,6 +690,8 @@ final class AudioSyncManager {
     private var lastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
     private var alignerStartupTask: Task<Void, Never>?
     private var chunkProcessingTask: Task<Void, Never>?
+    private var modelIdleReleaseTask: Task<Void, Never>?
+    private var modelMayBeCached = false
     private var chunkEngine: AudioChunkTranscribing?
     private var activeSampleRate: Double = 16000.0
     private var capturedSeconds: Double = 0
@@ -571,6 +724,28 @@ final class AudioSyncManager {
         }
     }
 
+    private func scheduleIdleModelReleaseIfNeeded() {
+        guard modelMayBeCached, modelIdleReleaseTask == nil else { return }
+        let delay = dependencies.idleModelReleaseDelay
+        let sleepFor = dependencies.idleModelReleaseSleep
+        let release = dependencies.releaseCachedModel
+        modelIdleReleaseTask = Task { [weak self] in
+            do {
+                try await sleepFor(delay)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  !self.isLiveSyncActive,
+                  self.alignerStartupTask == nil
+            else { return }
+            self.modelIdleReleaseTask = nil
+            self.modelMayBeCached = false
+            release()
+        }
+    }
+
     func stop() {
         cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
@@ -592,6 +767,7 @@ final class AudioSyncManager {
         pendingSeekPos = nil
         lastPlayback = nil
         capturedSeconds = 0
+        scheduleIdleModelReleaseIfNeeded()
     }
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
@@ -724,6 +900,7 @@ final class AudioSyncManager {
     ) {
         captureTargetGeneration &+= 1
         let captureGeneration = captureTargetGeneration
+        installChunkHandler(trackId: trackId, generation: generation, captureGeneration: captureGeneration)
         let targetBundles = Self.targetBundleIdentifiers(for: trackId, sourceBundleId: activeSourceBundleId)
         Task { [weak self] in
             guard let self,
@@ -869,6 +1046,9 @@ final class AudioSyncManager {
     }
 
     private func startLyricsAlignmentSync(track: TrackInfo, lines: [LyricLine]) {
+        modelIdleReleaseTask?.cancel()
+        modelIdleReleaseTask = nil
+        modelMayBeCached = true
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
         audioSampleBuffer.removeAll(keepingCapacity: true)
@@ -887,11 +1067,18 @@ final class AudioSyncManager {
                   self.activeTrackId == track.id,
                   self.state.audioSyncEngine == .lyricsAlignment
             else {
-                engine?.shutdown()
+                guard let engine else { return }
+                engine.shutdown()
+                // A late launch may have cached the model after the idle release fired.
+                if let self, !self.isLiveSyncActive, self.alignerStartupTask == nil {
+                    self.modelMayBeCached = true
+                    self.scheduleIdleModelReleaseIfNeeded()
+                }
                 return
             }
             self.alignerStartupTask = nil
             guard let engine else {
+                self.scheduleIdleModelReleaseIfNeeded()
                 self.state.audioSyncStatus = .unavailable("Lyrics alignment model not installed, or this Mac has no Neural Engine")
                 return
             }
@@ -902,16 +1089,27 @@ final class AudioSyncManager {
     }
 
     private func beginChunkCapture(track: TrackInfo, generation: UInt64) {
-        capture.onAudioSamples = { @Sendable [weak self] audio in
-            // When the first sample was captured: the pre-extraction monotonic timestamp, else delivery minus delay.
-            let capturedAt = audio.capturedAt ?? (ProcessInfo.processInfo.systemUptime - (audio.captureDelay ?? 0))
+        isLiveSyncActive = true
+        lastPlayback = (
+            currentPlaybackPosition(),
+            ProcessInfo.processInfo.systemUptime,
+            Self.sanitizedPlaybackRate(state.playbackRate),
+            state.isPlaying
+        )
+        startCaptureForCurrentTarget(trackId: track.id, engine: .lyricsAlignment, generation: generation)
+    }
+
+    private func installChunkHandler(trackId: String, generation: UInt64, captureGeneration: UInt64) {
+        capture.onAudioSamples = { @Sendable [weak self] batch in
+            let deliveredAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self,
                       self.syncGeneration == generation,
+                      self.captureTargetGeneration == captureGeneration,
                       self.isLiveSyncActive,
-                      self.activeTrackId == track.id,
+                      self.activeTrackId == trackId,
                       self.state.audioSyncEngine == .lyricsAlignment,
-                      capturedAt > self.seekBoundary
+                      let audio = batch.trimmingBefore(self.seekBoundary, deliveredAt: deliveredAt)
                 else { return }
                 let samples = audio.samples
                 let sampleRate = audio.sampleRate
@@ -925,7 +1123,7 @@ final class AudioSyncManager {
                 }
                 let livePos = Self.playbackPosition(
                     self.currentPlaybackPosition(),
-                    capturedAt: capturedAt,
+                    capturedAt: audio.firstSampleUptime(deliveredAt: deliveredAt),
                     now: ProcessInfo.processInfo.systemUptime,
                     rate: self.state.isPlaying ? self.state.playbackRate : 0
                 )
@@ -953,7 +1151,7 @@ final class AudioSyncManager {
                 if let chunkStart = self.chunkStartPos, sampleRate > 0 {
                     let deliveryStart = chunkStart
                         + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
-                    let previousFrameCount = self.vocalEnvelope.segments.reduce(0) { $0 + $1.levels.count }
+                    let previousFrameCount = self.vocalEnvelope.totalFrameCount
                     let previousEnd = self.vocalEnvelope.segments.last?.end
                     self.vocalEnvelope.append(
                         mid: samples,
@@ -962,11 +1160,11 @@ final class AudioSyncManager {
                         startTime: deliveryStart,
                         rate: self.chunkPlaybackRate
                     )
-                    let updatedFrameCount = self.vocalEnvelope.segments.reduce(0) { $0 + $1.levels.count }
+                    let updatedFrameCount = self.vocalEnvelope.totalFrameCount
                     if updatedFrameCount > 0,
                        updatedFrameCount > previousFrameCount || self.vocalEnvelope.segments.last?.end != previousEnd {
                         self.vocalEnvelopeRevision &+= 1
-                        self.notifyVocalEnvelopeChanged(for: track.id, throttled: previousFrameCount > 0)
+                        self.notifyVocalEnvelopeChanged(for: trackId, throttled: previousFrameCount > 0)
                     }
                 }
                 self.audioSampleBuffer.append(contentsOf: samples)
@@ -981,18 +1179,9 @@ final class AudioSyncManager {
                     }
                 }
 
-                self.dispatchChunkIfReady(trackId: track.id, generation: generation)
+                self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
         }
-
-        isLiveSyncActive = true
-        lastPlayback = (
-            currentPlaybackPosition(),
-            ProcessInfo.processInfo.systemUptime,
-            Self.sanitizedPlaybackRate(state.playbackRate),
-            state.isPlaying
-        )
-        startCaptureForCurrentTarget(trackId: track.id, engine: .lyricsAlignment, generation: generation)
     }
 
     /// Dispatches one `targetFrames` chunk when the worker is idle, or what is left once the audio reaches the
@@ -1015,7 +1204,7 @@ final class AudioSyncManager {
         guard audioSampleBuffer.count >= targetFrames || (isFinal && !audioSampleBuffer.isEmpty) else { return }
 
         let frameCount = min(targetFrames, audioSampleBuffer.count)
-        let chunk = AudioLevel.normalizedForRecognition(Array(audioSampleBuffer.prefix(frameCount)))
+        let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
         audioSampleBuffer.removeFirst(frameCount)
         if audioSampleBuffer.isEmpty {
             chunkStartPos = nil
@@ -1024,40 +1213,49 @@ final class AudioSyncManager {
         }
         if isFinal { sentFinalChunk = true }
 
-        let request = AudioChunkRequest(
-            samples: chunk,
-            sampleRate: Int(sampleRate),
-            chunkStartTime: chunkStart,
-            playbackRate: chunkPlaybackRate,
-            isFinal: isFinal
-        )
-        chunkProcessingTask = Task { [weak self] in
+        let requestSampleRate = Int(sampleRate)
+        let requestPlaybackRate = chunkPlaybackRate
+        // Run normalization, Core ML inference, and CTC Viterbi at `.background` QoS so multi-threaded
+        // CPU fallback (libBNNS) stays on efficiency cores and never preempts interactive UI threads.
+        chunkProcessingTask = Task.detached(priority: .background) { [weak self] in
+            let chunk = AudioLevel.normalizedForRecognition(rawChunk)
+            let request = AudioChunkRequest(
+                samples: chunk,
+                sampleRate: requestSampleRate,
+                chunkStartTime: chunkStart,
+                playbackRate: requestPlaybackRate,
+                isFinal: isFinal
+            )
             let words: [RecognizedAudioWord]
             do {
                 words = try await engine.transcribe(request)
             } catch {
-                guard let self, self.syncGeneration == generation else { return }
-                self.chunkProcessingTask = nil
-                self.persistCurrentAlignmentIfReady()
-                self.stop()
-                self.state.audioSyncStatus = .unavailable("Lyrics alignment stopped unexpectedly; it restarts with the next track")
+                await MainActor.run { [weak self] in
+                    guard let self, self.syncGeneration == generation else { return }
+                    self.chunkProcessingTask = nil
+                    self.persistCurrentAlignmentIfReady()
+                    self.stop()
+                    self.state.audioSyncStatus = .unavailable("Lyrics alignment stopped unexpectedly; it restarts with the next track")
+                }
                 return
             }
-            guard let self, self.syncGeneration == generation else { return }
-            self.chunkProcessingTask = nil
-            guard self.activeTrackId == trackId,
-                  self.isLiveSyncActive,
-                  self.state.audioSyncEngine == .lyricsAlignment
-            else { return }
-            self.diagnostics.update { $0.record(words: words, replacing: false) }
-            self.recognizedWords.append(contentsOf: words)
-            if let reporter = engine as? LineAttemptReporting {
-                self.attemptedLineIDs.formUnion(reporter.attemptedLineIDs)
-                self.confidentLineIDs.formUnion(reporter.confidentLineIDs)
-                self.nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
+            await MainActor.run { [weak self] in
+                guard let self, self.syncGeneration == generation else { return }
+                self.chunkProcessingTask = nil
+                guard self.activeTrackId == trackId,
+                      self.isLiveSyncActive,
+                      self.state.audioSyncEngine == .lyricsAlignment
+                else { return }
+                self.diagnostics.update { $0.record(words: words, replacing: false) }
+                self.recognizedWords.append(contentsOf: words)
+                if let reporter = engine as? LineAttemptReporting {
+                    self.attemptedLineIDs.formUnion(reporter.attemptedLineIDs)
+                    self.confidentLineIDs.formUnion(reporter.confidentLineIDs)
+                    self.nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
+                }
+                self.applyLyricsAlignment()
+                self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
-            self.applyLyricsAlignment()
-            self.dispatchChunkIfReady(trackId: trackId, generation: generation)
         }
     }
 
