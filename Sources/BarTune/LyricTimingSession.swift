@@ -127,19 +127,143 @@ struct LyricTimingSession: Equatable, Sendable {
         JapaneseRomanizer.containsJapaneseOrCJK(text) || KoreanRomanizer.containsHangul(text)
     }
 
-    static func romanizedPreview(forLine text: String) -> String? {
-        guard JapaneseRomanizer.containsJapaneseOrCJK(text) else { return nil }
-        let romaji = JapaneseRomanizer.romanizeLine(text)
-        return romaji == text ? nil : romaji
+    static func romanizedPreview(
+        forLine text: String,
+        japanese: Bool = true,
+        korean: Bool = false,
+        chinese: Bool = false,
+        preferChineseForHan: Bool = false
+    ) -> String? {
+        if korean, KoreanRomanizer.containsHangul(text) {
+            let romaja = KoreanRomanizer.romanizeLine(text)
+            return romaja == text ? nil : romaja
+        }
+        if japanese, JapaneseRomanizer.containsKana(text) {
+            let romaji = JapaneseRomanizer.romanizeLine(text)
+            return romaji == text ? nil : romaji
+        }
+        if chinese, preferChineseForHan,
+           !JapaneseRomanizer.containsKana(text),
+           ChineseRomanizer.containsHan(text) {
+            let pinyin = ChineseRomanizer.romanizeLine(text)
+            return pinyin == text ? nil : pinyin
+        }
+        if japanese, !preferChineseForHan, JapaneseRomanizer.containsJapaneseOrCJK(text) {
+            let romaji = JapaneseRomanizer.romanizeLine(text)
+            return romaji == text ? nil : romaji
+        }
+        return nil
     }
 
-    static func romanizedWordPreviews(for words: [EditableWord]) -> [String] {
+    static func romanizedWordPreviews(
+        for words: [EditableWord],
+        japanese: Bool = true,
+        korean: Bool = false,
+        chinese: Bool = false,
+        preferChineseForHan: Bool = false
+    ) -> [String] {
         guard !words.isEmpty else { return [] }
         let texts = words.map(\.text)
-        guard JapaneseRomanizer.containsJapaneseOrCJK(texts.joined()) else {
-            return Array(repeating: "", count: words.count)
+        let joined = texts.joined()
+        if korean, KoreanRomanizer.containsHangul(joined) {
+            return texts.map { KoreanRomanizer.containsHangul($0) ? KoreanRomanizer.romanizeLine($0) : "" }
         }
-        return JapaneseRomanizer.romanizeWords(texts)
+        if japanese, JapaneseRomanizer.containsKana(joined) {
+            return JapaneseRomanizer.romanizeWords(texts)
+        }
+        if chinese, preferChineseForHan,
+           !JapaneseRomanizer.containsKana(joined),
+           ChineseRomanizer.containsHan(joined) {
+            return texts.map { ChineseRomanizer.containsHan($0) ? ChineseRomanizer.romanizeLine($0) : "" }
+        }
+        if japanese, !preferChineseForHan, JapaneseRomanizer.containsJapaneseOrCJK(joined) {
+            return JapaneseRomanizer.romanizeWords(texts)
+        }
+        return Array(repeating: "", count: words.count)
+    }
+
+    struct DisplayWordSpan: Equatable, Sendable {
+        let label: String
+        let previewText: String
+        let sourceRange: ClosedRange<Int>
+    }
+
+    private static func romanizedSeparator(
+        after source: String,
+        followedByWhitespaceToken: Bool,
+        isLast: Bool
+    ) -> String {
+        guard !isLast else { return "" }
+        let endsWord = followedByWhitespaceToken || source.last?.isWhitespace == true
+        return endsWord || JapaneseRomanizer.containsJapaneseOrCJK(source) ? " " : ""
+    }
+
+    /// Display spans for word-level timeline/karaoke rendering, keeping merged Japanese readings
+    /// intact (so consumed kana tokens never fall back to raw text) and preserving exact source
+    /// word/syllable boundaries (including standalone whitespace tokens) for both romanized and
+    /// unromanized lines.
+    static func displayWordSpans(
+        for words: [EditableWord],
+        japanese: Bool = true,
+        korean: Bool = false,
+        chinese: Bool = false,
+        preferChineseForHan: Bool = false
+    ) -> [DisplayWordSpan] {
+        guard !words.isEmpty else { return [] }
+        let texts = words.map(\.text)
+        let joined = texts.joined()
+
+        func romanizedSpans(_ items: [(text: String, range: ClosedRange<Int>)]) -> [DisplayWordSpan] {
+            items.enumerated().map { offset, item in
+                let source = texts[item.range.upperBound]
+                let nextTokenIdx = item.range.upperBound + 1
+                let nextToken = texts[nextTokenIdx...].first { !$0.isEmpty }
+                let hasWhitespaceBoundary = nextToken?.first?.isWhitespace == true
+                let isLast = offset + 1 == items.count
+                let separator = romanizedSeparator(
+                    after: source,
+                    followedByWhitespaceToken: hasWhitespaceBoundary,
+                    isLast: isLast
+                )
+                return DisplayWordSpan(
+                    label: item.text,
+                    previewText: item.text + separator,
+                    sourceRange: item.range
+                )
+            }
+        }
+
+        if korean, KoreanRomanizer.containsHangul(joined) {
+            let items: [(String, ClosedRange<Int>)] = texts.enumerated().compactMap { idx, raw in
+                let label = KoreanRomanizer.containsHangul(raw)
+                    ? KoreanRomanizer.romanizeLine(raw)
+                    : raw.trimmingCharacters(in: .whitespaces)
+                return label.isEmpty ? nil : (label, idx...idx)
+            }
+            return romanizedSpans(items)
+        }
+        if japanese, JapaneseRomanizer.containsKana(joined) {
+            return romanizedSpans(JapaneseRomanizer.romanizeWordSpans(texts).map { ($0.text, $0.sourceRange) })
+        }
+        if chinese, preferChineseForHan,
+           !JapaneseRomanizer.containsKana(joined),
+           ChineseRomanizer.containsHan(joined) {
+            let items: [(String, ClosedRange<Int>)] = texts.enumerated().compactMap { idx, raw in
+                let label = ChineseRomanizer.containsHan(raw)
+                    ? ChineseRomanizer.romanizeLine(raw)
+                    : raw.trimmingCharacters(in: .whitespaces)
+                return label.isEmpty ? nil : (label, idx...idx)
+            }
+            return romanizedSpans(items)
+        }
+        if japanese, !preferChineseForHan, JapaneseRomanizer.containsJapaneseOrCJK(joined) {
+            return romanizedSpans(JapaneseRomanizer.romanizeWordSpans(texts).map { ($0.text, $0.sourceRange) })
+        }
+        return texts.enumerated().compactMap { idx, raw in
+            guard !raw.isEmpty else { return nil }
+            let trimmed = raw.trimmingCharacters(in: .whitespaces)
+            return DisplayWordSpan(label: trimmed, previewText: raw, sourceRange: idx...idx)
+        }
     }
 
     // MARK: - Line Text & Structure Editing
@@ -343,15 +467,36 @@ struct LyricTimingSession: Equatable, Sendable {
     mutating func nudgeLine(at index: Int, by delta: Double) {
         guard lines.indices.contains(index) else { return }
         let oldTimestamp = lines[index].timestamp ?? 0.0
-        let newTimestamp = Self.clampTime(oldTimestamp + delta)
-        let appliedDelta = newTimestamp - oldTimestamp
-        lines[index].timestamp = newTimestamp
+        let earliestMoving = lines[index].words.compactMap(\.timestamp).reduce(oldTimestamp, min)
+        let appliedDelta = Self.clampTime(earliestMoving + delta) - earliestMoving
+        lines[index].timestamp = Self.clampTime(oldTimestamp + appliedDelta)
         if let end = lines[index].endTimestamp {
             lines[index].endTimestamp = Self.clampTime(end + appliedDelta)
         }
         for wordIndex in lines[index].words.indices {
             if let wordTs = lines[index].words[wordIndex].timestamp {
                 lines[index].words[wordIndex].timestamp = Self.clampTime(wordTs + appliedDelta)
+            }
+        }
+    }
+
+    mutating func translateLine(
+        at index: Int,
+        originStart: Double,
+        originEnd: Double?,
+        originWordTimestamps: [Double?],
+        delta: Double
+    ) {
+        guard lines.indices.contains(index) else { return }
+        let earliestMoving = originWordTimestamps.compactMap { $0 }.reduce(originStart, min)
+        let appliedDelta = Self.clampTime(earliestMoving + delta) - earliestMoving
+        lines[index].timestamp = Self.clampTime(originStart + appliedDelta)
+        if let originEnd {
+            lines[index].endTimestamp = Self.clampTime(originEnd + appliedDelta)
+        }
+        for wordIndex in lines[index].words.indices where wordIndex < originWordTimestamps.count {
+            if let originTs = originWordTimestamps[wordIndex] {
+                lines[index].words[wordIndex].timestamp = Self.clampTime(originTs + appliedDelta)
             }
         }
     }
@@ -381,6 +526,15 @@ struct LyricTimingSession: Equatable, Sendable {
         else { return }
         lines[lineIndex].words[wordIndex].timestamp = seconds.map(Self.clampTime)
         lines[lineIndex].words[wordIndex].preservedDuration = nil
+    }
+
+    /// Moves a word's start timestamp without clearing any imported `preservedDuration` (used when
+    /// dragging a word block on the timeline so short words followed by rests keep their exact length).
+    mutating func translateWord(lineIndex: Int, wordIndex: Int, to seconds: Double) {
+        guard lines.indices.contains(lineIndex),
+              lines[lineIndex].words.indices.contains(wordIndex)
+        else { return }
+        lines[lineIndex].words[wordIndex].timestamp = Self.clampTime(seconds)
     }
 
     private static func clampTime(_ seconds: Double) -> Double {
@@ -454,23 +608,77 @@ struct LyricTimingSession: Equatable, Sendable {
         return indices
     }
 
+    /// Precomputes the next stamped word's timestamp for each word index in one O(W) reverse pass.
+    static func nextWordStarts(for words: [EditableWord]) -> [Double?] {
+        var result = [Double?](repeating: nil, count: words.count)
+        var nextTimestamp: Double?
+        for idx in words.indices.reversed() {
+            result[idx] = nextTimestamp
+            if let ts = words[idx].timestamp {
+                nextTimestamp = ts
+            }
+        }
+        return result
+    }
+
+    /// Precomputes the next strictly later start timestamp for every distinct line timestamp in O(N log N),
+    /// keeping timeline drawing and hit-testing O(1) per line while matching playback order on out-of-order rows.
+    static func nextLaterStartLookup(for lines: [EditableLine]) -> [Double: Double] {
+        let sortedUnique = Array(Set(lines.compactMap(\.timestamp))).sorted()
+        guard sortedUnique.count >= 2 else { return [:] }
+        var lookup: [Double: Double] = [:]
+        lookup.reserveCapacity(sortedUnique.count - 1)
+        for idx in 0..<(sortedUnique.count - 1) {
+            lookup[sortedUnique[idx]] = sortedUnique[idx + 1]
+        }
+        return lookup
+    }
+
+    /// Single source of truth for resolving a line's end timestamp across preview, loop, timeline, and export.
+    /// Pass `fallbackDuration: nil` on export so unbounded final lines remain unbounded (matching overlay fallback).
+    static func derivedLineEnd(
+        for line: EditableLine,
+        nextLaterStart: Double?,
+        fallbackDuration: Double? = nil
+    ) -> Double? {
+        guard let start = line.timestamp else { return nil }
+        if let explicit = line.endTimestamp, explicit > start {
+            return explicit
+        }
+        if let nextLaterStart, nextLaterStart > start {
+            return nextLaterStart
+        }
+        guard let fallbackDuration else { return nil }
+        let nextWordStarts = Self.nextWordStarts(for: line.words)
+        let wordEnd: Double? = line.words.enumerated().compactMap { wordIdx, word -> Double? in
+            guard let ts = word.timestamp else { return nil }
+            let dur: Double = if let preserved = word.preservedDuration, preserved.isFinite, preserved >= 0 {
+                preserved
+            } else if let nextWordStart = nextWordStarts[wordIdx], nextWordStart > ts {
+                nextWordStart - ts
+            } else {
+                0.45
+            }
+            return ts + dur
+        }.max()
+        let baseEnd = start + fallbackDuration
+        return max(baseEnd, wordEnd ?? baseEnd)
+    }
+
     func buildLyricLines() -> [LyricLine] {
         let stampedLines: [(EditableLine, Double)] = lines.compactMap { line in
             guard let start = line.timestamp else { return nil }
             return (line, start)
         }
+        let nextLaterByStart = Self.nextLaterStartLookup(for: lines)
 
         return stampedLines.enumerated().map { index, pair in
             let (line, start) = pair
-            let nextLineStart = (index + 1 < stampedLines.count) ? stampedLines[index + 1].1 : nil
-
-            let lineEnd: Double? = if let explicitEnd = line.endTimestamp, explicitEnd > start {
-                explicitEnd
-            } else if let nextLineStart, nextLineStart > start {
-                nextLineStart
-            } else {
-                nil
-            }
+            let lineEnd = Self.derivedLineEnd(
+                for: line,
+                nextLaterStart: nextLaterByStart[start],
+                fallbackDuration: nil
+            )
             let lineDuration = lineEnd.map { $0 - start }
 
             let stampedWords: [(EditableWord, Double)] = line.words.compactMap { word in

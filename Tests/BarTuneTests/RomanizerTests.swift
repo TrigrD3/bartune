@@ -16,6 +16,24 @@ final class RomanizerTests: XCTestCase {
         XCTAssertEqual(JapaneseRomanizer.romanizeLine("BOOMBAYAH"), "BOOMBAYAH")
     }
 
+    func testRomanizesComposedAndDecomposedHangulIdentically() {
+        let word = "사랑"
+        XCTAssertEqual(KoreanRomanizer.romanizeLine(word), "sarang")
+        XCTAssertEqual(KoreanRomanizer.romanizeLine(word.decomposedStringWithCanonicalMapping), "sarang")
+    }
+
+    func testKoreanDisplaySpansOnlySeparateSyllablesAtSourceWhitespace() {
+        func preview(_ tokens: [String]) -> String {
+            let words = tokens.map { EditableWord(text: $0) }
+            return LyricTimingSession.displayWordSpans(for: words, japanese: false, korean: true)
+                .map(\.previewText).joined()
+        }
+
+        XCTAssertEqual(preview(["사", "", "랑"]), "sarang")
+        XCTAssertEqual(preview(["사", " ", "랑"]), "sa rang")
+        XCTAssertEqual(preview(["사", "", " 랑"]), "sa rang")
+    }
+
     func testDetectsKoreanTrack() {
         let lines = [
             LyricLine(id: 0, timestamp: 1.0, text: "Blackpink in your area"),

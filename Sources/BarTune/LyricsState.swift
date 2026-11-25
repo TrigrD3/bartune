@@ -368,7 +368,7 @@ final class LyricsState: ObservableObject {
     @Published var activeLineNextTimestamp: Double = 0.0
     var playbackAnchorPosition: Double = 0.0
     var playbackAnchorDate: Date = .now
-    var playbackRate: Double = 1.0
+    @Published var playbackRate: Double = 1.0
     @Published var cursorLocalX: CGFloat? = nil
     @Published var trackSummary: String = "Not Playing"
     @Published private(set) var currentTrack: TrackInfo? = nil
@@ -638,6 +638,8 @@ final class LyricsState: ObservableObject {
     private let userDefaults: UserDefaults
     private let pausedPositionSubject = PassthroughSubject<Double, Never>()
     var pausedPositionDidChange: AnyPublisher<Double, Never> { pausedPositionSubject.eraseToAnyPublisher() }
+    private let rawLinesSubject = PassthroughSubject<Void, Never>()
+    var rawLinesDidChange: AnyPublisher<Void, Never> { rawLinesSubject.eraseToAnyPublisher() }
     private var rawLines: [LyricLine] = []
     private var rawLinesAreSortedByTimestamp: Bool = true
     private var romanizedLines: [LyricLine] = []
@@ -842,6 +844,7 @@ final class LyricsState: ObservableObject {
             trackSummary = "Not Playing"
             albumColors = nil
         }
+        rawLinesSubject.send()
     }
 
     private func ensureRomanizedLinesIfNeeded() {
@@ -1021,6 +1024,7 @@ final class LyricsState: ObservableObject {
         } else {
             refreshCurrentLineText()
         }
+        rawLinesSubject.send()
     }
 
     private static func translationSourceMatches(_ lhs: [LyricLine], _ rhs: [LyricLine]) -> Bool {
@@ -1099,7 +1103,9 @@ final class LyricsState: ObservableObject {
                 pausedPositionSubject.send(max(0.0, position))
             }
         }
-        self.playbackRate = playbackRate
+        if self.playbackRate != playbackRate {
+            self.playbackRate = playbackRate
+        }
         let lines = activeLines
         guard isPlaying, !lines.isEmpty else {
             clearActiveLineState()

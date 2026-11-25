@@ -273,11 +273,21 @@ enum BrowserMediaParser {
         )?.snapshot
     }
 
+    struct ParsedBrowserPayload {
+        let snapshot: PlaybackSnapshot
+        let chapterStart: Double
+        let chapterStarts: [Double]
+        let rawTitle: String
+        let rawArtist: String
+        let mediaId: String
+        let roundedDuration: Int?
+    }
+
     static func parsePayloadWithChapterStart(
         _ raw: String,
         sourceBundleId: String? = nil,
         includeYouTubeVideos: Bool = true
-    ) -> (snapshot: PlaybackSnapshot, chapterStart: Double)? {
+    ) -> ParsedBrowserPayload? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != "IDLE" else { return nil }
 
@@ -294,10 +304,12 @@ enum BrowserMediaParser {
         let payloadHost = String(afterPrefix[..<hostSeparator])
         guard isSupportedMusicHost(payloadHost, includeYouTubeVideos: includeYouTubeVideos) else { return nil }
 
-        var title = cleanTitle(parts[3])
+        let rawTitle = parts[3]
+        let rawArtist = parts[4]
+        var title = cleanTitle(rawTitle)
         guard !title.isEmpty else { return nil }
 
-        var artist = cleanArtist(parts[4])
+        var artist = cleanArtist(rawArtist)
         let album = parts[5].trimmingCharacters(in: .whitespacesAndNewlines)
         let parsedDuration = SpotifyMonitor.parseLocaleDouble(parts[6]) ?? 0
         var durationSec = (parsedDuration.isFinite && parsedDuration > 0 && Int(exactly: parsedDuration.rounded()) != nil)
@@ -309,15 +321,18 @@ enum BrowserMediaParser {
         let playbackRate = parts.count >= 11 ? parsePlaybackRate(parts[10]) : 1.0
 
         let isStandardYouTube = isStandardYouTubeTrackId(trackId)
-        let mediaId = parts.count >= 12 ? parts[11] : ""
+        let mediaId = (parts.count >= 12 ? parts[11] : "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawRoundedDuration: Int? = (durationSec.isFinite && durationSec > 0) ? Int(exactly: durationSec.rounded()) : nil
         trackId = recordingTrackId(baseId: trackId, mediaId: mediaId, duration: durationSec)
         var chapterStart = 0.0
+        var chapterStarts: [Double] = []
 
+        let parsedChapters = (isStandardYouTube && parts.count >= 10 && !parts[9].isEmpty)
+            ? parseChapters(parts[9])
+            : []
         if isStandardYouTube,
-           parts.count >= 10,
-           !parts[9].isEmpty,
            let resolved = resolveActiveChapter(
-               chapters: parseChapters(parts[9]),
+               chapters: parsedChapters,
                videoDuration: durationSec,
                currentTime: positionSec
            ) {
@@ -329,6 +344,7 @@ enum BrowserMediaParser {
                 durationSec = resolved.duration
                 positionSec = resolved.position
                 chapterStart = resolved.chapter.start
+                chapterStarts = parsedChapters.map(\.start)
                 trackId = "\(trackId):ch:\(chapterSecond)"
             }
         } else if isStandardYouTube {
@@ -354,7 +370,15 @@ enum BrowserMediaParser {
             position: positionSec,
             playbackRate: playbackRate
         )
-        return (snapshot, chapterStart)
+        return ParsedBrowserPayload(
+            snapshot: snapshot,
+            chapterStart: chapterStart,
+            chapterStarts: chapterStarts,
+            rawTitle: rawTitle,
+            rawArtist: rawArtist,
+            mediaId: isStandardYouTube || payloadHost == "music.youtube.com" ? mediaId : "",
+            roundedDuration: rawRoundedDuration
+        )
     }
 }
 
@@ -406,6 +430,11 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         let trackId: String
         let expectedURL: String
         let chapterStart: Double
+        var chapterStarts: [Double] = []
+        var expectedMediaTitle: String = ""
+        var expectedMediaArtist: String = ""
+        var expectedMediaId: String = ""
+        var expectedRoundedDuration: Int?
     }
 
     // Compiled AppleScripts cached per browser bundle ID (accessed serially on SpotifyMonitor's scriptQueue).
@@ -447,7 +476,12 @@ final class BrowserMediaMonitor: @unchecked Sendable {
                     tab: tab,
                     trackId: parsed.snapshot.track?.id ?? "",
                     expectedURL: tab.url,
-                    chapterStart: parsed.chapterStart
+                    chapterStart: parsed.chapterStart,
+                    chapterStarts: parsed.chapterStarts,
+                    expectedMediaTitle: parsed.rawTitle,
+                    expectedMediaArtist: parsed.rawArtist,
+                    expectedMediaId: parsed.mediaId,
+                    expectedRoundedDuration: parsed.roundedDuration
                 )
                 return parsed.snapshot
             }
@@ -523,6 +557,28 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         expectedURL: String? = nil,
         chapterStart: Double = 0.0
     ) -> String? {
+        buildCommandScriptSource(
+            for: command,
+            target: ActiveBrowserTarget(
+                browser: browser,
+                tab: tab,
+                trackId: "",
+                expectedURL: expectedURL ?? "",
+                chapterStart: chapterStart
+            ),
+            preActionGuardJS: ""
+        )
+    }
+
+    private static func buildCommandScriptSource(
+        for command: PlaybackCommand,
+        target: ActiveBrowserTarget,
+        preActionGuardJS: String
+    ) -> String? {
+        let browser = target.browser
+        let tab = target.tab
+        let expectedURL: String? = target.expectedURL.isEmpty ? nil : target.expectedURL
+        let chapterStart = target.chapterStart
         let actionJS: String
         switch command {
         case .playPause:
@@ -533,9 +589,172 @@ final class BrowserMediaMonitor: @unchecked Sendable {
             let absolute = max(0.0, clamped + offset)
             let formatted = String(format: "%.3f", locale: Locale(identifier: "en_US_POSIX"), absolute)
             actionJS = "m.currentTime = \(formatted);"
-        case .nextTrack, .previousTrack:
+        case .nextTrack:
+            actionJS = """
+            const b = document.querySelector('tp-yt-paper-icon-button.next-button, .next-button, .ytp-next-button, [data-testid="control-button-skip-forward"], .skipControl__next, button[aria-label="Next"], button[aria-label="Next Song"]'); if (b) b.click();
+            """
+        case .previousTrack:
+            actionJS = """
+            const b = document.querySelector('tp-yt-paper-icon-button.previous-button, .previous-button, .ytp-prev-button, [data-testid="control-button-skip-back"], .skipControl__previous, button[aria-label="Previous"], button[aria-label="Previous Song"]'); if (b) b.click();
+            """
+        }
+        let urlGuard: String
+        if let expectedURL, !expectedURL.isEmpty {
+            let escapedURL = escapeForJSString(expectedURL)
+            urlGuard = "if (location.href !== '\(escapedURL)') return;"
+        } else {
+            urlGuard = ""
+        }
+        let guardedAction = preActionGuardJS.isEmpty ? actionJS : "\(preActionGuardJS) \(actionJS)"
+        let js = "(() => { \(urlGuard) const m = (window.__barTuneActiveMedia && window.__barTuneActiveMedia.isConnected) ? window.__barTuneActiveMedia : document.querySelector('video, audio'); if (m) { \(guardedAction) } })()"
+        let escapedJS = escapeForAppleScript(js)
+        if browser.isSafari {
+            return """
+            tell application "Safari"
+                try
+                    do JavaScript "\(escapedJS)" in tab \(tab.tabIndex) of window \(tab.windowIndex)
+                end try
+            end tell
+            """
+        }
+        return """
+        tell application "\(browser.appName)"
+            try
+                execute tab \(tab.tabIndex) of window \(tab.windowIndex) javascript "\(escapedJS)"
+            end try
+        end tell
+        """
+    }
+
+    static func currentChapterInterval(chapterStart: Double, chapterStarts: [Double]) -> (start: Double, end: Double?, previous: Double?)? {
+        guard chapterStarts.count >= 2 else { return nil }
+        let sorted = chapterStarts.sorted()
+        guard let currentIndex = sorted.firstIndex(of: chapterStart) else { return nil }
+        let currentEnd = sorted.indices.contains(currentIndex + 1) ? sorted[currentIndex + 1] : nil
+        let previous = currentIndex > 0 ? sorted[currentIndex - 1] : nil
+        return (chapterStart, currentEnd, previous)
+    }
+
+    private static func chapterIntervalGuardJS(start: Double, end: Double?) -> String {
+        let locale = Locale(identifier: "en_US_POSIX")
+        let minCurrent = String(format: "%.3f", locale: locale, max(0.0, start))
+        let upperClause: String = if let end, end.isFinite {
+            " || m.currentTime >= \(String(format: "%.3f", locale: locale, end))"
+        } else {
+            ""
+        }
+        return "if (m.currentTime < \(minCurrent)\(upperClause)) return;"
+    }
+
+    private static func liveMediaIdentityGuardJS(target: ActiveBrowserTarget) -> String {
+        if !target.expectedMediaId.isEmpty {
+            let escapedMediaId = escapeForJSString(target.expectedMediaId)
+            return "const liveRid = new URLSearchParams(location.search).get('v') || ''; if (liveRid !== '\(escapedMediaId)') return;"
+        }
+        guard !target.expectedMediaTitle.isEmpty else { return "" }
+        let escapedTitle = escapeForJSString(target.expectedMediaTitle)
+        let escapedArtist = escapeForJSString(target.expectedMediaArtist)
+        var clauses: [String] = [
+            "const md = (navigator.mediaSession && navigator.mediaSession.metadata) ? navigator.mediaSession.metadata : null;",
+            "const liveTitle = (md && md.title) || document.title || '';",
+            "const liveArtist = (md && md.artist) || '';",
+            "if (liveTitle !== '\(escapedTitle)' || liveArtist !== '\(escapedArtist)') return;",
+        ]
+        if let expectedDur = target.expectedRoundedDuration, expectedDur > 0 {
+            clauses.append("if (!isFinite(m.duration) || Math.round(m.duration) !== \(expectedDur)) return;")
+        }
+        return clauses.joined(separator: " ")
+    }
+
+    /// Builds the browser command script with live-item validation before track skips and seeks so a
+    /// track/chapter change between browser polls cannot act on the newly started item.
+    static func guardedCommandScriptSource(for command: PlaybackCommand, target: ActiveBrowserTarget) -> String? {
+        if let plan = chapterSkipPlan(
+            command: command,
+            chapterStart: target.chapterStart,
+            chapterStarts: target.chapterStarts
+        ) {
+            return chapterSkipScriptSource(
+                plan: plan,
+                browser: target.browser,
+                tab: target.tab,
+                expectedURL: target.expectedURL
+            )
+        }
+        let preActionGuardJS: String = switch command {
+        case .nextTrack, .previousTrack, .seek:
+            if let interval = currentChapterInterval(
+                chapterStart: target.chapterStart,
+                chapterStarts: target.chapterStarts
+            ) {
+                chapterIntervalGuardJS(start: interval.start, end: interval.end)
+            } else {
+                liveMediaIdentityGuardJS(target: target)
+            }
+        case .playPause:
+            ""
+        }
+        return buildCommandScriptSource(
+            for: command,
+            target: target,
+            preActionGuardJS: preActionGuardJS
+        )
+    }
+
+    struct ChapterSkipPlan: Equatable {
+        let target: Double
+        let currentStart: Double
+        let currentEnd: Double?
+    }
+
+    /// Resolves an adjacent chapter start timestamp and the current chapter interval for chapter-backed YouTube tracks.
+    /// Returns `nil` when not in a multi-chapter video or when skipping past the first/last chapter.
+    static func chapterSkipPlan(
+        command: PlaybackCommand,
+        chapterStart: Double,
+        chapterStarts: [Double]
+    ) -> ChapterSkipPlan? {
+        guard let interval = currentChapterInterval(chapterStart: chapterStart, chapterStarts: chapterStarts) else { return nil }
+        let destination: Double?
+        switch command {
+        case .nextTrack:
+            destination = interval.end
+        case .previousTrack:
+            destination = interval.previous
+        case .playPause, .seek:
             return nil
         }
+        guard let destination else { return nil }
+        return ChapterSkipPlan(target: destination, currentStart: interval.start, currentEnd: interval.end)
+    }
+
+    static func chapterSkipTarget(
+        command: PlaybackCommand,
+        chapterStart: Double,
+        chapterStarts: [Double]
+    ) -> Double? {
+        chapterSkipPlan(command: command, chapterStart: chapterStart, chapterStarts: chapterStarts)?.target
+    }
+
+    static func chapterSkipScriptSource(
+        plan: ChapterSkipPlan,
+        browser: BrowserTarget,
+        tab: BrowserTabDescriptor,
+        expectedURL: String?
+    ) -> String {
+        let clamped = (plan.target.isFinite && plan.target > 0) ? plan.target : 0.0
+        let locale = Locale(identifier: "en_US_POSIX")
+        let formatted = String(format: "%.3f", locale: locale, clamped)
+        let minCurrent = String(format: "%.3f", locale: locale, max(0.0, plan.currentStart))
+        let upperClause: String = if let currentEnd = plan.currentEnd, currentEnd.isFinite {
+            " || m.currentTime >= \(String(format: "%.3f", locale: locale, currentEnd))"
+        } else {
+            ""
+        }
+        // Revalidate live currentTime against the exact half-open chapter interval [currentStart, currentEnd)
+        // matching `resolveActiveChapter`, so a stale skip cannot act on a neighboring chapter.
+        // Resume playback if paused so the follow-up browser poll detects the new chapter immediately.
+        let actionJS = "if (m.currentTime < \(minCurrent)\(upperClause)) return; m.currentTime = \(formatted); if (m.paused) { const p = m.play(); if (p && p.catch) p.catch(() => {}); }"
         let urlGuard: String
         if let expectedURL, !expectedURL.isEmpty {
             let escapedURL = escapeForJSString(expectedURL)
@@ -570,15 +789,8 @@ final class BrowserMediaMonitor: @unchecked Sendable {
         if let expectedTrackId, active.trackId != expectedTrackId {
             return
         }
-        guard let source = Self.commandScriptSource(
-            for: command,
-            browser: active.browser,
-            tab: active.tab,
-            expectedURL: active.expectedURL,
-            chapterStart: active.chapterStart
-        ),
-            let script = NSAppleScript(source: source)
-        else { return }
+        let source = Self.guardedCommandScriptSource(for: command, target: active)
+        guard let source, let script = NSAppleScript(source: source) else { return }
         var error: NSDictionary?
         script.executeAndReturnError(&error)
     }

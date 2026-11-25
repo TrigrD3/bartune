@@ -31,7 +31,7 @@ struct CustomLyricsRecord: Equatable, Codable, Sendable {
         artist: String,
         savedAt: Date,
         lines: [LyricLine],
-        explicitEndLineIndices: Set<Int>? = nil
+        explicitEndLineIndices: Set<Int>? = []
     ) {
         self.trackId = trackId
         self.title = title
@@ -95,8 +95,13 @@ struct CustomLyricsStore: Sendable {
         try data.write(to: fileURL(for: record.trackId), options: .atomic)
     }
 
-    func remove(trackId: String) {
-        try? FileManager.default.removeItem(at: fileURL(for: trackId))
+    func remove(trackId: String) throws {
+        let url = fileURL(for: trackId)
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return
+        }
     }
 }
 

@@ -242,7 +242,7 @@ enum KoreanRomanizer {
         var out = ""
         out.reserveCapacity(text.count * 2)
 
-        for scalar in text.unicodeScalars {
+        for scalar in text.precomposedStringWithCanonicalMapping.unicodeScalars {
             let v = scalar.value
             if v >= 0xAC00 && v <= 0xD7A3 {
                 let index = Int(v - 0xAC00)
