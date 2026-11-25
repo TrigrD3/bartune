@@ -128,4 +128,4 @@ Open a [GitHub Issue](https://github.com/TrigrD3/bartune/issues/new/choose) with
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the [MIT License](LICENSE).
+By contributing, you agree that your contributions will be licensed under the [GNU General Public License v3.0](LICENSE).
