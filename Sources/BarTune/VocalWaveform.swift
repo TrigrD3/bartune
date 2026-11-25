@@ -59,6 +59,9 @@ struct VocalEnvelope {
         /// Track seconds per frame.
         let step: Double
         var levels: [Float]
+        /// Raw linear min/max sample peaks (`-1...1`) per frame for timeline waveform display.
+        var minPeaks: [Float] = []
+        var maxPeaks: [Float] = []
 
         var end: Double { start + Double(levels.count) * step }
 
@@ -82,6 +85,8 @@ struct VocalEnvelope {
     private var expectedNextStart: Double?
     private var midEnergy: Float = 0
     private var sideEnergy: Float = 0
+    private var frameMin: Float = 0
+    private var frameMax: Float = 0
     private var pendingSamples = 0
 
     /// Appends captured audio starting at `startTime` (track seconds); `side` is empty for mono audio.
@@ -96,6 +101,8 @@ struct VocalEnvelope {
             sideFilter = VoiceBandFilter(sampleRate: sampleRate)
             midEnergy = 0
             sideEnergy = 0
+            frameMin = 0
+            frameMax = 0
             pendingSamples = 0
             segments.append(Segment(start: startTime, step: samplesPerFrame / sampleRate * rate, levels: []))
         }
@@ -103,9 +110,22 @@ struct VocalEnvelope {
 
         let frameLength = Int(samplesPerFrame)
         let hasSide = side.count == mid.count
-        var levels = segments[segments.count - 1].levels
+        let segIdx = segments.count - 1
         for index in mid.indices {
-            let m = midFilter.process(mid[index])
+            let sample = mid[index]
+            if hasSide {
+                let sideSample = side[index]
+                let left = sample + sideSample
+                let right = sample - sideSample
+                let lo = min(left, right)
+                let hi = max(left, right)
+                if lo < frameMin { frameMin = lo }
+                if hi > frameMax { frameMax = hi }
+            } else {
+                if sample < frameMin { frameMin = sample }
+                if sample > frameMax { frameMax = sample }
+            }
+            let m = midFilter.process(sample)
             midEnergy += m * m
             if hasSide {
                 let s = sideFilter.process(side[index])
@@ -114,13 +134,16 @@ struct VocalEnvelope {
             pendingSamples += 1
             if pendingSamples == frameLength {
                 let centre = max(midEnergy * 0.25, midEnergy - sideEnergy) / Float(frameLength)
-                levels.append(10 * log10(centre + 1e-10))
+                segments[segIdx].levels.append(10 * log10(centre + 1e-10))
+                segments[segIdx].minPeaks.append(max(-1.0, min(0.0, frameMin)))
+                segments[segIdx].maxPeaks.append(min(1.0, max(0.0, frameMax)))
                 midEnergy = 0
                 sideEnergy = 0
+                frameMin = 0
+                frameMax = 0
                 pendingSamples = 0
             }
         }
-        segments[segments.count - 1].levels = levels
         trimToCapacity()
     }
 
@@ -135,6 +158,8 @@ struct VocalEnvelope {
         if total > Self.maxFrames, var only = segments.first {
             let excess = total - Self.maxFrames
             only.levels.removeFirst(excess)
+            if only.minPeaks.count >= excess { only.minPeaks.removeFirst(excess) }
+            if only.maxPeaks.count >= excess { only.maxPeaks.removeFirst(excess) }
             only.start += Double(excess) * only.step
             segments[0] = only
         }
@@ -164,6 +189,108 @@ struct VocalEnvelope {
         guard all.count >= 500 else { return nil }
         let sorted = all.sorted()
         return sorted[min(sorted.count - 1, Int(Double(sorted.count) * share))]
+    }
+
+    /// Combines non-overlapping cached frames with the current play's live envelope while keeping
+    /// segments in capture recency order (oldest cached first, newest live last) so future merges
+    /// evict the oldest captured frames rather than the lowest track timestamps.
+    static func mergedPreservingCaptureOrder(cached: VocalEnvelope?, live: VocalEnvelope, capacity: Int = maxFrames) -> VocalEnvelope? {
+        let cachedSegments = cached?.segments.filter { !$0.levels.isEmpty } ?? []
+        let liveSegments = live.segments.filter { !$0.levels.isEmpty }
+        guard !cachedSegments.isEmpty || !liveSegments.isEmpty else { return nil }
+        if cachedSegments.isEmpty, liveSegments.count == 1, liveSegments[0].levels.count <= capacity {
+            return live
+        }
+
+        // Resolve overlaps among live segments in capture order so replays replace stale peaks.
+        var resolvedLive: [Segment] = []
+        for liveSeg in liveSegments {
+            resolvedLive = subtracting(liveSeg, from: resolvedLive)
+            resolvedLive.append(liveSeg)
+        }
+
+        // Remove intervals covered by live frames from cached segments, preserving surrounding peaks.
+        var preservedCached = cachedSegments
+        for liveSeg in resolvedLive {
+            preservedCached = subtracting(liveSeg, from: preservedCached)
+        }
+
+        // Apply the frame budget to recency order (keep newest live frames first, then fill with cached),
+        // rather than evicting fresh low-timestamp segments after sorting by track time.
+        let keptLive = keepNewest(resolvedLive, budget: capacity)
+        let liveFrameCount = keptLive.reduce(0) { $0 + $1.levels.count }
+        let keptCached = keepNewest(preservedCached, budget: max(0, capacity - liveFrameCount))
+
+        var merged = VocalEnvelope()
+        merged.segments = keptCached + keptLive
+        return merged.segments.isEmpty ? nil : merged
+    }
+
+    /// Returns a track-time-sorted copy of `mergedPreservingCaptureOrder` ready for timeline drawing.
+    static func mergedForDisplay(cached: VocalEnvelope?, live: VocalEnvelope, capacity: Int = maxFrames) -> VocalEnvelope? {
+        guard var merged = mergedPreservingCaptureOrder(cached: cached, live: live, capacity: capacity) else {
+            return nil
+        }
+        if merged.segments.count > 1 {
+            merged.segments.sort { $0.start < $1.start }
+        }
+        return merged
+    }
+
+    private static func subtracting(_ cut: Segment, from segments: [Segment]) -> [Segment] {
+        var result: [Segment] = []
+        result.reserveCapacity(segments.count)
+        for seg in segments {
+            if cut.end <= seg.start || cut.start >= seg.end {
+                result.append(seg)
+                continue
+            }
+            if cut.start > seg.start {
+                let exactFrames = (cut.start - seg.start) / seg.step
+                let leftCount = max(0, min(seg.levels.count, Int(floor(exactFrames + 1e-6))))
+                if leftCount > 0 {
+                    result.append(slice(seg, range: 0..<leftCount))
+                }
+            }
+            if cut.end < seg.end {
+                let exactFrames = (cut.end - seg.start) / seg.step
+                let rightStart = max(0, min(seg.levels.count, Int(ceil(exactFrames - 1e-6))))
+                if rightStart < seg.levels.count {
+                    result.append(slice(seg, range: rightStart..<seg.levels.count))
+                }
+            }
+        }
+        return result
+    }
+
+    private static func keepNewest(_ segments: [Segment], budget: Int) -> [Segment] {
+        guard budget > 0, !segments.isEmpty else { return [] }
+        var kept = segments
+        var total = kept.reduce(0) { $0 + $1.levels.count }
+        while total > budget, !kept.isEmpty {
+            let excess = total - budget
+            let oldest = kept[0]
+            if oldest.levels.count <= excess {
+                total -= oldest.levels.count
+                kept.removeFirst()
+            } else {
+                kept[0] = slice(oldest, range: excess..<oldest.levels.count)
+                total = budget
+            }
+        }
+        return kept
+    }
+
+    private static func slice(_ segment: Segment, range: Range<Int>) -> Segment {
+        let hasMin = segment.minPeaks.count == segment.levels.count
+        let hasMax = segment.maxPeaks.count == segment.levels.count
+        return Segment(
+            start: segment.time(ofFrame: range.lowerBound),
+            step: segment.step,
+            levels: Array(segment.levels[range]),
+            minPeaks: hasMin ? Array(segment.minPeaks[range]) : [],
+            maxPeaks: hasMax ? Array(segment.maxPeaks[range]) : []
+        )
     }
 }
 
@@ -243,7 +370,8 @@ enum WaveformTimingRefiner {
                     startTime: word.startTime,
                     duration: sustainEnd - word.startTime,
                     confidence: word.confidence,
-                    syllables: word.syllables
+                    syllables: word.syllables,
+                    sourceLineId: word.sourceLineId
                 )
                 stats.extended += 1
             }

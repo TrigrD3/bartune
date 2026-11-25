@@ -126,6 +126,229 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(lastWord.timestamp + (lastWord.duration ?? 0), 11.94, accuracy: 0.005)
     }
 
+    func testLateLyricBlockPullsEarlierAcrossUnmatchedPreviousDurationAndHeldTail() {
+        // Case 1: Unmatched previous line has duration running right up to the next line's late timestamp (20.0),
+        // while the next line's vocal actually begins 2.6 s earlier at 17.4 s.
+        let linesAfterUnmatched = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 10.0, text: "Unmatched intro line"),
+            LyricLine(id: 1, timestamp: 20.0, text: "Coming down to show you"),
+        ]
+        let lateWords = [
+            RecognizedAudioWord(text: "coming", startTime: 17.4, duration: 0.35, confidence: 0.9),
+            RecognizedAudioWord(text: "down", startTime: 17.8, duration: 0.35, confidence: 0.9),
+            RecognizedAudioWord(text: "to", startTime: 18.2, duration: 0.25, confidence: 0.9),
+            RecognizedAudioWord(text: "show", startTime: 18.5, duration: 0.35, confidence: 0.9),
+            RecognizedAudioWord(text: "you", startTime: 18.9, duration: 0.40, confidence: 0.9),
+        ]
+        let result1 = LyricsAudioAligner.align(lines: linesAfterUnmatched, recognizedWords: lateWords, regroupsCJKWords: false)
+        XCTAssertEqual(result1.matchedLineIDs, [1])
+        XCTAssertEqual(result1.lines[1].timestamp, 17.4, accuracy: 0.01)
+        let prevEnd = result1.lines[0].timestamp + (result1.lines[0].duration ?? 0)
+        XCTAssertEqual(prevEnd, 17.4, accuracy: 0.01)
+
+        // Case 2: Matched previous line's held tail runs to 19.6 s while the next late line (20.0 s) starts at 18.6 s
+        // and also has later words past 19.6 s; aligner must pick the fuller 4-word match at 18.6 s, not a 2-word suffix.
+        let linesAfterMatched = [
+            LyricLine(id: 0, timestamp: 15.0, text: "Hold note"),
+            LyricLine(id: 1, timestamp: 20.0, text: "Start early then continue"),
+        ]
+        let overlappedWords = [
+            RecognizedAudioWord(text: "hold", startTime: 15.0, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "note", startTime: 18.0, duration: 1.6, confidence: 0.9),
+            RecognizedAudioWord(text: "start", startTime: 18.6, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "early", startTime: 19.1, duration: 0.4, confidence: 0.9),
+            RecognizedAudioWord(text: "then", startTime: 19.8, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "continue", startTime: 20.2, duration: 0.5, confidence: 0.9),
+        ]
+        let result2 = LyricsAudioAligner.align(lines: linesAfterMatched, recognizedWords: overlappedWords, regroupsCJKWords: false)
+        XCTAssertEqual(result2.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result2.lines[1].timestamp, 18.6, accuracy: 0.01)
+        XCTAssertEqual(result2.lines[1].words.first?.timestamp ?? -1, 18.6, accuracy: 0.01)
+        XCTAssertEqual(result2.lines[0].timestamp + (result2.lines[0].duration ?? 0), 18.6, accuracy: 0.01)
+    }
+
+    func testEarlyEndingOriginalTimestampsExtendToActualVocalEndWithoutCrossLineBleed() throws {
+        // Case 1: Original line has a too-short explicit duration (1.5 s) while next lyric is at 18.0 s
+        // and the actual vocal continues through 16.2 s.
+        let shortDurationLines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 1.5, text: "Hold this long phrase out"),
+            LyricLine(id: 1, timestamp: 18.0, text: "Next line"),
+        ]
+        let shortDurationWords = [
+            RecognizedAudioWord(text: "hold", startTime: 10.0, duration: 0.4, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "this", startTime: 11.2, duration: 0.5, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "long", startTime: 12.6, duration: 0.8, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "phrase", startTime: 14.0, duration: 1.0, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "out", startTime: 15.4, duration: 0.8, confidence: 0.9, sourceLineId: 0),
+        ]
+        let res1 = LyricsAudioAligner.align(lines: shortDurationLines, recognizedWords: shortDurationWords, regroupsCJKWords: false)
+        XCTAssertEqual(res1.matchedLineIDs, [0])
+        XCTAssertEqual(res1.lines[0].timestamp + (res1.lines[0].duration ?? 0), 16.2, accuracy: 0.01)
+        XCTAssertEqual(try XCTUnwrap(res1.lines[0].words.last).timestamp, 15.4, accuracy: 0.01)
+
+        // Case 2: Next non-empty line's fetched timestamp (12.5 s) is early while line 0 actually finishes at 14.8 s
+        // and line 1 actually starts at 15.2 s (sharing repeated words). Line 0 must not be clipped at 12.5 s
+        // and must not steal line 1's repeated words.
+        let earlyNextLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "Never gonna give you up"),
+            LyricLine(id: 1, timestamp: 12.5, text: "Never gonna let you down"),
+        ]
+        let earlyNextWords = [
+            RecognizedAudioWord(text: "never", startTime: 10.0, duration: 0.5, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "gonna", startTime: 10.8, duration: 0.6, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "give", startTime: 11.8, duration: 0.8, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "you", startTime: 13.0, duration: 0.8, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "up", startTime: 14.0, duration: 0.8, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "never", startTime: 15.2, duration: 0.5, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "gonna", startTime: 15.8, duration: 0.5, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "let", startTime: 16.4, duration: 0.4, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "you", startTime: 16.9, duration: 0.4, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "down", startTime: 17.4, duration: 0.6, confidence: 0.9, sourceLineId: 1),
+        ]
+        let res2 = LyricsAudioAligner.align(lines: earlyNextLines, recognizedWords: earlyNextWords, regroupsCJKWords: false)
+        XCTAssertEqual(res2.matchedLineIDs, [0, 1])
+        XCTAssertEqual(res2.lines[0].timestamp + (res2.lines[0].duration ?? 0), 14.8, accuracy: 0.01)
+        XCTAssertEqual(try XCTUnwrap(res2.lines[0].words.last).timestamp, 14.0, accuracy: 0.01)
+        XCTAssertEqual(res2.lines[1].timestamp, 15.2, accuracy: 0.01)
+
+        // Case 3: Early blank marker right after line 0 must not clip line 0, and if line 2 pulls earlier
+        // than line 0's tail, line 0 and the intervening blank marker stay strictly monotonic.
+        let earlyBlankLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "Hold note"),
+            LyricLine(id: 1, timestamp: 11.5, text: ""),
+            LyricLine(id: 2, timestamp: 15.0, text: "Come back in"),
+        ]
+        let earlyBlankWords = [
+            RecognizedAudioWord(text: "hold", startTime: 10.0, duration: 0.5, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "note", startTime: 11.2, duration: 3.6, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "come", startTime: 13.5, duration: 0.4, confidence: 0.9, sourceLineId: 2),
+            RecognizedAudioWord(text: "back", startTime: 14.0, duration: 0.4, confidence: 0.9, sourceLineId: 2),
+            RecognizedAudioWord(text: "in", startTime: 14.5, duration: 0.5, confidence: 0.9, sourceLineId: 2),
+        ]
+        let res3 = LyricsAudioAligner.align(lines: earlyBlankLines, recognizedWords: earlyBlankWords, regroupsCJKWords: false)
+        XCTAssertEqual(res3.matchedLineIDs, [0, 2])
+        XCTAssertEqual(res3.lines[2].timestamp, 13.5, accuracy: 0.01)
+        let line0End = res3.lines[0].timestamp + (res3.lines[0].duration ?? 0)
+        XCTAssertLessThanOrEqual(line0End, res3.lines[1].timestamp + 0.0001)
+        XCTAssertGreaterThan(res3.lines[1].timestamp, res3.lines[0].timestamp)
+        XCTAssertLessThan(res3.lines[1].timestamp, res3.lines[2].timestamp)
+
+        // Case 4: Moving a blank marker during boundary reconciliation must clear `previousBlankTimestamp`
+        // so a later unmatched line (18.0 s) is not pushed past the blank's old clamped timestamp (20.0 s).
+        let postBlankLines = [
+            LyricLine(id: 0, timestamp: 10.0, duration: 10.0, text: "intro"),
+            LyricLine(id: 1, timestamp: 13.0, text: ""),
+            LyricLine(id: 2, timestamp: 16.0, text: "hello"),
+            LyricLine(id: 3, timestamp: 18.0, text: "world"),
+        ]
+        let postBlankWords = [
+            RecognizedAudioWord(text: "hello", startTime: 15.0, duration: 0.4, confidence: 1.0, sourceLineId: 2),
+        ]
+        let res4 = LyricsAudioAligner.align(lines: postBlankLines, recognizedWords: postBlankWords, regroupsCJKWords: false)
+        XCTAssertEqual(res4.lines[0].timestamp, 10.0, accuracy: 0.01)
+        XCTAssertEqual(res4.lines[1].timestamp, 14.99, accuracy: 0.01)
+        XCTAssertEqual(res4.lines[2].timestamp, 15.0, accuracy: 0.01)
+        XCTAssertEqual(res4.lines[3].timestamp, 18.0, accuracy: 0.01)
+
+        // Case 5: Remapping a cached record when a fetched source inserts a leading blank line updates
+        // line IDs, heard-word `sourceLineId`s, and locked/attempted IDs so cached words still match.
+        let cachedRecord = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:remap",
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.0,
+            alignedLineCount: 1,
+            sourceLineCount: 2,
+            lines: [
+                LyricLine(id: 0, timestamp: 10.0, duration: 2.0, text: "First line"),
+                LyricLine(id: 1, timestamp: 14.0, duration: 2.0, text: "Second line"),
+            ],
+            heardWords: [
+                RecognizedAudioWord(text: "first", startTime: 10.0, duration: 0.5, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "line", startTime: 10.6, duration: 0.5, confidence: 0.9, sourceLineId: 0),
+            ],
+            lockedLineIDs: [0],
+            attemptedLineIDs: [1]
+        )
+        let refetchedWithBlank = [
+            LyricLine(id: 0, timestamp: 0.0, text: ""),
+            LyricLine(id: 1, timestamp: 10.0, text: "First line"),
+            LyricLine(id: 2, timestamp: 14.0, text: "Second line"),
+        ]
+        XCTAssertTrue(cachedRecord.matchesSource(refetchedWithBlank))
+        let remapped = cachedRecord.remapped(to: refetchedWithBlank)
+        XCTAssertEqual(remapped.lockedLineIDs, [1])
+        XCTAssertEqual(remapped.attemptedLineIDs, [2])
+        XCTAssertEqual(remapped.heardWords?.map(\.sourceLineId), [1, 1])
+        let alignedRemapped = LyricsAudioAligner.align(
+            lines: refetchedWithBlank,
+            recognizedWords: remapped.heardWords ?? [],
+            regroupsCJKWords: false
+        )
+        XCTAssertEqual(alignedRemapped.matchedLineIDs, [1])
+
+        // Case 6: Removing a leading blank row on refetch rebuilds remapped lines with unique IDs
+        // (no duplicate ID 0 that would trap Dictionary(uniqueKeysWithValues:)).
+        let withLeadingBlank = AudioSyncedLyricsRecord(
+            trackId: "spotify:track:remap-drop-blank",
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.0,
+            alignedLineCount: 2,
+            sourceLineCount: 3,
+            lines: [
+                LyricLine(id: 0, timestamp: 0.0, text: ""),
+                LyricLine(id: 1, timestamp: 1.0, duration: 2.0, text: "A"),
+                LyricLine(id: 2, timestamp: 4.0, duration: 2.0, text: "B"),
+                LyricLine(id: 3, timestamp: 8.0, duration: 2.0, text: "C"),
+            ],
+            lockedLineIDs: [1, 2]
+        )
+        let refetchedNoBlank = [
+            LyricLine(id: 0, timestamp: 1.0, text: "A"),
+            LyricLine(id: 1, timestamp: 4.0, text: "B"),
+            LyricLine(id: 2, timestamp: 8.0, text: "C"),
+        ]
+        let droppedBlankRemapped = withLeadingBlank.remapped(to: refetchedNoBlank)
+        XCTAssertEqual(droppedBlankRemapped.lines.map(\.id), [0, 1, 2])
+        XCTAssertEqual(Set(droppedBlankRemapped.lines.map(\.id)).count, droppedBlankRemapped.lines.count)
+        XCTAssertEqual(droppedBlankRemapped.lockedLineIDs, [0, 1])
+
+        // Case 7: Leading blank marker (5.0 s) before an early first vocal line (4.2 s) relaxes across the blank
+        // and pulls the leading blank before 4.2 s.
+        let leadingBlankLines = [
+            LyricLine(id: 0, timestamp: 5.0, text: ""),
+            LyricLine(id: 1, timestamp: 6.0, text: "Hello world"),
+        ]
+        let earlyFirstWords = [
+            RecognizedAudioWord(text: "hello", startTime: 4.2, duration: 0.4, confidence: 0.95, sourceLineId: 1),
+            RecognizedAudioWord(text: "world", startTime: 4.7, duration: 0.5, confidence: 0.95, sourceLineId: 1),
+        ]
+        let leadingRes = LyricsAudioAligner.align(lines: leadingBlankLines, recognizedWords: earlyFirstWords, regroupsCJKWords: false)
+        XCTAssertEqual(leadingRes.matchedLineIDs, [1])
+        XCTAssertEqual(leadingRes.lines[1].timestamp, 4.2, accuracy: 0.01)
+        XCTAssertLessThan(leadingRes.lines[0].timestamp, leadingRes.lines[1].timestamp)
+
+        // Case 8: `reconcilePrecedingBoundary` pushes a stale blank sitting below a shifted preceding line
+        // up to `prevEnd` instead of crushing the preceding line's duration to 0.
+        var shiftedLines = [
+            LyricLine(
+                id: 0,
+                timestamp: 11.5,
+                duration: 1.0,
+                text: "Locked late",
+                words: [WordTimestamp(timestamp: 11.5, duration: 1.0, text: "Locked late")]
+            ),
+            LyricLine(id: 1, timestamp: 11.0, text: ""),
+            LyricLine(id: 2, timestamp: 14.0, duration: 1.0, text: "Later"),
+        ]
+        LyricsAudioAligner.reconcilePrecedingBoundary(in: &shiftedLines, before: 2, targetStart: 14.0)
+        XCTAssertEqual(shiftedLines[0].duration ?? -1, 1.0, accuracy: 0.001)
+        XCTAssertEqual(shiftedLines[0].words[0].duration ?? -1, 1.0, accuracy: 0.001)
+        XCTAssertEqual(shiftedLines[1].timestamp, 12.5, accuracy: 0.001)
+        XCTAssertLessThan(shiftedLines[1].timestamp, shiftedLines[2].timestamp)
+    }
+
     func testAudioSyncedLyricsCacheDiscardsRemovedEngineRecords() throws {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         for removedEngine in ["appleSpeech", "whisper"] {
@@ -985,5 +1208,170 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(heard[0].syllables?.map(\.startTime), [10.0, 10.6, 11.0])
         XCTAssertEqual(heard[0].startTime + heard[0].duration, 11.5, accuracy: 0.001)
         XCTAssertNil(heard[1].syllables)
+    }
+
+    func testAlignKeepsLineOwnedEarlyOnsetAfterPositiveMedianOffset() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "alpha one"),
+            LyricLine(id: 1, timestamp: 20.0, text: "beta two"),
+            LyricLine(id: 2, timestamp: 30.0, text: "gamma three"),
+        ]
+        // First two lines establish a +2.0 s median offset; line 2's forced-alignment onset at 27.5 s
+        // lies inside its unshifted forced-alignment window and must not be discarded by the +2.0 s shift.
+        let recognized = [
+            RecognizedAudioWord(text: "alpha", startTime: 12.0, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "one", startTime: 12.4, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "beta", startTime: 22.0, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "two", startTime: 22.4, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "gamma", startTime: 27.5, duration: 0.3, confidence: 0.9, sourceLineId: 2),
+            RecognizedAudioWord(text: "three", startTime: 27.9, duration: 0.3, confidence: 0.9, sourceLineId: 2),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertEqual(result.matchedLineIDs, [0, 1, 2])
+        XCTAssertEqual(result.lines[2].timestamp, 27.5, accuracy: 0.01)
+    }
+
+    func testOwnedTailUsesUnshiftedDeclaredEndAfterNegativeOffset() throws {
+        let lines = [
+            LyricLine(id: 0, timestamp: 5, text: "one"),
+            LyricLine(id: 1, timestamp: 10, text: "two"),
+            LyricLine(id: 2, timestamp: 20, duration: 8, text: "hold on"),
+            LyricLine(id: 3, timestamp: 23, text: "next"),
+        ]
+        let heard = [
+            RecognizedAudioWord(text: "one", startTime: 3, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "two", startTime: 8, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "hold", startTime: 18, duration: 0.3, confidence: 0.9, sourceLineId: 2),
+            RecognizedAudioWord(text: "on", startTime: 30, duration: 0.3, confidence: 0.9, sourceLineId: 2),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.medianOffset, -2)
+        XCTAssertEqual(result.matchedWordCount, 4)
+        XCTAssertEqual(try XCTUnwrap(result.lines[2].words.last).timestamp, 30, accuracy: 0.001)
+    }
+
+    func testNextOwnedOnsetTrimsInterpolatedTailAcrossBlank() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "alpha bravo charlie delta"),
+            LyricLine(id: 1, timestamp: 11, text: ""),
+            LyricLine(id: 2, timestamp: 12.4, text: "again"),
+        ]
+        let heard = [
+            RecognizedAudioWord(text: "alpha", startTime: 10, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "bravo", startTime: 10.6, duration: 1.8, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "again", startTime: 11.4, duration: 0.4, confidence: 0.9, sourceLineId: 2),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 2])
+        XCTAssertEqual(result.lines[2].timestamp, 11.4, accuracy: 0.001)
+        let blankStart = result.lines[1].timestamp
+        XCTAssertLessThan(blankStart, result.lines[2].timestamp)
+        XCTAssertEqual(result.lines[0].timestamp + (result.lines[0].duration ?? 0), blankStart, accuracy: 0.001)
+        XCTAssertTrue(result.lines[0].words.allSatisfy { $0.timestamp + ($0.duration ?? 0) <= blankStart + 0.001 })
+    }
+
+    func testOwnedRunBeatsCloserUntaggedReplayAndPreservesFollowingOnset() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "again"),
+            LyricLine(id: 1, timestamp: 12, text: "tomorrow"),
+        ]
+        let heard = [
+            RecognizedAudioWord(text: "again", startTime: 7.2, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "tomorrow", startTime: 11.6, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "again", startTime: 12.2, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 1])
+        XCTAssertEqual(result.lines[0].timestamp, 7.2, accuracy: 0.001)
+        XCTAssertEqual(result.lines[1].timestamp, 11.6, accuracy: 0.001)
+    }
+
+    func testUnusableOwnedOnsetFallsBackToUntaggedRun() {
+        let lines = [LyricLine(id: 0, timestamp: 10, duration: 8, text: "hold me close")]
+        let heard = [
+            RecognizedAudioWord(text: "hold", startTime: 10.1, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "me", startTime: 10.5, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "hold", startTime: 16, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "me", startTime: 16.5, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "close", startTime: 17, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0])
+        XCTAssertEqual(result.matchedWordCount, 2)
+        XCTAssertEqual(result.lines[0].timestamp, 10.1, accuracy: 0.001)
+    }
+
+    func testAlignKeepsNextLineCapForLegacyUntaggedWords() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "say yes"),
+            LyricLine(id: 1, timestamp: 12.0, text: "yes"),
+            LyricLine(id: 2, timestamp: 20.0, text: "closing phrase"),
+        ]
+        // Legacy cached words carry no sourceLineId; lines 0 and 2 anchor median offset at 0.0 s so
+        // line 0's untagged cap stays at 12.4 s and must not steal untagged "yes" at 12.8 s from line 1.
+        let recognized = [
+            RecognizedAudioWord(text: "say", startTime: 10.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "yes", startTime: 12.8, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "closing", startTime: 20.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "phrase", startTime: 20.4, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertTrue(result.matchedLineIDs.contains(1), "line 1 must keep its own untagged 'yes' at 12.8 s")
+        XCTAssertEqual(result.lines[1].timestamp, 12.8, accuracy: 0.01)
+    }
+
+    func testLegacyUntaggedMatchDoesNotBlockNextLinesOwnedOnset() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "say yes"),
+            LyricLine(id: 1, timestamp: 12.0, text: "now"),
+            LyricLine(id: 2, timestamp: 20.0, text: "closing phrase"),
+        ]
+        // Line 0 matches legacy untagged "yes" at 12.2 s (within its 12.4 s cap), advancing
+        // lastConsumedWordStart past 12.2 s. Line 1's valid owned onset at 11.6 s must still win
+        // and trim line 0's tail cleanly while preserving start order (10.0 < 11.6).
+        let recognized = [
+            RecognizedAudioWord(text: "say", startTime: 10.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "now", startTime: 11.6, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "yes", startTime: 12.2, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "closing", startTime: 20.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "phrase", startTime: 20.4, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertEqual(result.matchedLineIDs, [0, 1, 2])
+        XCTAssertEqual(result.lines[0].timestamp, 10.0, accuracy: 0.01)
+        XCTAssertEqual(result.lines[1].timestamp, 11.6, accuracy: 0.01)
+        XCTAssertLessThanOrEqual(result.lines[0].timestamp + (result.lines[0].duration ?? 0), 11.61)
+    }
+
+    func testAlignKeepsBlankMarkerBoundForLegacyUntaggedWords() {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "say yes"),
+            LyricLine(id: 1, timestamp: 11.0, text: ""),
+            LyricLine(id: 2, timestamp: 14.0, text: "yes"),
+            LyricLine(id: 3, timestamp: 20.0, text: "closing phrase"),
+        ]
+        // Untagged "yes" at 13.2 s sits past the 11.0 s blank marker (11.4 s cap), so line 0 must not
+        // steal it and line 2 keeps its own onset.
+        let recognized = [
+            RecognizedAudioWord(text: "say", startTime: 10.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "yes", startTime: 13.2, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "closing", startTime: 20.0, duration: 0.3, confidence: 0.9),
+            RecognizedAudioWord(text: "phrase", startTime: 20.4, duration: 0.3, confidence: 0.9),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: recognized, regroupsCJKWords: false)
+        XCTAssertEqual(result.matchedLineIDs, [0, 2, 3])
+        XCTAssertEqual(result.lines[2].timestamp, 13.2, accuracy: 0.01)
     }
 }

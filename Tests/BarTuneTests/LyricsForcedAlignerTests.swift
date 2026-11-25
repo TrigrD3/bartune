@@ -77,6 +77,7 @@ final class LyricsForcedAlignerTests: XCTestCase {
 
         let second = try await aligner.transcribe(chunk(start: 22.0))
         XCTAssertEqual(second.map(\.text), ["ka", "ka"])
+        XCTAssertEqual(second.map(\.sourceLineId), [0, 1])
         XCTAssertEqual(second.first?.startTime ?? 0, 13.12, accuracy: 0.01)
         XCTAssertEqual(second.last?.startTime ?? 0, 17.2, accuracy: 0.01)
 
@@ -348,6 +349,149 @@ final class LyricsForcedAlignerTests: XCTestCase {
         ))
         XCTAssertTrue(words.isEmpty)
         XCTAssertTrue(model.windows.isEmpty)
+    }
+
+    func testAnchoredUpperBoundMakesLongDeclaredLineReadyAtAnchor() async throws {
+        // Line 0 starts at 12.0 s with a 40 s declared duration (end 52.0 s), while line 1 is already
+        // locked at 16.5...18.5 s. Committed audio through 20.08 s covers line 0's window ending at 16.5 s
+        // instead of waiting for 55.0 s.
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12.0, duration: 40.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 52.0, duration: 2.0, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(
+            lines: lines,
+            model: model,
+            anchors: [1: 16.5...18.5]
+        )
+        // Frame f is track -2 + 0.24 f, so the word starts at 13.12 s.
+        model.peaksForCall = [[63: 14, 64: 4]]
+
+        let words = try await aligner.transcribe(chunk(start: 10.0))
+        XCTAssertEqual(words.map(\.text), ["ka"])
+        XCTAssertEqual(words.first?.sourceLineId, 0)
+        XCTAssertEqual(words.first?.startTime ?? 0, 13.12, accuracy: 0.01)
+    }
+
+    func testLongDeclaredLineUsesNextRowForReadinessAndSearchesBeyondIt() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, duration: 40, text: "ka"),
+            LyricLine(id: 1, timestamp: 16, text: "ka"),
+            LyricLine(id: 2, timestamp: 24, text: "ka"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+        // Second window: frame f is track 6 + 0.24 f. The first "ka" is held past 16 + 3 s.
+        model.peaksForCall = [[:], [52: 14, 53: 4, 54: 4, 55: 4, 56: 4, 57: 4, 58: 4, 64: 14, 65: 4]]
+        let first = try await aligner.transcribe(chunk(start: 6))
+        XCTAssertTrue(first.isEmpty)
+
+        let words = try await aligner.transcribe(chunk(start: 18))
+        XCTAssertEqual(words.map(\.sourceLineId), [0], "the second row provides context by 27 s")
+        let word = try XCTUnwrap(words.first)
+        XCTAssertEqual(word.startTime, 18.48, accuracy: 0.01)
+        XCTAssertEqual(word.startTime + word.duration, 20.16, accuracy: 0.01)
+    }
+
+    func testAnchorWindowMissedOnSeekRemainsEligibleOnReplay() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 7, timestamp: 17, text: "ka"),
+            LyricLine(id: 8, timestamp: 22, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [8: 15...16])
+        model.peaksForCall = [[:], [92: 14, 93: 4]]
+        // The LRC start lies in the run, but the entire allowed 14...15 s interval precedes it.
+        let missed = try await aligner.transcribe(chunk(start: 16))
+        XCTAssertTrue(missed.isEmpty)
+        XCTAssertTrue(aligner.attemptedLineIDs.isEmpty)
+
+        // The replay ends at 16 s and covers the whole window before the 17 s LRC start.
+        let words = try await aligner.transcribe(chunk(start: 4, isFinal: true))
+        XCTAssertEqual(words.map(\.sourceLineId), [7])
+        XCTAssertEqual(words.first?.startTime ?? 0, 14.08, accuracy: 0.01)
+        XCTAssertEqual(aligner.attemptedLineIDs, [7])
+    }
+
+    func testSubFrameOverlapWithAnchorCappedWindowDoesNotMarkLineDone() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 7, timestamp: 17, text: "ka"),
+            LyricLine(id: 8, timestamp: 22, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [8: 15...16])
+        model.peaksForCall = [[:], [92: 14, 93: 4]]
+        // Overlap with the 14...15 s effective window is only 0.05 s (< 1 frame of 0.24 s);
+        // align() cannot score a single frame so line 7 must remain eligible on replay.
+        let missed = try await aligner.transcribe(chunk(start: 14.95))
+        XCTAssertTrue(missed.isEmpty)
+        XCTAssertTrue(aligner.attemptedLineIDs.isEmpty)
+
+        let words = try await aligner.transcribe(chunk(start: 4, isFinal: true))
+        XCTAssertEqual(words.map(\.sourceLineId), [7])
+        XCTAssertEqual(aligner.attemptedLineIDs, [7])
+    }
+
+    func testConsecutiveLongDeclaredRowsWaitForCoveredContextBeforeCommitting() async throws {
+        // Two consecutive long-duration rows (L0 at 12 s dur 40 s, L1 at 16 s dur 40 s) followed by
+        // normal row L2 at 17 s (so L1 reaches readyAt = 17 + 3 = 20 s inside chunk 1's 20.08 s coverage,
+        // exercising the batch-pruning loop while L1's own 59 s search window is still uncovered).
+        let k = try XCTUnwrap(ForcedAlignmentText.vocabulary["k"])
+        let a = try XCTUnwrap(ForcedAlignmentText.vocabulary["a"])
+        let t = try XCTUnwrap(ForcedAlignmentText.vocabulary["t"])
+        let n = try XCTUnwrap(ForcedAlignmentText.vocabulary["n"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, duration: 40, text: "ka"),
+            LyricLine(id: 1, timestamp: 16, duration: 40, text: "ta"),
+            LyricLine(id: 2, timestamp: 17, text: "na"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+        // Window 1 (start 10, frame f = -2 + 0.24 f, retained frames 50..91 -> 10.0..20.08 s):
+        //   L0 "k" at frame 90 (19.60 s), "a" starts at frame 91 (19.84 s).
+        // Window 2 (start 22, frame f = 10 + 0.24 f, retained frames 42..91 -> 20.08..32.08 s):
+        //   L0 sustained "a" through frame 45 (20.80 s), L1 "ta" at frames 60..61 (24.40 s), L2 "na" at frames 70..71 (26.80 s).
+        model.peaksForCall = [
+            [90: k, 91: a],
+            [42: a, 43: a, 44: a, 45: a, 60: t, 61: a, 70: n, 71: a],
+        ]
+        let first = try await aligner.transcribe(chunk(start: 10))
+        XCTAssertTrue(first.isEmpty, "L0 must wait while ready context line L1 still has uncovered audio")
+        XCTAssertTrue(aligner.attemptedLineIDs.isEmpty)
+
+        let second = try await aligner.transcribe(chunk(start: 22))
+        let l0Word = try XCTUnwrap(second.first { $0.sourceLineId == 0 })
+        let l1Word = try XCTUnwrap(second.first { $0.sourceLineId == 1 })
+        XCTAssertEqual(l0Word.startTime, 19.60, accuracy: 0.05)
+        XCTAssertEqual(l1Word.startTime, 24.40, accuracy: 0.05)
+    }
+
+    func testLongLineNextToLaterAnchorWaitsUntilAnchorCapIsCovered() async throws {
+        // L0 fetched at 12 s with 40 s duration; L1 fetched at 16 s is anchored at 23..25 s.
+        // L0's readyAt is 19 s, but its anchor-capped windowEnd is 23 s. Chunk 1 (coveredEnd 20.08 s)
+        // must not commit L0 early via done.contains(1); chunk 2 captures L0's onset at 21.52 s.
+        let k = try XCTUnwrap(ForcedAlignmentText.vocabulary["k"])
+        let a = try XCTUnwrap(ForcedAlignmentText.vocabulary["a"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, duration: 40, text: "ka"),
+            LyricLine(id: 1, timestamp: 16, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [1: 23...25])
+        // Window 2 (frame f = 10 + 0.24 f): frame 48 is 21.52 s.
+        model.peaksForCall = [
+            [:],
+            [48: k, 49: a],
+        ]
+
+        let first = try await aligner.transcribe(chunk(start: 10))
+        XCTAssertTrue(first.isEmpty, "must wait until anchor-capped windowEnd (23 s) is covered")
+        XCTAssertTrue(aligner.attemptedLineIDs.isEmpty)
+
+        let second = try await aligner.transcribe(chunk(start: 22))
+        let word = try XCTUnwrap(second.first { $0.sourceLineId == 0 })
+        XCTAssertEqual(word.startTime, 21.52, accuracy: 0.05)
     }
 
     func testModelInstallVerifiesTheArchiveAndReplacesAStaleCompiledModel() throws {

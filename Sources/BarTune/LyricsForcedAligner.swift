@@ -294,7 +294,7 @@ protocol CTCAcousticModel: AnyObject, Sendable {
 /// that ends with it; a line is aligned once audio covering its LRC time ± `lineWindow` has been scored.
 /// An engine that reports which lyric lines it had the audio for, and which of them it aligned confidently.
 protocol LineAttemptReporting: AnyObject {
-    /// Lines whose full audio window was heard, aligned or not; not the anchors.
+    /// Lyrics attempted against captured audio, including lines with no reliable match. Anchors are excluded.
     var attemptedLineIDs: Set<Int> { get }
     /// Aligned lines whose words the model heard clearly enough to lock.
     var confidentLineIDs: Set<Int> { get }
@@ -306,7 +306,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private struct PreparedLine {
         let id: Int
         let start: Double
-        let end: Double
+        /// The next row provides context even when a held vocal extends past it.
+        let contextEnd: Double
+        let searchEnd: Double
         let words: [ForcedAlignmentText.Word]
         /// Each word's syllables, empty for a word of one.
         let syllables: [[ForcedAlignmentText.Syllable]]
@@ -367,11 +369,14 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         for (index, line) in timed.enumerated() {
             let words = ForcedAlignmentText.words(for: line.text, script: script)
             guard !words.isEmpty else { continue }
-            let end = index + 1 < timed.count ? timed[index + 1].timestamp : line.timestamp + 5
+            let contextEnd = index + 1 < timed.count
+                ? timed[index + 1].timestamp
+                : line.timestamp + max(5.0, line.duration ?? 5.0)
             prepared.append(PreparedLine(
                 id: line.id,
                 start: line.timestamp,
-                end: end,
+                contextEnd: contextEnd,
+                searchEnd: max(contextEnd, line.timestamp + (line.duration ?? 0)),
                 words: words,
                 syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
             ))
@@ -501,8 +506,23 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let line = lines[index]
             // A line that began before this run's audio is left for a later play.
             guard line.start >= coveredStart else { continue }
-            guard throughEnd ? line.start < coveredEnd : line.end + lineWindow <= coveredEnd else { break }
+            let readyAt = min(line.contextEnd + lineWindow, line.upperBound)
+            guard readyAt <= coveredEnd || (throughEnd && line.start < coveredEnd) else { break }
+            // A seek may start after the next anchor, or finish before the previous anchor,
+            // or overlap by less than two frames (where `align` cannot produce a valid span).
+            let effectiveLow = max(0, runFrame(atTrackTime: windowStart(of: line)))
+            let effectiveHigh = min(committedFrames - 1, runFrame(atTrackTime: windowEnd(of: line)))
+            guard max(coveredStart, windowStart(of: line)) < min(coveredEnd, windowEnd(of: line)),
+                  effectiveHigh > effectiveLow
+            else { continue }
             batch.append(index)
+        }
+        // Do not commit a batch while its trailing line (whether a context row or a row bounded by an
+        // upcoming anchor) still has uncovered audio in its effective search window.
+        while let last = batch.last,
+              !throughEnd,
+              windowEnd(of: lines[last]) > coveredEnd {
+            batch.removeLast()
         }
         // The newest ready line is only context, so the line before it can't stretch into its audio;
         // a line right before an aligned one is already bounded by it.
@@ -565,7 +585,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 startTime: start,
                 duration: finish - start,
                 confidence: Double(exp(logProbability / Float(max(1, frameCount)))),
-                syllables: syllables(lines[owner.line].syllables[owner.word], spans: spans[cursor...end], from: lowFrame)
+                syllables: syllables(lines[owner.line].syllables[owner.word], spans: spans[cursor...end], from: lowFrame),
+                sourceLineId: lines[owner.line].id
             ))
             wordLines.append(owner.line)
             keptUntilFrame = lowFrame + spans[end].lastFrame + 1
@@ -594,7 +615,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     }
 
     private func windowEnd(of line: PreparedLine) -> Double {
-        min(line.end + lineWindow, line.upperBound)
+        min(line.searchEnd + lineWindow, line.upperBound)
     }
 
     /// Words the model barely hears (a shout under backing vocals, say) can land seconds off. A confident
