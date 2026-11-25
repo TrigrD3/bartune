@@ -18,7 +18,7 @@
   <br/>
   <img src="https://img.shields.io/badge/macOS-13.0%2B-black?logo=apple" alt="macOS 13+" />
   <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white" alt="Swift 5.9+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="MIT License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="GPLv3 License" /></a>
 </p>
 
 ---
@@ -86,4 +86,4 @@ Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for local setu
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+GNU General Public License v3.0 (GPLv3) — see [LICENSE](LICENSE).
