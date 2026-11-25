@@ -145,15 +145,29 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+          fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/download-artifact@v7
         with:
           name: BarTune-${{ needs.build.outputs.version }}.dmg
           path: dist
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          node .github/scripts/build-release-notes.mjs \
+            --version "$VERSION" \
+            --tag "$TAG" \
+            --output release-notes.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
@@ -161,7 +175,8 @@ jobs:
           tag_name: ${{ needs.build.outputs.tag }}
           target_commitish: ${{ github.sha }}
           name: BarTune ${{ needs.build.outputs.tag }}
-          generate_release_notes: true
+          body_path: release-notes.md
+          generate_release_notes: false
           files: |
             dist/BarTune-${{ needs.build.outputs.version }}.dmg
             dist/BarTune-${{ needs.build.outputs.version }}.dmg.sha256

@@ -207,3 +207,14 @@ test('export-coverage.sh fails visibly when test binary, profdata, or LCOV outpu
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('release.yml publish-stable builds descriptive release notes with PR read permissions', () => {
+  const release = readWorkflow('release.yml');
+  const publishJob = extractJobBlock(release, 'publish-stable');
+  assert.match(publishJob, /^\s{6}contents:\s*write\s*$/m);
+  assert.match(publishJob, /^\s{6}pull-requests:\s*read\s*$/m);
+  assert.match(publishJob, /fetch-depth:\s*0/);
+  assert.match(publishJob, /fetch-tags:\s*true/);
+  assert.match(publishJob, /node \.github\/scripts\/build-release-notes\.mjs/);
+  assert.match(publishJob, /body_path:\s*release-notes\.md/);
+});
