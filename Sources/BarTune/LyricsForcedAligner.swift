@@ -317,12 +317,31 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         var upperBound = Double.infinity
     }
 
+    private struct SearchWindow {
+        let start: Double
+        let end: Double
+        let readyAt: Double
+        let earliestOnset: Double
+        let latestOnset: Double
+        /// The search edges before neighboring anchors constrain the CTC path.
+        let rawStart: Double
+        let rawEnd: Double
+    }
+
+    private struct Alignment {
+        var words: [RecognizedAudioWord] = []
+        var confidentOffsets: [Int: Double] = [:]
+        var nearlyConfident: Set<Int> = []
+        var confidenceSum = 0.0
+    }
+
     private let model: CTCAcousticModel
     private let lines: [PreparedLine]
     private let lineWindow: Double
     private let holdBackSamples: Int
     private let lock = NSLock()
     private var done = Set<Int>()
+    private var missedBeforeCoarseMatch = Set<Int>()
     private let anchoredIndices: Set<Int>
     private var confident = Set<Int>()
     private var nearlyConfident = Set<Int>()
@@ -337,10 +356,16 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private var committedFrames = 0
     /// End of the last aligned word in this run; later lines can't start before it.
     private var alignedUntilFrame = 0
-    /// Onset minus LRC time of every anchor and confident line so far, across runs.
-    private var lineOffsets: [Double] = []
-    /// A line whose onset strays this far from the song's median offset is dropped, so it keeps its LRC time.
-    private let maxOffsetDeviation = 1.0
+    /// Onset minus LRC time of each anchor and confident line, across runs.
+    private var lineOffsets: [Int: Double] = [:]
+    private let maxOffsetDeviation = 1.25
+    static let maxWordSpan = 3.5
+    static let maxIntroStart = 10.0
+
+    static func maxLineSpan(wordCount: Int) -> Double {
+        max(6, Double(wordCount) * 1.7)
+    }
+
     /// A line whose words average at least this confidence is locked. Tuned on JamendoLyrics (English):
     /// 93% of such lines start within 300 ms of the sung onset, against 70% of all aligned lines.
     static let lockConfidence = 0.15
@@ -363,32 +388,37 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         holdBackSamples = Int(holdBack * Double(Self.sampleRate))
         let script = ForcedAlignmentText.Script.detect(in: lines)
         let latinRules = LatinSyllabifier.Rules.detect(in: lines)
-        let timed = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let instrumentalGap = 12.0
         var prepared: [PreparedLine] = []
         var spans: [ClosedRange<Double>?] = []
-        for (index, line) in timed.enumerated() {
+        for (index, line) in lines.enumerated() {
             let words = ForcedAlignmentText.words(for: line.text, script: script)
             guard !words.isEmpty else { continue }
-            let contextEnd = index + 1 < timed.count
-                ? timed[index + 1].timestamp
-                : line.timestamp + max(5.0, line.duration ?? 5.0)
+            let next = index + 1 < lines.count ? lines[index + 1] : nil
+            let endsAtBlank = next?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
+            let duration = line.duration ?? 0
+            let nextTime = next?.timestamp ?? (line.timestamp + max(5, duration))
+            let hasLongGap = !endsAtBlank && next.map { $0.timestamp - line.timestamp > instrumentalGap } == true
+            // A distant row adds little context. Allow a plausible declared duration for the line before it.
+            let estimatedDuration = max(8, Double(words.count) * 1.2, duration <= instrumentalGap ? duration : 0)
+            let contextEnd = hasLongGap ? min(nextTime, line.timestamp + estimatedDuration) : nextTime
             prepared.append(PreparedLine(
                 id: line.id,
                 start: line.timestamp,
                 contextEnd: contextEnd,
-                searchEnd: max(contextEnd, line.timestamp + (line.duration ?? 0)),
+                searchEnd: endsAtBlank || hasLongGap ? contextEnd : max(contextEnd, line.timestamp + duration),
                 words: words,
                 syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
             ))
             spans.append(anchors[line.id])
         }
         var anchored = Set<Int>()
-        var offsets: [Double] = []
+        var offsets: [Int: Double] = [:]
         var lowerBound = -Double.infinity
         for index in prepared.indices {
             if let span = spans[index] {
                 anchored.insert(index)
-                offsets.append(span.lowerBound - prepared[index].start)
+                offsets[index] = span.lowerBound - prepared[index].start
                 lowerBound = span.upperBound
             } else {
                 prepared[index].lowerBound = lowerBound
@@ -464,6 +494,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             frames.removeAll()
             committedFrames = 0
             alignedUntilFrame = 0
+            missedBeforeCoarseMatch.removeAll()
         }
         expectedNextChunkStart = request.chunkStartTime
             + Double(request.samples.count) / Double(Self.sampleRate) * request.playbackRate
@@ -499,62 +530,159 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     /// `throughEnd`: the run's audio ends here (the track's last chunk), so every line still ahead is aligned
     /// with what was heard.
     private func alignReadyLines(throughEnd: Bool = false) -> [RecognizedAudioWord] {
+        var words: [RecognizedAudioWord] = []
+        var previousDoneCount: Int
+        repeat {
+            previousDoneCount = done.count
+            words += alignReadyBatch(throughEnd: throughEnd)
+        } while done.count > previousDoneCount
+        return words
+    }
+
+    private func alignReadyBatch(throughEnd: Bool) -> [RecognizedAudioWord] {
         let coveredStart = trackTime(ofRunFrame: 0)
         let coveredEnd = trackTime(ofRunFrame: committedFrames)
+        let canProbe = lineOffsets.isEmpty && lineWindow > 0
+        var missedRawOnsets: [Int] = []
         var batch: [Int] = []
-        for index in lines.indices where !done.contains(index) {
-            let line = lines[index]
-            // A line that began before this run's audio is left for a later play.
-            guard line.start >= coveredStart else { continue }
-            let readyAt = min(line.contextEnd + lineWindow, line.upperBound)
-            guard readyAt <= coveredEnd || (throughEnd && line.start < coveredEnd) else { break }
+        for index in lines.indices where !done.contains(index) && !missedBeforeCoarseMatch.contains(index) {
+            let window = searchWindow(for: index)
+            guard window.latestOnset >= coveredStart else {
+                // A late vocal may still be captured, even when its raw onset was missed.
+                if canProbe, lines[index].start + 2 * lineWindow >= coveredStart {
+                    missedRawOnsets.append(index)
+                }
+                continue
+            }
+            guard window.readyAt <= coveredEnd || (throughEnd && window.earliestOnset < coveredEnd) else { break }
             // A seek may start after the next anchor, or finish before the previous anchor,
             // or overlap by less than two frames (where `align` cannot produce a valid span).
-            let effectiveLow = max(0, runFrame(atTrackTime: windowStart(of: line)))
-            let effectiveHigh = min(committedFrames - 1, runFrame(atTrackTime: windowEnd(of: line)))
-            guard max(coveredStart, windowStart(of: line)) < min(coveredEnd, windowEnd(of: line)),
+            let effectiveLow = max(0, runFrame(atTrackTime: window.start))
+            let effectiveHigh = min(committedFrames - 1, runFrame(atTrackTime: window.end))
+            guard max(coveredStart, window.start) < min(coveredEnd, window.end),
                   effectiveHigh > effectiveLow
             else { continue }
             batch.append(index)
+            if endsBeforeInstrumentalBreak(index) { break }
         }
         // Do not commit a batch while its trailing line (whether a context row or a row bounded by an
         // upcoming anchor) still has uncovered audio in its effective search window.
         while let last = batch.last,
               !throughEnd,
-              windowEnd(of: lines[last]) > coveredEnd {
+              searchWindow(for: last).end > coveredEnd {
             batch.removeLast()
         }
-        // The newest ready line is only context, so the line before it can't stretch into its audio;
-        // a line right before an aligned one is already bounded by it.
-        let lastIsBounded = batch.last.map { throughEnd || $0 == lines.count - 1 || done.contains($0 + 1) } == true
-        let keep = lastIsBounded ? batch.count : batch.count - 1
-        guard keep > 0 else { return [] }
-        done.formUnion(batch.prefix(keep))
-        if let words = align(batch, keeping: keep) { return words }
-        return batch.prefix(keep).flatMap { index in
-            align(batch.contains(index + 1) ? [index, index + 1] : [index], keeping: 1) ?? []
+        let keep = keptLineCount(in: batch, throughEnd: throughEnd)
+        let baseline = keep > 0 ? align(batch, keeping: keep) : nil
+        if canProbe, let words = commitCoarseMatch(
+            in: batch, keeping: keep, baseline: baseline, missedRawOnsets: missedRawOnsets, throughEnd: throughEnd
+        ) {
+            return words
+        }
+        let kept = batch.prefix(keep)
+        if let baseline { return commitBatch(baseline, keeping: kept) }
+        done.formUnion(kept)
+        return kept.flatMap { index in
+            let withContext = batch.contains(index + 1) ? align([index, index + 1], keeping: 1) : nil
+            return (withContext ?? align([index], keeping: 1)).map(commit) ?? []
         }
     }
 
-    /// Aligns `batch` together and returns the words of its first `keep` lines.
-    private func align(_ batch: [Int], keeping keep: Int) -> [RecognizedAudioWord]? {
-        guard let firstLine = batch.first.map({ lines[$0] }), let lastLine = batch.last.map({ lines[$0] }) else { return nil }
-        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: windowStart(of: firstLine)))
-        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: windowEnd(of: lastLine)))
+    private func keptLineCount(in batch: [Int], throughEnd: Bool) -> Int {
+        guard let last = batch.last else { return 0 }
+        // The newest ready line is context unless the batch ends at a known boundary.
+        let lastIsBounded = throughEnd || last == lines.count - 1 || done.contains(last + 1) || endsBeforeInstrumentalBreak(last)
+        return batch.count - (lastIsBounded ? 0 : 1)
+    }
+
+    /// Tries the two adjacent timing ranges against the frames already scored for the raw batch.
+    /// Returns an empty result while a plausible later window still needs audio.
+    private func commitCoarseMatch(
+        in batch: [Int], keeping keep: Int, baseline: Alignment?, missedRawOnsets: [Int], throughEnd: Bool
+    ) -> [RecognizedAudioWord]? {
+        let confidenceGain = 0.05
+        let baselineLocks = baseline?.confidentOffsets.count ?? 0
+
+        let coveredStart = trackTime(ofRunFrame: alignedUntilFrame)
+        let coveredEnd = trackTime(ofRunFrame: committedFrames)
+        var winner: (alignment: Alignment, kept: ArraySlice<Int>, missed: ArraySlice<Int>, confidence: Double)?
+        var waitingForAudio = false
+        for shift in [-2 * lineWindow, 2 * lineWindow] {
+            let candidates = shift > 0 ? missedRawOnsets + batch : batch
+            let candidateKeep = keptLineCount(in: candidates, throughEnd: throughEnd)
+            guard candidateKeep > 0 else { continue }
+            let minimumLines = min(2, candidates.count)
+            let minimumKept = min(2, candidateKeep)
+            // Count rejected and uncovered lines as zero so a smaller probe cannot win by skipping weak lines.
+            let comparisonCount = Double(max(keep, candidateKeep))
+            let baselineConfidence = (baseline?.confidenceSum ?? 0) / comparisonCount
+            guard baselineConfidence + confidenceGain <= 1 else { continue }
+            let windows = candidates.map { searchWindow(for: $0, coarseShift: shift) }
+            // The onset must be captured, even if the padding before it is clipped.
+            let eligible = windows.drop { $0.latestOnset < coveredStart }
+            let covered = eligible.prefix { window in
+                let effectiveLow = max(alignedUntilFrame, runFrame(atTrackTime: window.start))
+                let effectiveHigh = min(committedFrames - 1, runFrame(atTrackTime: window.end))
+                return window.latestOnset >= coveredStart
+                    && (throughEnd ? window.latestOnset < coveredEnd : window.end <= coveredEnd)
+                    && max(coveredStart, window.start) < min(coveredEnd, window.end)
+                    && effectiveHigh > effectiveLow
+            }
+            let lastIsBounded = throughEnd || (covered.endIndex == candidates.endIndex && candidateKeep == candidates.count)
+            let probeKeep = covered.count - (lastIsBounded ? 0 : 1)
+            if covered.count < minimumLines || probeKeep < minimumKept {
+                waitingForAudio = waitingForAudio || (eligible.count >= minimumLines && covered.count < eligible.count)
+                continue
+            }
+            let probe = candidates[covered.indices]
+            guard let match = align(Array(probe), keeping: probeKeep, coarseShift: shift),
+                  !match.confidentOffsets.isEmpty,
+                  match.confidentOffsets.count >= baselineLocks
+            else { continue }
+            // A lone clipped row needs a clearly heard first word; later syllables can otherwise
+            // pull a CTC path across a long blank stretch and manufacture an early onset.
+            if throughEnd, probeKeep == 1, covered.contains(where: { $0.end > coveredEnd }),
+               (match.words.first?.confidence ?? 0) < 0.01 { continue }
+            let confidence = match.confidenceSum / comparisonCount
+            guard confidence >= baselineConfidence + confidenceGain else { continue }
+            if let winner {
+                let current = winner.alignment
+                guard match.confidentOffsets.count > current.confidentOffsets.count
+                    || (match.confidentOffsets.count == current.confidentOffsets.count && confidence > winner.confidence)
+                else { continue }
+            }
+            winner = (match, probe.prefix(probeKeep), candidates[..<probe.startIndex], confidence)
+        }
+        guard let winner else {
+            return !throughEnd && baselineLocks == 0 && waitingForAudio ? [] : nil
+        }
+        // Earlier lines missed by capture stay eligible on a later run, and the uncovered tail stays pending.
+        missedBeforeCoarseMatch.formUnion(winner.missed)
+        return commitBatch(winner.alignment, keeping: winner.kept)
+    }
+
+    /// Aligns `batch` together and evaluates the words of its first `keep` lines.
+    private func align(_ batch: [Int], keeping keep: Int, coarseShift: Double? = nil) -> Alignment? {
+        let windows = batch.map { searchWindow(for: $0, coarseShift: coarseShift) }
+        guard let start = windows.map(\.start).min(), let end = windows.map(\.end).max() else { return nil }
+        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: start))
+        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: end))
         guard highFrame > lowFrame else { return nil }
 
         var tokens: [Int] = []
         var allowed: [ClosedRange<Int>] = []
+        var pinningRanges: [ClosedRange<Int>] = []
         var owners: [(line: Int, word: Int)] = []
-        for index in batch {
+        for (index, window) in zip(batch, windows) {
             let line = lines[index]
-            let low = max(lowFrame, runFrame(atTrackTime: windowStart(of: line))) - lowFrame
-            let high = min(highFrame, runFrame(atTrackTime: windowEnd(of: line))) - lowFrame
+            let low = max(lowFrame, runFrame(atTrackTime: window.start))
+            let high = min(highFrame, runFrame(atTrackTime: window.end))
             guard high >= low else { return nil }
+            pinningRanges.append(runFrame(atTrackTime: window.rawStart)...min(committedFrames - 1, runFrame(atTrackTime: window.rawEnd)))
             for (wordIndex, word) in line.words.enumerated() {
                 for token in word.tokenIDs {
                     tokens.append(token)
-                    allowed.append(low...high)
+                    allowed.append((low - lowFrame)...(high - lowFrame))
                     owners.append((index, wordIndex))
                 }
             }
@@ -566,8 +694,6 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
 
         let kept = Set(batch.prefix(keep))
         var words: [RecognizedAudioWord] = []
-        var wordLines: [Int] = []
-        var keptUntilFrame: Int?
         var cursor = 0
         while cursor < spans.count, kept.contains(owners[cursor].line) {
             let owner = owners[cursor]
@@ -588,12 +714,36 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 syllables: syllables(lines[owner.line].syllables[owner.word], spans: spans[cursor...end], from: lowFrame),
                 sourceLineId: lines[owner.line].id
             ))
-            wordLines.append(owner.line)
-            keptUntilFrame = lowFrame + spans[end].lastFrame + 1
             cursor = end + 1
         }
-        if let keptUntilFrame { alignedUntilFrame = keptUntilFrame }
-        return dropUnreliableLines(words, lineOf: wordLines)
+        return dropUnreliableLines(words, lines: batch.prefix(keep), pinningRanges: pinningRanges)
+    }
+
+    private func commit(_ alignment: Alignment) -> [RecognizedAudioWord] {
+        confident.formUnion(alignment.confidentOffsets.keys)
+        lineOffsets.merge(alignment.confidentOffsets) { _, offset in offset }
+        nearlyConfident.formUnion(alignment.nearlyConfident)
+        if let last = alignment.words.last {
+            alignedUntilFrame = runFrame(atTrackTime: last.startTime + last.duration)
+        }
+        return alignment.words
+    }
+
+    private func commitBatch(_ alignment: Alignment, keeping kept: ArraySlice<Int>) -> [RecognizedAudioWord] {
+        let acceptedIDs = Set(alignment.words.compactMap(\.sourceLineId))
+        guard let firstRejected = kept.dropLast().firstIndex(where: { !acceptedIDs.contains(lines[$0].id) }) else {
+            done.formUnion(kept)
+            return commit(alignment)
+        }
+        // A rejected line can force later words off their real peaks. Leave that suffix for the next batch.
+        done.formUnion(kept[...firstRejected])
+        let prefix = kept[..<firstRejected]
+        let prefixIDs = Set(prefix.map { lines[$0].id })
+        var accepted = alignment
+        accepted.words = alignment.words.filter { $0.sourceLineId.map(prefixIDs.contains) ?? false }
+        accepted.confidentOffsets = alignment.confidentOffsets.filter { $0.key < kept[firstRejected] }
+        accepted.nearlyConfident = alignment.nearlyConfident.filter { $0 < kept[firstRejected] }
+        return commit(accepted)
     }
 
     /// Each syllable starts where the first of its letters was aligned.
@@ -610,39 +760,98 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         }
     }
 
-    private func windowStart(of line: PreparedLine) -> Double {
-        max(line.start - lineWindow, line.lowerBound)
+    private func endsBeforeInstrumentalBreak(_ index: Int) -> Bool {
+        index + 1 < lines.count && lines[index + 1].start - lines[index].contextEnd > 2 * lineWindow
     }
 
-    private func windowEnd(of line: PreparedLine) -> Double {
-        min(line.searchEnd + lineWindow, line.upperBound)
+    private func median(_ offsets: [Double]) -> Double? {
+        guard !offsets.isEmpty else { return nil }
+        let sorted = offsets.sorted()
+        return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
     }
 
-    /// Words the model barely hears (a shout under backing vocals, say) can land seconds off. A confident
-    /// line is kept and sets the song's offset; any other line is dropped when it strays from that offset.
-    private func dropUnreliableLines(_ words: [RecognizedAudioWord], lineOf wordLines: [Int]) -> [RecognizedAudioWord] {
-        var dropped = Set<Int>()
-        for (index, line) in wordLines.enumerated() where index == 0 || wordLines[index - 1] != line {
-            let confidences = zip(words, wordLines).filter { $0.1 == line }.map(\.0.confidence)
-            let meanConfidence = confidences.reduce(0, +) / Double(confidences.count)
-            let offset = words[index].startTime - lines[line].start
-            if meanConfidence >= Self.lockConfidence {
-                confident.insert(line)
-                lineOffsets.append(offset)
-                continue
-            }
-            if lineOffsets.count >= 4 {
-                let median = lineOffsets.sorted()[lineOffsets.count / 2]
-                if abs(offset - median) > maxOffsetDeviation {
-                    dropped.insert(line)
+    private func offsetEstimate(before index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
+        guard !offsets.isEmpty else { return (0, 0) }
+        let recent = Array(lines.indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
+        return (median(recent) ?? median(Array(offsets.values)) ?? 0, recent.count)
+    }
+
+    private func searchWindow(for index: Int, coarseShift: Double? = nil) -> SearchWindow {
+        let line = lines[index]
+        let (offset, priorCount) = offsetEstimate(before: index, using: lineOffsets)
+        // Keep the LRC window within reach until two earlier lines support the shift.
+        let startShift = coarseShift ?? (priorCount < 2 ? min(0, offset) : offset)
+        let endShift = coarseShift ?? (priorCount < 2 ? max(0, offset) : offset)
+        let paddedStart = line.start + startShift - lineWindow
+        let rawStart = coarseShift != nil ? max(0, paddedStart) : (index == 0 && line.start <= Self.maxIntroStart ? 0 : paddedStart)
+        let rawEnd = line.searchEnd + endShift + lineWindow
+        let shiftedOnset = line.start + offset
+        return SearchWindow(
+            start: max(rawStart, line.lowerBound),
+            end: min(rawEnd, line.upperBound),
+            readyAt: min(line.contextEnd + endShift + lineWindow, line.upperBound),
+            earliestOnset: min(line.start, shiftedOnset),
+            // Later anchors can widen the search on replay; an earlier match can establish a missed onset.
+            latestOnset: coarseShift.map { line.start + $0 } ?? max(0, priorCount < 2 ? max(line.start, shiftedOnset) : shiftedOnset),
+            rawStart: rawStart,
+            rawEnd: rawEnd
+        )
+    }
+
+    private func dropUnreliableLines(
+        _ words: [RecognizedAudioWord],
+        lines kept: ArraySlice<Int>,
+        pinningRanges: [ClosedRange<Int>]
+    ) -> Alignment {
+        var accepted = Alignment()
+        var offsets = lineOffsets
+        var cursor = 0
+        for (line, range) in zip(kept, pinningRanges) {
+            let next = cursor + lines[line].words.count
+            let lineWords = words[cursor..<next]
+            cursor = next
+            guard let first = lineWords.first, let last = lineWords.last else { continue }
+            let end = last.startTime + last.duration
+            let meanConfidence = lineWords.reduce(0) { $0 + $1.confidence } / Double(lineWords.count)
+            // A CTC path can bridge silence without losing token confidence.
+            guard meanConfidence >= 0.01,
+                  end - first.startTime <= Self.maxLineSpan(wordCount: lineWords.count),
+                  !lineWords.contains(where: { $0.duration > Self.maxWordSpan }),
+                  !zip(lineWords, lineWords.dropFirst()).contains(where: { $1.startTime - $0.endTime > Self.maxWordSpan })
+            else { continue }
+            let squished = lineWords.count >= 4 && end - first.startTime < Double(lineWords.count) * 0.16
+            if squished, meanConfidence < Self.lockConfidence { continue }
+            let pinned = runFrame(atTrackTime: first.startTime) <= range.lowerBound + 1
+                || runFrame(atTrackTime: end) >= range.upperBound
+            if pinned, meanConfidence < Self.onsetLockConfidence { continue }
+
+            let offset = first.startTime - lines[line].start
+            let supportsLock = meanConfidence >= Self.onsetLockConfidence
+                && Self.hasAcousticSupport(in: lineWords.map(\.confidence))
+            if supportsLock, meanConfidence >= Self.lockConfidence {
+                accepted.confidentOffsets[line] = offset
+                offsets[line] = offset
+            } else {
+                if offsets.count >= 4, abs(offset - offsetEstimate(before: line, using: offsets).offset) > maxOffsetDeviation {
                     continue
                 }
+                if supportsLock {
+                    accepted.nearlyConfident.insert(line)
+                }
             }
-            if meanConfidence >= Self.onsetLockConfidence {
-                nearlyConfident.insert(line)
-            }
+            accepted.words.append(contentsOf: lineWords)
+            accepted.confidenceSum += meanConfidence
         }
-        return zip(words, wordLines).filter { !dropped.contains($0.1) }.map(\.0)
+        return accepted
+    }
+
+    static func hasAcousticSupport(in confidences: [Double]) -> Bool {
+        guard confidences.count >= 4 else { return true }
+        // Include the middle word in the prefix so it cannot mask a weak suffix.
+        let middle = (confidences.count + 1) / 2
+        let first = confidences[..<middle].reduce(0, +) / Double(middle)
+        let second = confidences[middle...].reduce(0, +) / Double(confidences.count - middle)
+        return min(first, second) >= 0.03
     }
 }
 
