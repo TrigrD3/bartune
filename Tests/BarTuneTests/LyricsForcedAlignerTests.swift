@@ -1260,7 +1260,27 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: models.path), [LyricsAlignerModel.packageName])
     }
 
-    func testModelInstallRestoresExistingArtifactsWhenSwapFails() throws {
+    func testModelInstallPublishesTheCompiledArtifactWithItsSourcePackage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try makeModelArchive(in: root)
+        let digest = try AppUpdateService.sha256Hex(ofFileAt: archive)
+        let models = root.appendingPathComponent("Models")
+        let package = models.appendingPathComponent(LyricsAlignerModel.packageName)
+        let compiled = models.appendingPathComponent(LyricsAlignerModel.compiledName)
+
+        try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models, compile: { source, output in
+            let manifest = try String(contentsOf: source.appendingPathComponent("Manifest.json"), encoding: .utf8)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
+            try Data("compiled \(manifest)".utf8).write(to: output)
+        })
+
+        XCTAssertEqual(try String(contentsOf: package.appendingPathComponent("Manifest.json"), encoding: .utf8), "weights")
+        XCTAssertEqual(try String(contentsOf: compiled, encoding: .utf8), "compiled weights")
+        XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: models.path)), Set([package.lastPathComponent, compiled.lastPathComponent]))
+    }
+
+    func testModelInstallRestoresExistingArtifactsWhenPreparationOrSwapFails() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let archive = try makeModelArchive(in: root)
@@ -1280,9 +1300,25 @@ final class LyricsForcedAlignerTests: XCTestCase {
         let replacementFailure = FailingModelMoveFileManager { source, destination in
             destination.path == package.path && source.deletingLastPathComponent().lastPathComponent.hasPrefix(".staging-")
         }
-        for fileManager in [backupFailure, replacementFailure] {
+        let compiledReplacementFailure = FailingModelMoveFileManager { source, destination in
+            destination.path == compiled.path && source.deletingLastPathComponent().lastPathComponent.hasPrefix(".staging-")
+        }
+        let compile: (URL, URL) throws -> Void = { _, output in
+            try Data("new compiled model".utf8).write(to: output)
+        }
+        let failCompilation: (URL, URL) throws -> Void = { _, output in
+            try Data("partial compilation".utf8).write(to: output)
+            throw CocoaError(.fileWriteNoPermission)
+        }
+        let failureCases: [(FileManager, (URL, URL) throws -> Void)] = [
+            (.default, failCompilation),
+            (backupFailure, compile),
+            (replacementFailure, compile),
+            (compiledReplacementFailure, compile),
+        ]
+        for (fileManager, prepare) in failureCases {
             XCTAssertThrowsError(
-                try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models, fileManager: fileManager)
+                try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models, fileManager: fileManager, compile: prepare)
             ) { error in
                 XCTAssertEqual((error as? CocoaError)?.code, .fileWriteNoPermission)
             }

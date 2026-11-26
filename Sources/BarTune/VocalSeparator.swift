@@ -212,9 +212,12 @@ final class SpectralVocalSeparator: VocalIsolating {
         }
         guard !left.isEmpty else { return ([], []) }
         try Task.checkCancellation()
+        // Open-Unmix expects full-scale audio. One gain preserves the stereo balance it uses to separate sources.
+        let peak = max(vDSP.maximumMagnitude(left), vDSP.maximumMagnitude(right))
+        let gain = AudioLevel.normalizationGain(peak: peak)
         let stft = SpectralSTFT()
-        var leftSpectrum = stft.stft(samples: left)
-        var rightSpectrum = stft.stft(samples: right)
+        var leftSpectrum = stft.stft(samples: gain == 1 ? left : vDSP.multiply(gain, left))
+        var rightSpectrum = stft.stft(samples: gain == 1 ? right : vDSP.multiply(gain, right))
         let stride = SpectralSTFT.spectrumBins
         let frameCount = leftSpectrum.real.count / stride
         let overlap = min(16, window / 4)
@@ -254,10 +257,12 @@ final class SpectralVocalSeparator: VocalIsolating {
             }
         }
         try Task.checkCancellation()
-        return (
-            stft.istft(real: leftSpectrum.real, imag: leftSpectrum.imag, outputLength: left.count),
-            stft.istft(real: rightSpectrum.real, imag: rightSpectrum.imag, outputLength: right.count)
-        )
+        let leftStem = stft.istft(real: leftSpectrum.real, imag: leftSpectrum.imag, outputLength: left.count)
+        let rightStem = stft.istft(real: rightSpectrum.real, imag: rightSpectrum.imag, outputLength: right.count)
+        // The envelope and pitch contour still measure the stem at the original capture level.
+        guard gain != 1 else { return (leftStem, rightStem) }
+        let inverseGain = 1 / gain
+        return (vDSP.multiply(inverseGain, leftStem), vDSP.multiply(inverseGain, rightStem))
     }
 }
 
@@ -351,21 +356,26 @@ enum VocalSeparatorModel {
             throw InstallError.httpStatus(http.statusCode)
         }
         try await Task.detached(priority: .utility) {
-            try install(archive: archive, into: directory)
+            try install(archive: archive, into: directory, compile: compileModel)
         }.value
     }
 
-    static func install(archive: URL, into directory: URL) throws {
-        try modelFilesLock.withLock {
-            try LyricsAlignerModel.install(
-                archive: archive,
-                expectedSHA256: downloadSHA256,
-                into: directory,
-                packageName: packageName,
-                compiledName: compiledName
-            )
-            releaseCachedModel()
-        }
+    static func install(
+        archive: URL,
+        expectedSHA256: String = downloadSHA256,
+        into directory: URL,
+        compile: ((URL, URL) throws -> Void)? = nil
+    ) throws {
+        try LyricsAlignerModel.install(
+            archive: archive,
+            expectedSHA256: expectedSHA256,
+            into: directory,
+            packageName: packageName,
+            compiledName: compiledName,
+            lock: modelFilesLock,
+            onInstalled: releaseCachedModel,
+            compile: compile
+        )
     }
 
     static func isInstalled(in directory: URL = directory) -> Bool {
@@ -396,7 +406,7 @@ enum VocalSeparatorModel {
         cache.invalidate()
     }
 
-    /// Loads the installed separator, compiling its `.mlpackage` once; nil when it is missing or fails to load.
+    /// Loads the installed separator, compiling on demand for existing packages without a compiled cache.
     static func launch(directory: URL = directory) async -> VocalIsolating? {
         guard #available(macOS 14, *) else { return nil }
         return await Task.detached(priority: .utility) {
@@ -410,14 +420,18 @@ enum VocalSeparatorModel {
         let package = directory.appendingPathComponent(packageName)
         let fileManager = FileManager.default
         guard hasPackage(in: directory) else { return nil }
-        if !fileManager.fileExists(atPath: compiled.path) {
-            guard let temporary = try? MLModel.compileModel(at: package) else { return nil }
-            defer { try? fileManager.removeItem(at: temporary) }
-            guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
+        if !fileManager.fileExists(atPath: compiled.path), (try? compileModel(at: package, to: compiled)) == nil {
+            return nil
         }
         let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
         return cache.load(compiledURL: compiled, modificationDate: modDate) {
             CoreMLVocalMaskModel(compiledModelURL: $0).map(SpectralVocalSeparator.init)
         }
+    }
+
+    private static func compileModel(at package: URL, to destination: URL) throws {
+        let temporary = try MLModel.compileModel(at: package)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.moveItem(at: temporary, to: destination)
     }
 }

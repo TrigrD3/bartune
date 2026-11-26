@@ -3751,6 +3751,48 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testVocalIsolationKeepsFullMixEnvelopeAcrossACaptureGap() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        state.playbackAnchorPosition = 10
+        state.isPlaying = false
+        let capture = FakeAudioCapture()
+        let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
+        var deps = makeDependencies(capture: capture, runChunk: { input in
+            request.withLock { $0 = input }
+            return []
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { RightChannelVocalSeparator() }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // The right-channel stem is silent before the 200 ms gap and audible after it.
+        let firstHalf = [Float](repeating: 0.3, count: 24000)
+        capture.emit(samples: firstHalf, sampleRate: 48000, side: firstHalf, captureDelay: 0)
+        let buffered = await waitUntil { manager.bufferedSampleCount == firstHalf.count }
+        XCTAssertTrue(buffered)
+        state.playbackAnchorPosition = 10.7
+        capture.emit(samples: [Float](repeating: 0.5, count: 24000), sampleRate: 48000, side: firstHalf, captureDelay: 0)
+        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        XCTAssertTrue(processed)
+
+        let recognized = try XCTUnwrap(request.withLock { $0 })
+        let preGapSample = try XCTUnwrap(recognized.samples.dropFirst(4000).first)
+        XCTAssertLessThan(abs(preGapSample), 0.0001)
+        XCTAssertGreaterThan(try XCTUnwrap(recognized.samples.dropFirst(12000).first), 0.5)
+        let segments = manager.vocalEnvelope.segments
+        XCTAssertEqual(segments.count, 2)
+        XCTAssertEqual(try XCTUnwrap(segments.last?.start), 10.7, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(segments.first?.maxPeaks.dropFirst(25).first), 0.6, accuracy: 0.01)
+        XCTAssertEqual(try XCTUnwrap(segments.last?.maxPeaks.dropFirst(25).first), 0.8, accuracy: 0.01)
+    }
+
+    @MainActor
     func testChunkInferenceRunsAtBackgroundPriority() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment

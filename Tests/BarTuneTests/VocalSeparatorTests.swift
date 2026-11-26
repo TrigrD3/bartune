@@ -21,12 +21,14 @@ final class VocalSeparatorTests: XCTestCase {
         let windowFrameCount = 8
         let nbBins = SpectralSTFT.nbBins
         private(set) var calls = 0
+        private(set) var firstMixMagnitude: [Float]?
         var gainForCall: (Int) -> Float = { _ in 1 }
         var mutedCenterBin: Int?
 
         func predictVocalMagnitude(mixMagnitude: [Float]) -> [Float] {
             XCTAssertEqual(mixMagnitude.count, windowFrameCount * 2 * nbBins)
             calls += 1
+            if firstMixMagnitude == nil { firstMixMagnitude = mixMagnitude }
             var output = mixMagnitude.map { $0 * gainForCall(calls) }
             if let center = mutedCenterBin {
                 for frame in 0..<windowFrameCount {
@@ -55,6 +57,67 @@ final class VocalSeparatorTests: XCTestCase {
         XCTAssertEqual(spectrum.magnitudes.count, spectrum.real.count)
         XCTAssertEqual(output.count, input.count)
         XCTAssertLessThan(zip(output, input).map { abs($0 - $1) }.max() ?? .infinity, 1e-4)
+    }
+
+    func testNormalizationUsesUnityForInvalidPeaksAndUnrepresentableInverseGains() {
+        for peak: Float in [.infinity, .nan, .greatestFiniteMagnitude] {
+            XCTAssertEqual(AudioLevel.normalizationGain(peak: peak), 1)
+        }
+        for maxGain: Float in [.infinity, .nan, 0, -1, .leastNonzeroMagnitude] {
+            XCTAssertEqual(AudioLevel.normalizationGain(peak: 0.5, maxGain: maxGain), 1)
+        }
+    }
+
+    func testInfiniteInputFailsSeparationBeforeRescaling() {
+        let input = [Float](repeating: .infinity, count: 4096)
+        let separator = SpectralVocalSeparator(model: MaskPredictor())
+
+        XCTAssertThrowsError(try separator.vocals(left: input, right: input))
+    }
+
+    func testQuietStereoMixIsNormalizedTogetherBeforePredictionAndRestoredAfterSeparation() throws {
+        let louder = [Float](repeating: -0.03, count: 11317)
+        let quieter = [Float](repeating: 0.015, count: louder.count)
+        for (left, right) in [(louder, quieter), (quieter, louder)] {
+            let predictor = MaskPredictor()
+            predictor.gainForCall = { _ in 0.35 }
+
+            let output = try SpectralVocalSeparator(model: predictor).vocals(left: left, right: right)
+
+            let mix = try XCTUnwrap(predictor.firstMixMagnitude)
+            let leftPeak = try XCTUnwrap(mix.prefix(predictor.nbBins).max())
+            let rightPeak = try XCTUnwrap(mix[predictor.nbBins..<(2 * predictor.nbBins)].max())
+            XCTAssertEqual(max(leftPeak, rightPeak), 0.95 * 2048, accuracy: 0.1)
+            XCTAssertEqual(leftPeak / rightPeak, abs(left[0] / right[0]), accuracy: 1e-4)
+            XCTAssertLessThan(zip(output.left, left).map { abs($0 - $1 * 0.35) }.max() ?? .infinity, 1e-4)
+            XCTAssertLessThan(zip(output.right, right).map { abs($0 - $1 * 0.35) }.max() ?? .infinity, 1e-4)
+        }
+    }
+
+    func testNearSilentStereoMixIsNotAmplifiedBeforePrediction() throws {
+        let left = [Float](repeating: 0.00005, count: 11317)
+        let right = [Float](repeating: -0.000025, count: left.count)
+        let predictor = MaskPredictor()
+
+        let output = try SpectralVocalSeparator(model: predictor).vocals(left: left, right: right)
+
+        let mix = try XCTUnwrap(predictor.firstMixMagnitude)
+        XCTAssertEqual(try XCTUnwrap(mix.prefix(predictor.nbBins).max()), 0.00005 * 2048, accuracy: 1e-4)
+        XCTAssertLessThan(zip(output.left, left).map { abs($0 - $1) }.max() ?? .infinity, 1e-6)
+        XCTAssertLessThan(zip(output.right, right).map { abs($0 - $1) }.max() ?? .infinity, 1e-6)
+    }
+
+    func testQuietStereoGainIsCappedBeforePrediction() throws {
+        let left = [Float](repeating: 0.001, count: 11317)
+        let right = [Float](repeating: 0.0005, count: left.count)
+        let predictor = MaskPredictor()
+
+        let output = try SpectralVocalSeparator(model: predictor).vocals(left: left, right: right)
+
+        let mix = try XCTUnwrap(predictor.firstMixMagnitude)
+        XCTAssertEqual(try XCTUnwrap(mix.prefix(predictor.nbBins).max()), 0.1 * 2048, accuracy: 0.1)
+        XCTAssertLessThan(zip(output.left, left).map { abs($0 - $1) }.max() ?? .infinity, 1e-5)
+        XCTAssertLessThan(zip(output.right, right).map { abs($0 - $1) }.max() ?? .infinity, 1e-5)
     }
 
     func testSpectralMaskAttenuatesBothChannelsWithoutChangingPhase() throws {
@@ -175,6 +238,44 @@ final class VocalSeparatorTests: XCTestCase {
         }
         XCTAssertFalse(VocalSeparatorModel.isInstalled(in: directory))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), [archive.lastPathComponent])
+    }
+
+    func testModelCompilationAllowsConcurrentRemoval() throws {
+        let root = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent(VocalSeparatorModel.packageName)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: false)
+        try Data("fixture".utf8).write(to: source.appendingPathComponent("Manifest.json"))
+        let archive = root.appendingPathComponent("separator.zip")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", source.path, archive.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        XCTAssertEqual(ditto.terminationStatus, 0)
+        let digest = try AppUpdateService.sha256Hex(ofFileAt: archive)
+
+        let destination = root.appendingPathComponent("install")
+        let otherDirectory = root.appendingPathComponent("remove")
+        let otherModel = otherDirectory.appendingPathComponent(VocalSeparatorModel.compiledName)
+        try FileManager.default.createDirectory(at: otherModel, withIntermediateDirectories: true)
+        let removed = DispatchSemaphore(value: 0)
+
+        try VocalSeparatorModel.install(archive: archive, expectedSHA256: digest, into: destination) { _, output in
+            DispatchQueue.global().async {
+                do {
+                    try VocalSeparatorModel.remove(from: otherDirectory)
+                } catch {
+                    XCTFail("Removal failed: \(error)")
+                }
+                removed.signal()
+            }
+            XCTAssertEqual(removed.wait(timeout: .now() + 3), .success)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+        }
+
+        XCTAssertFalse(VocalSeparatorModel.isInstalled(in: otherDirectory))
+        XCTAssertTrue(VocalSeparatorModel.hasPackage(in: destination))
     }
 
     func testCompiledCacheAloneIsRemovableAndHasNoPackage() throws {
