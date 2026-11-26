@@ -19,6 +19,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   LyricTimingEditorView.swift # Manual Lyric Timing Editor window (tap-to-time lines/words, fine-tune, per-song source picker)
   LyricsForcedAligner.swift # Lyrics Alignment engine: CTC Viterbi of romanized lyrics over a Core ML acoustic model (Neural Engine); syllable splits (Hangul, hanzi, Latin vowel groups) for Syllable Timing
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
+  AudioOutputLatency.swift  # CoreAudio default-output latency monitoring for the overlay clock
   VocalWaveform.swift      # Voice-band vocal envelope (stereo centre-weighted) and word timing refinement for silence gating and held notes
   VocalPitch.swift         # Background vDSP/YIN pitch and harmonicity contour for held-note endings and vocal onset locking
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
