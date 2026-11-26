@@ -173,7 +173,7 @@ struct VocalEnvelope {
     }
 
     /// How much louder (dB) the 0.25 s after `time` is than 0.35–0.05 s before it; nil unless one segment holds both.
-    /// A line whose words the aligner barely heard is locked only when its start sits on such a rise.
+    /// Used alongside harmonicity to decide whether a nearly confident line starts on a vocal onset.
     func onsetRise(at time: Double) -> Float? {
         guard let segment = segment(covering: (time - 0.35)...(time + 0.25)) else { return nil }
         func mean(_ from: Double, _ to: Double) -> Float? {
@@ -306,6 +306,7 @@ enum WaveformTimingRefiner {
     struct Stats: Equatable, Sendable {
         var extended = 0
         var dropped = 0
+        var harmonicityTrimmed = 0
     }
 
     /// A word whose loudest frame is this close to the song's quietest frames was heard in silence.
@@ -321,12 +322,16 @@ enum WaveformTimingRefiner {
     static let minimumSignalLevel: Float = -80
     static let maxExtension = 1.5
     static let minimumGap = 0.02
+    private static let unvoicedTailFrames = 5
+    private static let quietFloorMargin: Float = 2
+    private static let shortUnvoicedWord = 0.12
 
     /// `timingError` is about how far (seconds) the engine's word times can be off; silence is judged
     /// that far around each word.
     static func refine(
         _ words: [RecognizedAudioWord],
         envelope: VocalEnvelope,
+        pitchContour: VocalPitchContour? = nil,
         timingError: Double
     ) -> (words: [RecognizedAudioWord], stats: Stats) {
         var stats = Stats()
@@ -340,12 +345,18 @@ enum WaveformTimingRefiner {
         var refined: [RecognizedAudioWord] = []
         for word in words.sorted(by: { $0.startTime < $1.startTime }) {
             let slack = timingError + 0.1
-            if let gateLevel,
-               let segment = envelope.segment(covering: word.startTime...word.endTime),
-               let peak = maxLevel(in: segment, from: word.startTime - slack, to: word.endTime + slack),
+            let from = word.startTime - slack
+            let to = word.endTime + slack
+            let wordRange = word.startTime...word.endTime
+            if let floor, let gateLevel,
+               let segment = envelope.segment(covering: wordRange),
+               let peak = maxLevel(in: segment, from: from, to: to),
                peak < gateLevel {
-                stats.dropped += 1
-                continue
+                let clarity = pitchContour?.segment(covering: wordRange)?.frames(from: from, to: to).max()
+                if isSilent(word, peak: peak, floor: floor, clarity: clarity) {
+                    stats.dropped += 1
+                    continue
+                }
             }
             refined.append(word)
         }
@@ -366,7 +377,25 @@ enum WaveformTimingRefiner {
             while frame <= lastFrame, frame >= 0, segment.levels[frame] >= peak - sustainDrop {
                 frame += 1
             }
-            let sustainEnd = min(limit, segment.time(ofFrame: frame))
+            var sustainEnd = min(limit, segment.time(ofFrame: frame))
+            let wordEnd = word.endTime
+            if sustainEnd > wordEnd,
+               let pitchContour,
+               let pitchSegment = pitchContour.segment(covering: wordEnd...wordEnd),
+               let vowelClarity = pitchSegment.frames(from: max(word.startTime, wordEnd - holdReach), to: wordEnd).max() {
+                if vowelClarity >= VocalPitchContour.voicedThreshold {
+                    // Live capture can append loudness before the pitch worker catches up.
+                    sustainEnd = min(sustainEnd, pitchSegment.end)
+                    if let unvoicedStart = unvoicedTailStart(in: pitchSegment, from: wordEnd, before: sustainEnd) {
+                        sustainEnd = unvoicedStart
+                        stats.harmonicityTrimmed += 1
+                    }
+                } else if let wordClarity = pitchContour.maxHarmonicity(from: word.startTime, to: wordEnd),
+                          wordClarity >= VocalPitchContour.voicedThreshold {
+                    // A voiced word that already ends in a consonant has no held vowel to extend.
+                    continue
+                }
+            }
             if sustainEnd - end >= segment.step * 2 {
                 refined[index] = RecognizedAudioWord(
                     text: word.text,
@@ -380,6 +409,36 @@ enum WaveformTimingRefiner {
             }
         }
         return (refined, stats)
+    }
+
+    private static func isSilent(_ word: RecognizedAudioWord, peak: Float, floor: Float, clarity: Float?) -> Bool {
+        guard let clarity else { return true }
+        // Quiet consonants and whispered words can have very little periodicity.
+        return clarity <= 0.05 && (peak < minimumSignalLevel
+            || (peak < floor + quietFloorMargin && word.duration >= shortUnvoicedWord))
+    }
+
+    private static func unvoicedTailStart(
+        in segment: VocalPitchContour.Segment,
+        from end: Double,
+        before limit: Double
+    ) -> Double? {
+        let first = max(0, segment.frame(at: end))
+        let last = min(segment.harmonicity.count - 1, segment.frame(at: limit) - 1)
+        guard first <= last else { return nil }
+        var consecutive = 0
+        for frame in first...last {
+            if segment.harmonicity[frame] < VocalPitchContour.unvoicedFloor {
+                consecutive += 1
+                if consecutive == unvoicedTailFrames {
+                    let start = segment.start + Double(frame - consecutive + 1) * segment.step
+                    return max(end, start)
+                }
+            } else {
+                consecutive = 0
+            }
+        }
+        return nil
     }
 
     private static func maxLevel(in segment: VocalEnvelope.Segment, from start: Double, to end: Double) -> Float? {

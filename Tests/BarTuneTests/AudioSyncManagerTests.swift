@@ -604,10 +604,15 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(anchorsSeen.withLock { $0.last }, [0], "only the locked line is kept as it is")
     }
 
-    /// Locked line IDs after one 7 s chunk from 10 s where line 1 ("Gamma delta", from 15.7 s) is nearly
-    /// confident and the voice comes in at `voiceStart`.
+    /// Results after one 7 s chunk from 10 s where line 1 ("Gamma delta", from 15.7 s) is nearly
+    /// confident and the sound comes in at `soundStart`.
     @MainActor
-    private func lockedAfterNearlyConfidentLine(voiceStart: Double) async throws -> [Int]? {
+    private func nearlyConfidentLineResult(
+        soundStart: Double,
+        percussive: Bool = false,
+        wideTone: Bool = false,
+        tailNoiseStart: Double? = nil
+    ) async throws -> (locks: [Int], voicedPercent: Float?, pitchFrames: Int, onsetRise: Float?, trimmed: Int, lastWordEnd: Double?, report: String) {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
@@ -620,35 +625,122 @@ final class AudioSyncManagerTests: XCTestCase {
         let fakeCapture = FakeAudioCapture()
         var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 7.0)
         deps.launchLyricsAligner = { _, _ in
-            FakeChunkEngine(confident: [], nearlyConfident: [1]) { _ in words }
+            FakeChunkEngine(confident: [], nearlyConfident: [1]) { _ in
+                XCTAssertFalse(Thread.isMainThread)
+                return words
+            }
         }
         let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
-        _ = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
 
         let rate = 16000
+        var noiseState: UInt32 = 0x1234_5678
         let audio = (0..<(7 * rate)).map { index -> Float in
             let time = 10.0 + Double(index) / Double(rate)
-            let amplitude: Float = time >= voiceStart ? 0.5 : 0.005
+            let amplitude: Float = time >= soundStart ? 0.5 : 0.005
+            if percussive || (tailNoiseStart.map { time >= $0 } ?? false) {
+                noiseState = noiseState &* 1_664_525 &+ 1_013_904_223
+                return amplitude * (Float(noiseState >> 8) / Float(1 << 23) - 1)
+            }
             return amplitude * sin(2 * Float.pi * 440 * Float(index) / Float(rate))
         }
         for second in 0..<7 {
-            fakeCapture.emit(samples: Array(audio[(second * rate)..<((second + 1) * rate)]), sampleRate: Double(rate))
+            let samples = Array(audio[(second * rate)..<((second + 1) * rate)])
+            fakeCapture.emit(samples: samples, sampleRate: Double(rate), side: wideTone ? samples : [])
         }
-        _ = await waitUntil(timeout: 5) { cache.load(trackId: self.sampleTrack().id) != nil }
-        return try XCTUnwrap(cache.load(trackId: sampleTrack().id)).lockedLineIDs?.sorted()
+        let processed = await waitUntil(timeout: 5) {
+            cache.load(trackId: self.sampleTrack().id) != nil && manager.diagnostics.snapshot?.voicedFramePercent != nil
+        }
+        XCTAssertTrue(processed)
+        let record = try XCTUnwrap(cache.load(trackId: sampleTrack().id))
+        return (
+            locks: record.lockedLineIDs?.sorted() ?? [],
+            voicedPercent: manager.diagnostics.snapshot?.voicedFramePercent,
+            pitchFrames: manager.vocalPitchContour.segments.reduce(0) { $0 + $1.f0Hz.count },
+            onsetRise: manager.vocalEnvelope.onsetRise(at: 15.7),
+            trimmed: manager.diagnostics.snapshot?.waveformRefinement?.harmonicityTrimmed ?? 0,
+            lastWordEnd: record.lines[1].words.last.map { $0.timestamp + ($0.duration ?? 0) },
+            report: manager.diagnostics.snapshot?.report() ?? ""
+        )
     }
 
     @MainActor
     func testLyricsAlignmentLocksANearlyConfidentLineThatStartsOnAVocalOnset() async throws {
-        let locked = try await lockedAfterNearlyConfidentLine(voiceStart: 15.7)
-        XCTAssertEqual(locked, [1])
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7)
+        XCTAssertEqual(result.locks, [1])
+        XCTAssertGreaterThan(result.pitchFrames, 0)
+        XCTAssertGreaterThan(result.voicedPercent ?? 0, 0)
     }
 
     @MainActor
     func testLyricsAlignmentDoesNotLockANearlyConfidentLineInsideAHeldNote() async throws {
-        let locked = try await lockedAfterNearlyConfidentLine(voiceStart: 10.0)
-        XCTAssertEqual(locked, [])
+        let result = try await nearlyConfidentLineResult(soundStart: 10.0)
+        XCTAssertEqual(result.locks, [])
+    }
+
+    @MainActor
+    func testLyricsAlignmentDoesNotLockPercussiveOnsetAsSinging() async throws {
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7, percussive: true)
+        XCTAssertGreaterThan(result.onsetRise ?? 0, AudioSyncManager.onsetLockRise)
+        XCTAssertGreaterThan(result.pitchFrames, 0)
+        XCTAssertEqual(result.locks, [])
+    }
+
+    @MainActor
+    func testBackgroundPitchSuppressesWideStereoTone() async throws {
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7, wideTone: true)
+        XCTAssertGreaterThan(result.onsetRise ?? 0, AudioSyncManager.onsetLockRise)
+        XCTAssertEqual(result.pitchFrames, 700)
+        XCTAssertEqual(try XCTUnwrap(result.voicedPercent), 0, accuracy: 0.001)
+        XCTAssertEqual(result.locks, [])
+    }
+
+    @MainActor
+    func testLivePitchTrimsHeldTailWhenLoudNoiseFollowsVowel() async throws {
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7, tailNoiseStart: 16.55)
+        XCTAssertEqual(result.locks, [1])
+        XCTAssertGreaterThan(result.trimmed, 0)
+        XCTAssertLessThan(try XCTUnwrap(result.lastWordEnd), 16.7)
+        XCTAssertTrue(result.report.contains("Held notes trimmed by harmonicity:"))
+        XCTAssertTrue(result.report.contains("Voiced frames:"))
+    }
+
+    func testNearlyConfidentLockRequiresVoicingAtLoudOnset() {
+        let rate = 16000
+        let audio = (0..<(2 * rate)).map { index -> Float in
+            let amplitude: Float = index >= rate ? 0.5 : 0.005
+            return amplitude * sin(2 * Float.pi * 440 * Float(index) / Float(rate))
+        }
+        var envelope = VocalEnvelope()
+        envelope.append(mid: audio, side: [], sampleRate: Double(rate), startTime: 0, rate: 1)
+        XCTAssertGreaterThan(envelope.onsetRise(at: 1) ?? 0, AudioSyncManager.onsetLockRise)
+
+        let line = LyricLine(id: 1, timestamp: 1, duration: 0.8, text: "Gamma delta", words: [
+            WordTimestamp(timestamp: 1, duration: 0.35, text: "Gamma "),
+            WordTimestamp(timestamp: 1.4, duration: 0.4, text: "delta"),
+        ])
+        var pitch = VocalPitchContour()
+        pitch.merge(.init(start: 0, step: 0.01, f0Hz: [Float](repeating: 0, count: 200), harmonicity: [Float](repeating: 0.1, count: 200)))
+        XCTAssertFalse(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: envelope, pitchContour: pitch))
+
+        XCTAssertTrue(AudioSyncManager.locks(line, confident: [1], nearlyConfident: [], envelope: envelope, pitchContour: pitch))
+
+        pitch = VocalPitchContour()
+        pitch.merge(.init(
+            start: 0, step: 0.01,
+            f0Hz: [Float](repeating: 0, count: 100) + [Float](repeating: 440, count: 100),
+            harmonicity: [Float](repeating: 0.1, count: 100) + [Float](repeating: 0.9, count: 100)
+        ))
+        XCTAssertTrue(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: envelope, pitchContour: pitch))
+
+        let steadyAudio = audio.indices.map { index in Float(0.5) * sin(2 * Float.pi * 440 * Float(index) / Float(rate)) }
+        var steadyEnvelope = VocalEnvelope()
+        steadyEnvelope.append(mid: steadyAudio, side: [], sampleRate: Double(rate), startTime: 0, rate: 1)
+        XCTAssertLessThan(abs(steadyEnvelope.onsetRise(at: 1) ?? .infinity), AudioSyncManager.onsetLockRise)
+        XCTAssertTrue(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: steadyEnvelope, pitchContour: pitch))
     }
 
     func testLyricsAlignmentDoesNotLockRunawayWordTiming() {
