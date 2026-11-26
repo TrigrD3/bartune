@@ -29,8 +29,9 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
     var note: String?
     /// Latest delay between a captured sample and its delivery to BarTune, corrected for in word timings.
     var captureDelay: Double?
-    /// Word timings changed by the vocal envelope on the latest alignment.
+    /// Word timings changed by vocal loudness and harmonicity on the latest alignment.
     var waveformRefinement: WaveformTimingRefiner.Stats?
+    var voicedFramePercent: Float?
     var updatedAt = Date()
 
     mutating func record(words: [RecognizedAudioWord], replacing: Bool) {
@@ -100,6 +101,12 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
                 "Waveform refinement: \(waveformRefinement.extended) notes held, "
                     + "\(waveformRefinement.dropped) words in silence dropped"
             )
+        }
+        if let trimmed = waveformRefinement?.harmonicityTrimmed, trimmed > 0 {
+            out.append("Held notes trimmed by harmonicity: \(trimmed)")
+        }
+        if let voicedFramePercent {
+            out.append("Voiced frames: \(String(format: "%.1f", voicedFramePercent))%")
         }
         if let note {
             out.append("Note: \(note)")

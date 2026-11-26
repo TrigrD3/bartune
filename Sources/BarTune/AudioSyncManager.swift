@@ -627,6 +627,7 @@ final class AudioSyncManager {
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     /// Voice-band loudness of this play's captured audio, used to refine heard word timings.
     private(set) var vocalEnvelope = VocalEnvelope()
+    private(set) var vocalPitchContour = VocalPitchContour()
     private var vocalEnvelopeCache = LRUMemoryCache<VocalEnvelope>(capacity: 12)
     private var vocalEnvelopeRevision: UInt64 = 0
     private var cachedDisplayEnvelope: (trackId: String, revision: UInt64, envelope: VocalEnvelope?)?
@@ -681,6 +682,7 @@ final class AudioSyncManager {
 
     // Audio chunk state
     private var audioSampleBuffer: [Float] = []
+    private var audioSideBuffer: [Float] = []
     private var chunkStartPos: Double?
     private var chunkPlaybackRate: Double = 1.0
     private var pendingSeekPos: Double?
@@ -748,6 +750,11 @@ final class AudioSyncManager {
         }
     }
 
+    private func clearAudioBuffers(keepingCapacity: Bool) {
+        audioSampleBuffer.removeAll(keepingCapacity: keepingCapacity)
+        audioSideBuffer.removeAll(keepingCapacity: keepingCapacity)
+    }
+
     func stop() {
         cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
@@ -763,7 +770,7 @@ final class AudioSyncManager {
         pendingVocalEnvelopeNotification = nil
         chunkEngine?.shutdown()
         chunkEngine = nil
-        audioSampleBuffer.removeAll(keepingCapacity: false)
+        clearAudioBuffers(keepingCapacity: false)
         chunkStartPos = nil
         chunkPlaybackRate = 1.0
         pendingSeekPos = nil
@@ -793,6 +800,7 @@ final class AudioSyncManager {
         // Always start a fresh live envelope so WaveformTimingRefiner never mixes levels across plays;
         // `vocalEnvelope(for:)` falls back to `vocalEnvelopeCache` for timeline display until new frames arrive.
         vocalEnvelope = VocalEnvelope()
+        vocalPitchContour = VocalPitchContour()
         if forceResync {
             vocalEnvelopeCache.removeValue(forKey: track.id)
         }
@@ -894,7 +902,7 @@ final class AudioSyncManager {
         guard isLiveSyncActive, previousTargets != updatedTargets else { return }
         capture.stop()
         // Buffered samples belong to the old capture's timeline; the next sample starts a new chunk.
-        audioSampleBuffer.removeAll(keepingCapacity: true)
+        clearAudioBuffers(keepingCapacity: true)
         chunkStartPos = nil
         // Deliveries still queued from the old capture must not start the new chunk.
         seekBoundary = ProcessInfo.processInfo.systemUptime
@@ -989,7 +997,7 @@ final class AudioSyncManager {
             let seeked = abs(position - expected) > Self.seekTolerance
             let rateChanged = abs(playbackRate - chunkPlaybackRate) > 0.01
             if seeked || rateChanged {
-                audioSampleBuffer.removeAll(keepingCapacity: true)
+                clearAudioBuffers(keepingCapacity: true)
                 chunkStartPos = nil
                 chunkPlaybackRate = playbackRate
                 pendingSeekPos = position
@@ -1059,7 +1067,7 @@ final class AudioSyncManager {
         modelMayBeCached = true
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
-        audioSampleBuffer.removeAll(keepingCapacity: true)
+        clearAudioBuffers(keepingCapacity: true)
         chunkStartPos = nil
         chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
         pendingSeekPos = nil
@@ -1121,6 +1129,10 @@ final class AudioSyncManager {
                 else { return }
                 let samples = audio.samples
                 let sampleRate = audio.sampleRate
+                if sampleRate != self.activeSampleRate, !self.audioSampleBuffer.isEmpty {
+                    self.clearAudioBuffers(keepingCapacity: true)
+                    self.chunkStartPos = nil
+                }
                 self.activeSampleRate = sampleRate
                 if sampleRate > 0 {
                     self.capturedSeconds += Double(samples.count) / sampleRate
@@ -1142,7 +1154,7 @@ final class AudioSyncManager {
                         + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
                     if abs(livePos - expectedStart) > Self.seekTolerance {
                         // Dropped audio gap: start a fresh chunk & envelope segment at the measured position.
-                        self.audioSampleBuffer.removeAll(keepingCapacity: true)
+                        self.clearAudioBuffers(keepingCapacity: true)
                         self.chunkStartPos = livePos
                         self.chunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
                     }
@@ -1176,12 +1188,18 @@ final class AudioSyncManager {
                     }
                 }
                 self.audioSampleBuffer.append(contentsOf: samples)
+                if audio.side.count == samples.count {
+                    self.audioSideBuffer.append(contentsOf: audio.side)
+                } else {
+                    self.audioSideBuffer.append(contentsOf: repeatElement(0, count: samples.count))
+                }
 
                 let targetFrames = max(1, Int(sampleRate * self.chunkDurationSeconds))
                 let maxFrames = targetFrames * 2
                 if self.audioSampleBuffer.count > maxFrames {
                     let overflow = self.audioSampleBuffer.count - maxFrames
                     self.audioSampleBuffer.removeFirst(overflow)
+                    self.audioSideBuffer.removeFirst(overflow)
                     if let startPos = self.chunkStartPos, sampleRate > 0 {
                         self.chunkStartPos = startPos + (Double(overflow) / sampleRate) * self.chunkPlaybackRate
                     }
@@ -1213,7 +1231,9 @@ final class AudioSyncManager {
 
         let frameCount = min(targetFrames, audioSampleBuffer.count)
         let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
+        let sideChunk = Array(audioSideBuffer.prefix(frameCount))
         audioSampleBuffer.removeFirst(frameCount)
+        audioSideBuffer.removeFirst(frameCount)
         if audioSampleBuffer.isEmpty {
             chunkStartPos = nil
         } else if sampleRate > 0 {
@@ -1223,9 +1243,13 @@ final class AudioSyncManager {
 
         let requestSampleRate = Int(sampleRate)
         let requestPlaybackRate = chunkPlaybackRate
-        // Run normalization, Core ML inference, and CTC Viterbi at `.background` QoS so multi-threaded
+        // Run pitch analysis, normalization, Core ML inference, and CTC Viterbi at `.background` QoS so multi-threaded
         // CPU fallback (libBNNS) stays on efficiency cores and never preempts interactive UI threads.
         chunkProcessingTask = Task.detached(priority: .background) { [weak self] in
+            let pitch = requestSampleRate == VocalPitchContour.sampleRate
+                ? VocalPitchContour.analyze(mid: rawChunk, side: sideChunk, start: chunkStart, rate: requestPlaybackRate)
+                : nil
+            guard !Task.isCancelled else { return }
             let chunk = AudioLevel.normalizedForRecognition(rawChunk)
             let request = AudioChunkRequest(
                 samples: chunk,
@@ -1254,7 +1278,14 @@ final class AudioSyncManager {
                       self.isLiveSyncActive,
                       self.state.audioSyncEngine == .lyricsAlignment
                 else { return }
-                self.diagnostics.update { $0.record(words: words, replacing: false) }
+                if let pitch {
+                    self.vocalPitchContour.merge(pitch)
+                }
+                let voicedFramePercent = self.vocalPitchContour.voicedFraction.map { $0 * 100 }
+                self.diagnostics.update {
+                    $0.voicedFramePercent = voicedFramePercent
+                    $0.record(words: words, replacing: false)
+                }
                 self.recognizedWords.append(contentsOf: words)
                 var newAttempts: Set<Int> = []
                 if let reporter = engine as? LineAttemptReporting {
@@ -1312,9 +1343,14 @@ final class AudioSyncManager {
         return Self.mergeHeardWords(prior: unattemptedPriorWords, current: recognizedWords)
     }
 
-    /// Every word heard, refined against this play's vocal envelope.
+    /// Every word heard, refined against this play's vocal loudness and harmonicity.
     private func refinedHeardWords() -> [RecognizedAudioWord] {
-        let (words, stats) = WaveformTimingRefiner.refine(allHeardWords, envelope: vocalEnvelope, timingError: 0.06)
+        let (words, stats) = WaveformTimingRefiner.refine(
+            allHeardWords,
+            envelope: vocalEnvelope,
+            pitchContour: vocalPitchContour,
+            timingError: 0.06
+        )
         diagnostics.update { $0.waveformRefinement = stats }
         return words
     }
@@ -1646,9 +1682,16 @@ final class AudioSyncManager {
     /// (English): with `onsetLockConfidence` it adds a fifth more locked lines, about 93% of them within
     /// 300 ms of the sung start on songs it was not tuned on.
     nonisolated static let onsetLockRise: Float = 3
+    private nonisolated static let harmonicityLockRise: Float = 0.35
 
     /// A well-timed line locks when confident or when nearly confident and starting on a vocal onset.
-    nonisolated static func locks(_ line: LyricLine, confident: Set<Int>, nearlyConfident: Set<Int>, envelope: VocalEnvelope) -> Bool {
+    nonisolated static func locks(
+        _ line: LyricLine,
+        confident: Set<Int>,
+        nearlyConfident: Set<Int>,
+        envelope: VocalEnvelope,
+        pitchContour: VocalPitchContour? = nil
+    ) -> Bool {
         guard !line.words.contains(where: { ($0.duration ?? 0) <= 0 && !LyricsAudioAligner.normalizeToken($0.text).isEmpty }) else {
             return false
         }
@@ -1665,9 +1708,21 @@ final class AudioSyncManager {
               line.timestamp + (line.duration ?? 0) - last.end <= maxWordSpan
         else { return false }
         if confident.contains(line.id) { return true }
-        guard nearlyConfident.contains(line.id), let rise = envelope.onsetRise(at: first.start)
-        else { return false }
-        return rise >= onsetLockRise
+        guard nearlyConfident.contains(line.id) else { return false }
+        let onsetEnd = first.start + 0.25
+        if let pitchContour, let clarity = pitchContour.meanHarmonicity(from: first.start, to: onsetEnd) {
+            if clarity < VocalPitchContour.unvoicedFloor,
+               let peak = pitchContour.maxHarmonicity(from: first.start, to: onsetEnd),
+               peak < VocalPitchContour.voicedThreshold {
+                return false
+            }
+            if clarity >= VocalPitchContour.voicedThreshold,
+               let harmonicityRise = pitchContour.harmonicityRise(at: first.start),
+               harmonicityRise >= harmonicityLockRise {
+                return true
+            }
+        }
+        return (envelope.onsetRise(at: first.start) ?? 0) >= onsetLockRise
     }
 
     /// Lyrics Alignment locks each confidently aligned line and keeps listening until no further play could
@@ -1688,7 +1743,8 @@ final class AudioSyncManager {
             line,
             confident: confidentLineIDs,
             nearlyConfident: nearlyConfidentLineIDs,
-            envelope: vocalEnvelope
+            envelope: vocalEnvelope,
+            pitchContour: vocalPitchContour
         ) {
             lockedThisPlay[line.id] = line
             lockedNewLine = true
