@@ -21,7 +21,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   AudioChroma.swift        # Bounded 12-bin chroma profiles for Lyrics Alignment audio chunks; recovers timing for repeated passages against same-lyric locked lines
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
   AudioOutputLatency.swift  # CoreAudio default-output latency monitoring for the overlay clock
-  VocalSeparator.swift     # Optional SigSep Open-Unmix UMX-HQ Core ML vocal isolation, Swift spectral mask, audio resampling and idle model cache
+  VocalSeparator.swift     # Optional Open-Unmix UMX-HQ isolation, shared stereo gain and spectral masks, resampling, and download-time Core ML compilation
   VocalWaveform.swift      # Voice-band vocal envelope (stereo centre-weighted) and word timing refinement for silence gating and held notes
   VocalPitch.swift         # Background vDSP/YIN pitch and harmonicity contour for held-note endings and vocal onset locking
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers

@@ -1304,14 +1304,17 @@ enum LyricsAlignerModel {
         }.value
     }
 
-    /// Verifies and unpacks a zipped Core ML package into `directory`, replacing any earlier model.
+    /// Verifies and unpacks a zipped Core ML package, optionally compiling it before replacing the installed artifacts.
     static func install(
         archive: URL,
         expectedSHA256: String,
         into directory: URL,
         packageName: String = packageName,
         compiledName: String = compiledName,
-        fileManager: FileManager = .default
+        fileManager: FileManager = .default,
+        lock: NSLock = modelFilesLock,
+        onInstalled: (() -> Void)? = nil,
+        compile: ((URL, URL) throws -> Void)? = nil
     ) throws {
         guard try AppUpdateService.sha256Hex(ofFileAt: archive) == expectedSHA256.lowercased() else {
             throw InstallError.checksumMismatch
@@ -1329,11 +1332,14 @@ enum LyricsAlignerModel {
         guard ditto.terminationStatus == 0, fileManager.fileExists(atPath: unpacked.path) else {
             throw InstallError.unpackFailed
         }
-        try modelFilesLock.withLock {
+        let stagedCompiled = staging.appendingPathComponent(compiledName)
+        try compile?(unpacked, stagedCompiled)
+        try lock.withLock {
             let package = directory.appendingPathComponent(packageName)
             let compiled = directory.appendingPathComponent(compiledName)
             let backupPrefix = ".backup-\(UUID().uuidString)-"
             var backups: [(original: URL, backup: URL)] = []
+            var installed: [URL] = []
             do {
                 for original in [package, compiled] {
                     let backup = directory.appendingPathComponent(backupPrefix + original.lastPathComponent)
@@ -1344,10 +1350,22 @@ enum LyricsAlignerModel {
                         continue
                     }
                 }
-                try fileManager.moveItem(at: unpacked, to: package)
+                var artifacts = [(unpacked, package)]
+                if compile != nil { artifacts.append((stagedCompiled, compiled)) }
+                for (source, destination) in artifacts {
+                    try fileManager.moveItem(at: source, to: destination)
+                    installed.append(destination)
+                }
             } catch {
                 let installError = error
                 var restoreError: Error?
+                for artifact in installed.reversed() {
+                    do {
+                        try fileManager.removeItem(at: artifact)
+                    } catch {
+                        restoreError = restoreError ?? error
+                    }
+                }
                 for (original, backup) in backups.reversed() {
                     do {
                         try fileManager.moveItem(at: backup, to: original)
@@ -1367,6 +1385,7 @@ enum LyricsAlignerModel {
                 try? fileManager.removeItem(at: backup)
             }
             if compiledName == Self.compiledName { releaseCachedModel() }
+            onInstalled?()
         }
     }
 

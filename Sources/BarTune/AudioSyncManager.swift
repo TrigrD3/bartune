@@ -56,9 +56,15 @@ enum AudioLevel {
     /// player leaves too little signal for recognition. Near-silence is left as is so its noise isn't amplified.
     static func normalizedForRecognition(_ samples: [Float], maxGain: Float = 100) -> [Float] {
         let peak = samples.reduce(Float(0)) { max($0, abs($1)) }
-        guard peak > 0.0001 else { return samples }
+        let gain = normalizationGain(peak: peak, maxGain: maxGain)
+        return gain == 1 ? samples : samples.map { $0 * gain }
+    }
+
+    static func normalizationGain(peak: Float, maxGain: Float = 100) -> Float {
+        guard peak.isFinite, peak > 0.0001, maxGain.isFinite, maxGain > 0 else { return 1 }
         let gain = min(0.95 / peak, maxGain)
-        return samples.map { $0 * gain }
+        // The vocal separator also needs a representable inverse to restore the capture level.
+        return gain.isFinite && gain > 0 && (1 / gain).isFinite ? gain : 1
     }
 }
 
@@ -1278,12 +1284,14 @@ final class AudioSyncManager {
         let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
         let sideChunk = audioSideBuffer.count == audioSampleBuffer.count ? Array(audioSideBuffer.prefix(frameCount)) : []
         let spans = captureSpanStarts.prefix { $0.offset < frameCount }
+        let separator = vocalSeparator
+        // The envelope location refers to its newest segment. A capture gap can put that segment
+        // on a different time grid from the chunk, so keep the full-mix preview in that case.
+        let envelopeLocation = separator != nil && captureSpanStarts.count == 1 ? vocalEnvelope.frameLocation(at: chunkStart) : nil
         removeBufferedSamplePrefix(frameCount, sampleRate: sampleRate)
         if isFinal { sentFinalChunk = true }
 
         let requestPlaybackRate = chunkPlaybackRate
-        let separator = vocalSeparator
-        let envelopeLocation = separator.flatMap { _ in vocalEnvelope.frameLocation(at: chunkStart) }
         let resample = dependencies.resampleForRecognition
         // Run vocal isolation, pitch analysis, chroma extraction, normalization, Core ML inference,
         // and CTC Viterbi at `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on
