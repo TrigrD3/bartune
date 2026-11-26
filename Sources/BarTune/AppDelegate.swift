@@ -475,7 +475,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             state.refreshActiveLineForCurrentPosition()
         case let .useAutomatic(lines):
             state.setTrack(track, lyrics: lines)
-            audioSyncManager.handleTrackLoaded(track: track, rawLines: lines)
+            audioSyncManager.handleTrackLoaded(track: track, rawLines: lines) { [weak self] in
+                guard lines.isEmpty, let self, self.state.translateLyrics, !self.state.rawLyricLines.isEmpty else { return }
+                self.translateCurrentTrack()
+            }
             state.refreshActiveLineForCurrentPosition()
         }
         if state.translateLyrics, !state.rawLyricLines.isEmpty {

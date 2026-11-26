@@ -270,6 +270,19 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         return Set(attemptedLineIDs ?? [])
     }
 
+    var hasLowYieldLocks: Bool {
+        engine == .lyricsAlignment && Self.hasLowYieldLocks(
+            lockedIDs: Set(lockedLineIDs ?? []), attemptedIDs: Set(attemptedLineIDs ?? [])
+        )
+    }
+
+    static func hasLowYieldLocks(lockedIDs: Set<Int>, attemptedIDs: Set<Int>) -> Bool {
+        guard (1...4).contains(lockedIDs.count) else { return false }
+        let missed = attemptedIDs.subtracting(lockedIDs).count
+        // Wait for a substantial sample, then reject locks on fewer than one in five heard lines.
+        return missed >= 10 && missed > lockedIDs.count * 4
+    }
+
     /// A reliable record that matched enough lines to skip listening again on the next play.
     func isComplete(expectedSourceLineCount: Int?) -> Bool {
         guard isReliable(expectedSourceLineCount: expectedSourceLineCount) else { return false }
@@ -291,6 +304,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     }
 
     private func isReliable(expectedSourceLineCount: Int?, minimumAlignedLineCount: Int) -> Bool {
+        guard !hasLowYieldLocks else { return false }
         let nonEmpty = lines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         guard !nonEmpty.isEmpty else { return false }
         let offsetLimit = engine == .lyricsAlignment && Set(lockedLineIDs ?? []).count >= 2

@@ -453,6 +453,8 @@ protocol LineAttemptReporting: AnyObject {
     var confidentLineIDs: Set<Int> { get }
     /// Aligned lines just below that, locked only when the vocal envelope rises at their start.
     var nearlyConfidentLineIDs: Set<Int> { get }
+    /// Releases a provisional offset after a sustained run of attempted lines with no new locks.
+    func discardStaleOffset(lockedLineIDs: Set<Int>) -> Bool
 }
 
 final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
@@ -497,12 +499,13 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private let holdBackSamples: Int
     private let lock = NSLock()
     private var done = Set<Int>()
-    private var missedBeforeCoarseMatch = Set<Int>()
     private let anchoredIndices: Set<Int>
     private var confident = Set<Int>()
     private var nearlyConfident = Set<Int>()
 
     // The current run of contiguous audio; a seek or rate change starts a new one.
+    private var skippedInRun = Set<Int>()
+    private var doneAtRunStart = Set<Int>()
     private var runStartTime = 0.0
     private var runRate = 1.0
     private var expectedNextChunkStart: Double?
@@ -645,6 +648,30 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         return Set(nearlyConfident.subtracting(confident).map { lines[$0].id })
     }
 
+    func discardStaleOffset(lockedLineIDs: Set<Int>) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard anchoredIndices.isEmpty, !lineOffsets.isEmpty else { return false }
+        // Include locks the manager promoted using vocal onsets as well as acoustic offset evidence.
+        let locks = confident.union(done.filter { lockedLineIDs.contains(lines[$0].id) })
+        guard locks.count <= 4, let lastLock = locks.max() else { return false }
+        // Count distinct misses after the latest lock. Nearly confident lines still support the offset.
+        let misses = done.lazy.filter {
+            $0 > lastLock && !self.doneAtRunStart.contains($0) && !self.nearlyConfident.contains($0)
+        }
+        guard misses.prefix(8).count == 8 else { return false }
+
+        // Look for a new offset on the remaining rows. A later run can retry the discarded rows.
+        skippedInRun.formUnion(done)
+        done.removeAll()
+        doneAtRunStart.removeAll()
+        lineOffsets.removeAll()
+        confident.removeAll()
+        nearlyConfident.removeAll()
+        alignedUntilFrame = 0
+        return true
+    }
+
     // swiftlint:disable:next async_without_await
     func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async throws -> [RecognizedAudioWord] {
         guard request.sampleRate == Self.sampleRate, !request.samples.isEmpty else { return [] }
@@ -683,7 +710,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             frames.removeAll()
             committedFrames = 0
             alignedUntilFrame = 0
-            missedBeforeCoarseMatch.removeAll()
+            skippedInRun.removeAll()
+            doneAtRunStart = done
         }
         expectedNextChunkStart = request.chunkStartTime
             + Double(request.samples.count) / Double(Self.sampleRate) * request.playbackRate
@@ -734,7 +762,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let canProbe = lineOffsets.isEmpty && lineWindow > 0
         var missedRawOnsets: [Int] = []
         var batch: [Int] = []
-        for index in lines.indices where !done.contains(index) && !missedBeforeCoarseMatch.contains(index) {
+        for index in lines.indices where !done.contains(index) && !skippedInRun.contains(index) {
             let window = searchWindow(for: index)
             guard window.latestOnset >= coveredStart else {
                 // A late vocal may still be captured, even when its raw onset was missed.
@@ -846,7 +874,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             return !throughEnd && baselineLocks == 0 && waitingForAudio ? [] : nil
         }
         // Earlier lines missed by capture stay eligible on a later run, and the uncovered tail stays pending.
-        missedBeforeCoarseMatch.formUnion(winner.missed)
+        skippedInRun.formUnion(winner.missed)
         return commitBatch(winner.alignment, keeping: winner.kept)
     }
 
@@ -913,7 +941,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             cursor = end + 1
         }
         let keptLines = batch.prefix(keep)
-        let alignment = dropUnreliableLines(words, lines: keptLines, pinningRanges: pinningRanges)
+        let alignment = dropUnreliableLines(words, lines: keptLines, pinningRanges: pinningRanges, isCoarseProbe: coarseShift != nil)
         guard restrictedByWordPriors else { return alignment }
         if alignment.words.isEmpty {
             // A provider's times can spell the lyrics correctly yet miss the actual vocal entirely.
@@ -1050,7 +1078,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private func dropUnreliableLines(
         _ words: [RecognizedAudioWord],
         lines kept: ArraySlice<Int>,
-        pinningRanges: [ClosedRange<Int>]
+        pinningRanges: [ClosedRange<Int>],
+        isCoarseProbe: Bool
     ) -> Alignment {
         var accepted = Alignment()
         var offsets = lineOffsets
@@ -1073,6 +1102,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let pinned = runFrame(atTrackTime: first.startTime) <= range.lowerBound + 1
                 || runFrame(atTrackTime: end) >= range.upperBound
             if pinned, meanConfidence < Self.onsetLockConfidence { continue }
+            // A few high-confidence words can lift the mean of a coarse match made mostly of guesses.
+            if isCoarseProbe, lineWords.count > 1,
+               lineWords.lazy.filter({ $0.confidence >= 0.10 }).count <= lineWords.count / 2 { continue }
 
             let offset = first.startTime - lines[line].start
             let supportsLock = meanConfidence >= Self.onsetLockConfidence
