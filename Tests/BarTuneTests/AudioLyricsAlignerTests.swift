@@ -26,6 +26,22 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(tokens.map(\.normalized), ["hello", "world", "dont", "stop"])
     }
 
+    func testSectionHeadingLetsEarlyLeadVocalAlignAndKeepsItsDisplayRow() {
+        let lines = [
+            LyricLine(id: 8, timestamp: 6, text: "[Intro]"),
+            LyricLine(id: 17, timestamp: 9, text: "sing"),
+        ]
+        let heard = [RecognizedAudioWord(text: "sing", startTime: 2, duration: 0.3, confidence: 0.9, sourceLineId: 17)]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [17])
+        XCTAssertEqual(result.lines.map(\.id), [8, 17])
+        XCTAssertEqual(result.lines.map(\.text), ["[Intro]", "sing"])
+        XCTAssertLessThan(result.lines[0].timestamp, result.lines[1].timestamp)
+        XCTAssertEqual(result.lines[1].timestamp, 2, accuracy: 0.01)
+    }
+
     func testAlignGeneratesWordTimestampsAndInterpolatesGaps() {
         let lines = [
             LyricLine(id: 0, timestamp: 10.0, text: "We are the champions"),

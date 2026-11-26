@@ -59,6 +59,210 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertTrue(ForcedAlignmentText.words(for: "♪ …", script: .latin).isEmpty)
     }
 
+    func testLatinReadingsExpandNumbersSymbolsAndElisionsWithoutChangingDisplay() {
+        let examples = [
+            ("& 100% +", ["and", "onehundredpercent", "plus"]),
+            (
+                "24/7, 1776 1999 2000 2009 2010 2099",
+                ["twentyfourseven", "seventeenseventysix", "nineteenninetynine", "twothousand", "twothousandnine", "twentyten", "twentyninetynine"]
+            ),
+            ("1st 2nd 3rd 4th 21st 100th", ["first", "second", "third", "fourth", "twentyfirst", "onehundredth"]),
+            ("0 42 875 9999", ["zero", "fortytwo", "eighthundredseventyfive", "ninethousandninehundredninetynine"]),
+            ("'bout ’cause 'cuz ‘til ’em 'round I'm", ["about", "cause", "cause", "until", "them", "around", "i'm"]),
+        ]
+        for (text, readings) in examples {
+            let words = ForcedAlignmentText.words(for: text, script: .latin)
+            XCTAssertEqual(words.map(\.reading), readings, text)
+            XCTAssertEqual(words.map(\.display).joined(separator: " "), text)
+        }
+    }
+
+    func testLatinReadingsExpandGroupedThousandsAsCardinalsWithoutChangingDisplay() {
+        let examples = [
+            ("1,000 miles", ["onethousand", "miles"]),
+            ("2,500", ["twothousandfivehundred"]),
+            ("10,000 1,000,000", ["tenthousand", "onemillion"]),
+            ("1,776 2,010", ["onethousandsevenhundredseventysix", "twothousandten"]),
+        ]
+        for (text, readings) in examples {
+            let words = ForcedAlignmentText.words(for: text, script: .latin)
+            XCTAssertEqual(words.map(\.reading), readings, text)
+            XCTAssertEqual(words.map(\.display).joined(separator: " "), text)
+        }
+    }
+
+    func testOnlyLeadLyricsAreForcedWhenParenthesesContainBackingVocals() {
+        let lead = ForcedAlignmentText.words(for: "(ooh) I'm on (yeah (oh) yeah) my way!", script: .latin)
+        XCTAssertEqual(lead.map(\.display), ["I'm", "on", "my", "way!"])
+        let parenthesized = ForcedAlignmentText.words(for: "(Ooh yeah) (oh!)", script: .latin)
+        XCTAssertEqual(parenthesized.map(\.display), ["(Ooh", "yeah)", "(oh!)"])
+        XCTAssertEqual(parenthesized.map(\.reading), ["ooh", "yeah", "oh"])
+        XCTAssertEqual(ForcedAlignmentText.words(for: "sing (out", script: .latin).map(\.reading), ["sing", "out"])
+    }
+
+    func testEnglishWordsAreNormalizedInRomanizedLyrics() {
+        for script in [ForcedAlignmentText.Script.japanese, .korean, .chinese] {
+            let words = ForcedAlignmentText.words(for: "1999 '& 'bout", script: script)
+            XCTAssertEqual(words.map(\.reading), ["nineteenninetynine", "'and", "about"])
+        }
+    }
+
+    func testEngineSkipsStructuralRowsAndReturnsTheirNeighborsOriginalIDs() async throws {
+        for tag in ["[Verse 1]", "[Intro: Singer]", "[Bridge]", "[Outro]", "[Instrumental]", "[Chorus x2]", "[Guitar Solo]"] {
+            XCTAssertTrue(ForcedAlignmentText.words(for: tag, script: .latin).isEmpty, tag)
+        }
+        XCTAssertEqual(ForcedAlignmentText.words(for: "[ooh]", script: .latin).map(\.reading), ["ooh"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Window starts at -12 s, giving two lead words at 5 s and 7 s.
+        model.peaksForCall = [[850: 14, 851: 4, 950: 14, 951: 4]]
+        let lines = [
+            LyricLine(id: 2, timestamp: 3, text: "[Pre-Chorus]"),
+            LyricLine(id: 7, timestamp: 5, text: "ka (yeah)"),
+            LyricLine(id: 17, timestamp: 6, text: "(x2)"),
+            LyricLine(id: 23, timestamp: 7, text: "(ka)"),
+            LyricLine(id: 24, timestamp: 8, text: "(2x)"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(words.map(\.text), ["ka", "(ka)"])
+        XCTAssertEqual(words.map(\.sourceLineId), [7, 23])
+        XCTAssertEqual(aligner.attemptedLineIDs, [7, 23])
+        XCTAssertEqual(aligner.confidentLineIDs, [7, 23])
+    }
+
+    func testWordTimingPriorsPreferTheNearbyPeaksAfterShifting() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 1, timestamp: 1, text: "prior anchor"),
+            LyricLine(id: 2, timestamp: 4, text: "ka (ooh) ta", words: [
+                WordTimestamp(timestamp: 4, duration: 0.2, text: "ka "),
+                WordTimestamp(timestamp: 5, duration: 0.1, text: "(ooh) "),
+                WordTimestamp(timestamp: 6, text: "ta"),
+            ]),
+        ]
+        // Anchor moves the word priors +2 s. Strong 4 s and 6 s decoys remain in the raw window.
+        model.peaksForCall = [[800: 14, 801: 4, 900: 14, 901: 4, 910: 10, 911: 4, 1000: 10, 1001: 4]]
+        model.weakFrames = [900, 901, 1000, 1001]
+        model.weakLogProbability = -1
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [1: 3...3.4])
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(words.map(\.text), ["ka", "ta"])
+        XCTAssertEqual(words.first?.startTime ?? 0, 6, accuracy: 0.01)
+        XCTAssertEqual(words.last?.startTime ?? 0, 8, accuracy: 0.01)
+    }
+
+    func testLeadAndSymbolOnlyWordsReachTheDisplayedLineAtTheirSungTimes() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // "ka" at 5 s, "and" at 5.8 s, and "ta" immediately after "and" at 5.86 s.
+        model.peaksForCall = [[850: 14, 851: 4, 890: 4, 891: 7, 892: 16, 893: 10, 894: 4]]
+        let line = LyricLine(id: 15, timestamp: 5, text: "(ka ooh yeah nah hey uh ah uh) ka & (ooh) ta (ta)")
+        let aligner = LyricsForcedAligner(lines: [line], model: model)
+
+        let heard = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+        XCTAssertEqual(heard.map(\.text), ["ka", "&", "ta"])
+        XCTAssertEqual(aligner.confidentLineIDs, [15])
+
+        let result = LyricsAudioAligner.align(lines: [line], recognizedWords: heard, regroupsCJKWords: false)
+        let aligned = try XCTUnwrap(result.lines.first)
+        XCTAssertEqual(result.matchedLineIDs, [15])
+        XCTAssertEqual(result.matchedWordCount, 3)
+        XCTAssertEqual(aligned.words.map(\.text).joined(), line.text)
+        for (text, onset) in [("ka ", 5.0), ("& ", 5.8), ("ta ", 5.86)] {
+            let word = try XCTUnwrap(aligned.words.last { $0.text == text })
+            XCTAssertEqual(word.timestamp, onset, accuracy: 0.01)
+        }
+        let overlap = try XCTUnwrap(aligned.words.first { $0.text == "(ooh) " })
+        XCTAssertEqual(try XCTUnwrap(overlap.duration), 0, accuracy: 0.01)
+        XCTAssertTrue(AudioSyncManager.locks(aligned, confident: [15], nearlyConfident: [], envelope: VocalEnvelope()))
+        XCTAssertEqual(AudioSyncManager.recognizedWords(of: [aligned]).map(\.text), ["ka", "&", "ta"])
+        XCTAssertEqual(AudioSyncManager.sungSpan(of: aligned)?.lowerBound ?? 0, 5, accuracy: 0.01)
+    }
+
+    func testInvalidOrAcousticallyUnsupportedPriorsAllowTheFullLineWindow() async throws {
+        let invalidTimings = [
+            [WordTimestamp(timestamp: 7, text: "other")],
+            [WordTimestamp(timestamp: .infinity, text: "ka")],
+            [WordTimestamp(timestamp: Double.greatestFiniteMagnitude, text: "ka")],
+            [WordTimestamp(timestamp: 10, duration: 0.1, text: "ka")],
+        ]
+        for timings in invalidTimings {
+            let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+            model.peaksForCall = [[850: 14, 851: 4]]
+            let line = LyricLine(id: 15, timestamp: 7, text: "ka", words: timings)
+            let aligner = LyricsForcedAligner(lines: [line], model: model)
+
+            let heard = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+            XCTAssertEqual(heard.first?.startTime ?? 0, 5, accuracy: 0.01, "\(timings)")
+            XCTAssertEqual(aligner.confidentLineIDs, [15])
+        }
+    }
+
+    func testBatchRetriesOnlyTheLineRejectedUnderWordPriors() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 1, timestamp: 5, text: "ka", words: [WordTimestamp(timestamp: 5, text: "ka")]),
+            LyricLine(id: 2, timestamp: 8, text: "ta", words: [WordTimestamp(timestamp: 11, text: "ta")]),
+        ]
+        // "ka" has a stronger decoy at 7.5 s. "ta" is sung at 8 s, outside its prior.
+        model.peaksForCall = [[850: 14, 851: 4, 975: 14, 976: 4, 1000: 10, 1001: 4]]
+        model.weakFrames = [850, 851]
+        model.weakLogProbability = -1
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+        let heard = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(heard.map(\.sourceLineId), [1, 2])
+        XCTAssertEqual(heard.first?.startTime ?? 0, 5, accuracy: 0.01)
+        XCTAssertEqual(heard.last?.startTime ?? 0, 8, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [1, 2])
+    }
+
+    func testRejectedLineRetriesAtTheEndOfAnAcceptedOneFrameWord() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 1, timestamp: 5, text: "I", words: [WordTimestamp(timestamp: 5, text: "I")]),
+            LyricLine(id: 2, timestamp: 5.02, text: "a", words: [WordTimestamp(timestamp: 7, text: "a")]),
+        ]
+        // "I" peaks at 5 s and "a" peaks on the next frame, before its word prior allows.
+        model.peaksForCall = [[850: 5, 851: 4]]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 0)
+
+        let heard = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(heard.map(\.sourceLineId), [1, 2])
+        let first = try XCTUnwrap(heard.first)
+        XCTAssertEqual(first.startTime, 5, accuracy: 0.001)
+        XCTAssertEqual(first.duration, 0.02, accuracy: 0.001)
+        let second = try XCTUnwrap(heard.first { $0.sourceLineId == 2 })
+        XCTAssertEqual(second.startTime, first.startTime + first.duration, accuracy: 0.001)
+        XCTAssertEqual(aligner.confidentLineIDs, [1, 2])
+    }
+
+    func testCoarseProbesIgnoreMappedWordPriors() async throws {
+        let f = try XCTUnwrap(ForcedAlignmentText.vocabulary["f"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, text: "ka", words: [WordTimestamp(timestamp: 15.7, text: "ka")]),
+            LyricLine(id: 1, timestamp: 15, text: "fi", words: [WordTimestamp(timestamp: 18.7, text: "fi")]),
+        ]
+        // Capture starts after the raw onsets. The +6 s coarse probe hears stronger vocals at 17.5 s and 20.5 s.
+        model.peaksForCall = [[625: 14, 626: 4, 675: 14, 676: 4, 775: f, 776: 5, 825: f, 826: 5, 875: 14, 876: 4, 1025: f, 1026: 5]]
+        model.weakFrames = [625, 626, 775, 776, 875, 876, 1025, 1026]
+        model.weakLogProbability = -1
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+        let heard = try await aligner.transcribe(chunk(start: 16, isFinal: true))
+
+        XCTAssertEqual(heard.map(\.sourceLineId), [0, 1])
+        XCTAssertEqual(heard.first?.startTime ?? 0, 17.5, accuracy: 0.01)
+        XCTAssertEqual(heard.last?.startTime ?? 0, 20.5, accuracy: 0.01)
+    }
+
     func testEngineReturnsLyricWordsAtTheirAlignedTrackTimes() async throws {
         // 100 frames per 24 s window -> one frame every 0.24 s of audio.
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)

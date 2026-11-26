@@ -772,6 +772,44 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(AudioSyncManager.locks(ordinary, confident: [3], nearlyConfident: [], envelope: envelope))
     }
 
+    func testLeadAnchorsExcludeBackingVocalsWhenTimedWordsOmitWhitespace() {
+        let line = LyricLine(id: 1, timestamp: 10, text: "(ooh yeah) ka", words: [
+            WordTimestamp(timestamp: 10, duration: 0.5, text: "(ooh"),
+            WordTimestamp(timestamp: 10.5, duration: 0.5, text: "yeah)"),
+            WordTimestamp(timestamp: 11, duration: 0.5, text: "ka"),
+        ])
+
+        XCTAssertNil(LyricsAudioAligner.tokenGroups(of: line))
+        XCTAssertEqual(AudioSyncManager.sungSpan(of: line), 11...11.5)
+        XCTAssertEqual(AudioSyncManager.recognizedWords(of: [line]).map(\.text), ["ka"])
+
+        let allSung = LyricLine(id: 2, timestamp: 10, text: "(ooh yeah)", words: Array(line.words.prefix(2)))
+        XCTAssertEqual(AudioSyncManager.recognizedWords(of: [allSung]).map(\.text), ["(ooh", "yeah)"])
+        let ordinary = LyricLine(id: 3, timestamp: 10, text: "sing out", words: [
+            WordTimestamp(timestamp: 10, duration: 0.5, text: "sing"),
+            WordTimestamp(timestamp: 10.5, duration: 0.5, text: "out"),
+        ])
+        XCTAssertEqual(AudioSyncManager.recognizedWords(of: [ordinary]).map(\.text), ["sing", "out"])
+    }
+
+    func testLyricsAlignmentLocksALeadLineWithALongBackingVocalTail() throws {
+        let line = LyricLine(id: 1, timestamp: 10, text: "ka (one two three four five six seven eight nine ten eleven)")
+        let heard = RecognizedAudioWord(text: "ka", startTime: 10, duration: 0.5, confidence: 1, sourceLineId: line.id)
+        let result = LyricsAudioAligner.align(lines: [line], recognizedWords: [heard], regroupsCJKWords: false)
+        let aligned = try XCTUnwrap(result.lines.first)
+
+        XCTAssertEqual(result.matchedLineIDs, [line.id])
+        let leadEnd = try XCTUnwrap(AudioSyncManager.sungSpan(of: aligned)).upperBound
+        let duration = try XCTUnwrap(aligned.duration)
+        XCTAssertGreaterThan(aligned.timestamp + duration - leadEnd, LyricsForcedAligner.maxWordSpan)
+        XCTAssertTrue(AudioSyncManager.locks(aligned, confident: [line.id], nearlyConfident: [], envelope: VocalEnvelope()))
+
+        let extended = LyricLine(
+            id: line.id, timestamp: aligned.timestamp, duration: duration + 4, text: aligned.text, words: aligned.words
+        )
+        XCTAssertFalse(AudioSyncManager.locks(extended, confident: [line.id], nearlyConfident: [], envelope: VocalEnvelope()))
+    }
+
     func testLyricsAlignmentDoesNotLockAnOverlongTrailingTail() {
         let line = LyricLine(id: 1, timestamp: 10, duration: 4.2, text: "Stay", words: [
             WordTimestamp(timestamp: 10, duration: 0.5, text: "Stay"),
