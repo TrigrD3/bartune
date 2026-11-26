@@ -1923,6 +1923,139 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testLiveCaptureRecoversRepeatedLineAfterFirstChorusLocks() async throws {
+        let (record, diagnostics) = try await runRepeatedChorus()
+        XCTAssertEqual(diagnostics.chorusRecoveredCount, 1)
+        XCTAssertEqual(record.alignedLineCount, 2)
+        XCTAssertEqual(record.lockedLineIDs, [0], "chroma recovery must not promote a line to a direct audio lock")
+        XCTAssertTrue(record.isReliable(expectedSourceLineCount: 3))
+        XCTAssertEqual(record.lines[1].timestamp - record.lines[0].timestamp, 10, accuracy: 0.025)
+        XCTAssertEqual(record.lines[1].words.map(\.text), record.lines[0].words.map(\.text))
+        XCTAssertTrue(diagnostics.report().contains("Repeated lines recovered: 1"))
+    }
+
+    @MainActor
+    func testLiveCaptureKeepsFreshDirectMatchBelowLockConfidence() async throws {
+        let directWords = [
+            ("Beautiful", 20.35), ("day", 20.85), ("comes", 21.35), ("again", 21.75),
+        ].map {
+            RecognizedAudioWord(text: $0.0, startTime: $0.1, duration: 0.2, confidence: 0.9, sourceLineId: 1)
+        }
+        let (record, diagnostics) = try await runRepeatedChorus(secondWords: directWords)
+        XCTAssertEqual(record.alignedLineCount, 2)
+        XCTAssertEqual(record.lockedLineIDs, [0])
+        XCTAssertEqual(diagnostics.chorusRecoveredCount, 0)
+        let firstDirectWord = try XCTUnwrap(record.lines[1].words.first)
+        XCTAssertEqual(firstDirectWord.timestamp, directWords[0].startTime, accuracy: 0.06)
+    }
+
+    @MainActor
+    func testLiveCaptureReplacesClampedRunawayDirectMatchWithChroma() async throws {
+        let (record, diagnostics) = try await runRepeatedChorus(secondWords: runawayChorusWords)
+        XCTAssertEqual(diagnostics.chorusRecoveredCount, 1)
+        XCTAssertEqual(record.alignedLineCount, 2)
+        XCTAssertEqual(record.lockedLineIDs, [0])
+        XCTAssertEqual(record.lines[1].timestamp - record.lines[0].timestamp, 10, accuracy: 0.025)
+        XCTAssertEqual(record.lines[1].words.map(\.duration), record.lines[0].words.map(\.duration))
+    }
+
+    @MainActor
+    func testLiveCaptureKeepsClampedRunawayDirectMatchWithoutQualifyingChroma() async throws {
+        let (record, diagnostics) = try await runRepeatedChorus(secondWords: runawayChorusWords, transposeSecondBy: 6)
+        XCTAssertEqual(diagnostics.chorusRecoveredCount, 0)
+        XCTAssertEqual(record.alignedLineCount, 2)
+        XCTAssertEqual(record.lockedLineIDs, [0])
+        let direct = record.lines[1]
+        XCTAssertEqual(direct.timestamp, runawayChorusWords[0].startTime, accuracy: 0.06)
+        XCTAssertEqual(direct.timestamp + (direct.duration ?? 0), record.lines[2].timestamp, accuracy: 0.001)
+    }
+
+    private var runawayChorusWords: [RecognizedAudioWord] {
+        [
+            ("Beautiful", 20.35, 0.2), ("day", 20.85, 0.2), ("comes", 21.35, 0.2), ("again", 21.75, 8.0),
+        ].map {
+            RecognizedAudioWord(text: $0.0, startTime: $0.1, duration: $0.2, confidence: 0.9, sourceLineId: 1)
+        }
+    }
+
+    @MainActor
+    func testLiveChromaUsesPostGapCaptureTimeWithinChunk() async throws {
+        let (record, diagnostics) = try await runRepeatedChorus(captureGap: 0.5)
+        XCTAssertEqual(diagnostics.chorusRecoveredCount, 1)
+        XCTAssertEqual(record.lines[1].timestamp - record.lines[0].timestamp, 10, accuracy: 0.025)
+    }
+
+    @MainActor
+    private func runRepeatedChorus(
+        secondWords: [RecognizedAudioWord] = [], captureGap: Double = 0, transposeSecondBy: Double = 0
+    ) async throws -> (AudioSyncedLyricsRecord, AudioSyncDiagnostics) {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let track = TrackInfo(
+            id: "spotify:track:repeated-chorus", title: "Repeat", artist: "Artist", album: "",
+            duration: 30, artworkURL: nil
+        )
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "Beautiful day comes again"),
+            LyricLine(id: 1, timestamp: 20.5, text: "Beautiful day comes again"),
+            LyricLine(id: 2, timestamp: 25, text: "Another distinct lyric line"),
+        ]
+        let capture = FakeAudioCapture()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let batches = LockedBox(0)
+        let firstWords = [
+            ("Beautiful", 10.1), ("day", 10.7), ("comes", 11.1), ("again", 11.6),
+        ].map {
+            RecognizedAudioWord(text: $0.0, startTime: $0.1, duration: 0.25, confidence: 0.95, sourceLineId: 0)
+        }
+        let deps = makeDependencies(
+            capture: capture,
+            launchAligner: { _, _ in
+                FakeChunkEngine(confident: [0]) { _ in
+                    batches.withLock { count in
+                        defer { count += 1 }
+                        return count == 0 ? firstWords : secondWords
+                    }
+                }
+            },
+            chunkDurationSeconds: 12
+        )
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        state.setTrack(track, lyrics: lines)
+        manager.handleTrackLoaded(track: track, rawLines: lines)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let rate = ChromaTestAudio.sampleRate
+        let audio = ChromaTestAudio.repeatedPhrase(transposeSecondBy: transposeSecondBy)
+        capture.emit(samples: Array(audio[..<Int(12 * rate)]), sampleRate: rate)
+        let firstLocked = await waitUntil(timeout: 5) { cache.load(trackId: track.id)?.lockedLineIDs == [0] }
+        XCTAssertTrue(firstLocked)
+
+        state.playbackAnchorPosition = 12
+        state.playbackAnchorDate = Date()
+        if captureGap > 0 {
+            capture.emit(samples: Array(audio[Int(12 * rate)..<Int(15 * rate)]), sampleRate: rate, captureDelay: 0)
+            let buffered = await waitUntil { manager.bufferedSampleCount == Int(3 * rate) }
+            XCTAssertTrue(buffered)
+            state.playbackAnchorPosition = 15 + captureGap
+            capture.emit(
+                samples: Array(audio[Int((15 + captureGap) * rate)..<Int((24 + captureGap) * rate)]),
+                sampleRate: rate, captureDelay: 0
+            )
+        } else {
+            capture.emit(samples: Array(audio[Int(12 * rate)..<Int(24 * rate)]), sampleRate: rate)
+        }
+        let processed = await waitUntil(timeout: 5) { manager.diagnostics.snapshot?.resultCount == 2 }
+        XCTAssertTrue(processed)
+        return try (XCTUnwrap(cache.load(trackId: track.id)), XCTUnwrap(manager.diagnostics.snapshot))
+    }
+
+    @MainActor
     func testPartialCacheIsShownAndRefinedButNeverDowngraded() async {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         var cachedLines = tenLines()

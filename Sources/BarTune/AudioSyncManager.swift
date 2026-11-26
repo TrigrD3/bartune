@@ -683,7 +683,9 @@ final class AudioSyncManager {
     // Audio chunk state
     private var audioSampleBuffer: [Float] = []
     private var audioSideBuffer: [Float] = []
-    private var chunkStartPos: Double?
+    /// Sample offsets and track times for contiguous capture spans in the buffer.
+    private var captureSpanStarts: [(offset: Int, time: Double)] = []
+    private var chunkStartPos: Double? { captureSpanStarts.first?.time }
     private var chunkPlaybackRate: Double = 1.0
     private var pendingSeekPos: Double?
     /// The audio up to the track's end was sent; reset by a seek, which can reach the end again.
@@ -698,6 +700,7 @@ final class AudioSyncManager {
     private var modelMayBeCached = false
     private var chunkEngine: AudioChunkTranscribing?
     private var activeSampleRate: Double = 16000.0
+    private var chromaProfile = AudioChromaProfile()
     private var capturedSeconds: Double = 0
     private var chunkDurationSeconds: Double { dependencies.chunkDurationSeconds }
 
@@ -750,11 +753,6 @@ final class AudioSyncManager {
         }
     }
 
-    private func clearAudioBuffers(keepingCapacity: Bool) {
-        audioSampleBuffer.removeAll(keepingCapacity: keepingCapacity)
-        audioSideBuffer.removeAll(keepingCapacity: keepingCapacity)
-    }
-
     func stop() {
         cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
@@ -770,8 +768,7 @@ final class AudioSyncManager {
         pendingVocalEnvelopeNotification = nil
         chunkEngine?.shutdown()
         chunkEngine = nil
-        clearAudioBuffers(keepingCapacity: false)
-        chunkStartPos = nil
+        discardBufferedAudio(keepingCapacity: false)
         chunkPlaybackRate = 1.0
         pendingSeekPos = nil
         lastPlayback = nil
@@ -787,6 +784,7 @@ final class AudioSyncManager {
         activeSourceBundleId = track.sourceBundleId
         baseLines = rawLines
         recognizedWords = []
+        chromaProfile = AudioChromaProfile()
         cachedAlignedLineCount = 0
         priorHeardWords = []
         anchoredLines = [:]
@@ -902,8 +900,7 @@ final class AudioSyncManager {
         guard isLiveSyncActive, previousTargets != updatedTargets else { return }
         capture.stop()
         // Buffered samples belong to the old capture's timeline; the next sample starts a new chunk.
-        clearAudioBuffers(keepingCapacity: true)
-        chunkStartPos = nil
+        discardBufferedAudio()
         // Deliveries still queued from the old capture must not start the new chunk.
         seekBoundary = ProcessInfo.processInfo.systemUptime
         startCaptureForCurrentTarget(trackId: track.id, engine: state.audioSyncEngine, generation: syncGeneration)
@@ -986,19 +983,58 @@ final class AudioSyncManager {
         (rate.isFinite && rate > 0) ? rate : 1.0
     }
 
+    private func discardBufferedAudio(keepingCapacity: Bool = true) {
+        audioSampleBuffer.removeAll(keepingCapacity: keepingCapacity)
+        audioSideBuffer.removeAll(keepingCapacity: keepingCapacity)
+        captureSpanStarts.removeAll(keepingCapacity: keepingCapacity)
+    }
+
+    private func bufferedEndPosition(sampleRate: Double) -> Double? {
+        guard let last = captureSpanStarts.last else { return nil }
+        let duration = Double(audioSampleBuffer.count - last.offset) / max(sampleRate, 1)
+        return last.time + duration * chunkPlaybackRate
+    }
+
+    private func beginCaptureSpan(at position: Double) -> Double {
+        var start = position
+        if audioSampleBuffer.isEmpty {
+            if let pending = pendingSeekPos {
+                pendingSeekPos = nil
+                if abs(position - pending) > Self.seekTolerance { start = pending }
+            }
+            chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
+        }
+        captureSpanStarts.append((audioSampleBuffer.count, start))
+        return start
+    }
+
+    private func removeBufferedSamplePrefix(_ count: Int, sampleRate: Double) {
+        if count == audioSampleBuffer.count {
+            discardBufferedAudio()
+            return
+        }
+        audioSampleBuffer.removeFirst(count)
+        audioSideBuffer.removeFirst(count)
+        guard let index = captureSpanStarts.lastIndex(where: { $0.offset <= count }) else { return }
+        let span = captureSpanStarts[index]
+        let start = span.time + Double(count - span.offset) / max(sampleRate, 1) * chunkPlaybackRate
+        captureSpanStarts.removeFirst(index)
+        captureSpanStarts[0] = (0, start)
+        for index in captureSpanStarts.indices.dropFirst() {
+            captureSpanStarts[index].offset -= count
+        }
+    }
+
     private func discardChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
         guard isLiveSyncActive, state.audioSyncEngine == .lyricsAlignment else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let last = lastPlayback
         lastPlayback = (position, now, playbackRate, isPlaying)
-        if let chunkStart = chunkStartPos {
-            let bufferedDuration = activeSampleRate > 0 ? Double(audioSampleBuffer.count) / activeSampleRate : 0
-            let expected = chunkStart + bufferedDuration * chunkPlaybackRate
+        if let expected = bufferedEndPosition(sampleRate: activeSampleRate) {
             let seeked = abs(position - expected) > Self.seekTolerance
             let rateChanged = abs(playbackRate - chunkPlaybackRate) > 0.01
             if seeked || rateChanged {
-                clearAudioBuffers(keepingCapacity: true)
-                chunkStartPos = nil
+                discardBufferedAudio()
                 chunkPlaybackRate = playbackRate
                 pendingSeekPos = position
                 seekBoundary = ProcessInfo.processInfo.systemUptime
@@ -1067,8 +1103,7 @@ final class AudioSyncManager {
         modelMayBeCached = true
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
-        clearAudioBuffers(keepingCapacity: true)
-        chunkStartPos = nil
+        discardBufferedAudio()
         chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
         pendingSeekPos = nil
         sentFinalChunk = false
@@ -1125,13 +1160,13 @@ final class AudioSyncManager {
                       self.isLiveSyncActive,
                       self.activeTrackId == trackId,
                       self.state.audioSyncEngine == .lyricsAlignment,
-                      let audio = batch.trimmingBefore(self.seekBoundary, deliveredAt: deliveredAt)
+                      let audio = batch.trimmingBefore(self.seekBoundary, deliveredAt: deliveredAt),
+                      !audio.samples.isEmpty
                 else { return }
                 let samples = audio.samples
                 let sampleRate = audio.sampleRate
                 if sampleRate != self.activeSampleRate, !self.audioSampleBuffer.isEmpty {
-                    self.clearAudioBuffers(keepingCapacity: true)
-                    self.chunkStartPos = nil
+                    self.discardBufferedAudio()
                 }
                 self.activeSampleRate = sampleRate
                 if sampleRate > 0 {
@@ -1147,30 +1182,19 @@ final class AudioSyncManager {
                     now: ProcessInfo.processInfo.systemUptime,
                     rate: self.state.isPlaying ? self.state.playbackRate : 0
                 )
-                if let existingStart = self.chunkStartPos,
+                var continuedStart = self.bufferedEndPosition(sampleRate: sampleRate)
+                if let expectedStart = continuedStart,
                    sampleRate > 0,
-                   audio.captureDelay != nil || audio.capturedAt != nil {
-                    let expectedStart = existingStart
-                        + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
+                   audio.captureDelay != nil || audio.capturedAt != nil,
+                   abs(livePos - expectedStart) > 0.05 {
+                    continuedStart = nil
                     if abs(livePos - expectedStart) > Self.seekTolerance {
-                        // Dropped audio gap: start a fresh chunk & envelope segment at the measured position.
-                        self.clearAudioBuffers(keepingCapacity: true)
-                        self.chunkStartPos = livePos
-                        self.chunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
+                        // A large discontinuity starts a fresh inference chunk.
+                        self.discardBufferedAudio()
                     }
                 }
-                if self.chunkStartPos == nil {
-                    if let pending = self.pendingSeekPos {
-                        self.pendingSeekPos = nil
-                        self.chunkStartPos = abs(livePos - pending) <= Self.seekTolerance ? livePos : pending
-                    } else {
-                        self.chunkStartPos = livePos
-                    }
-                    self.chunkPlaybackRate = Self.sanitizedPlaybackRate(self.state.playbackRate)
-                }
-                if let chunkStart = self.chunkStartPos, sampleRate > 0 {
-                    let deliveryStart = chunkStart
-                        + Double(self.audioSampleBuffer.count) / sampleRate * self.chunkPlaybackRate
+                let deliveryStart = continuedStart ?? self.beginCaptureSpan(at: livePos)
+                if sampleRate > 0 {
                     let previousFrameCount = self.vocalEnvelope.totalFrameCount
                     let previousEnd = self.vocalEnvelope.segments.last?.end
                     self.vocalEnvelope.append(
@@ -1198,11 +1222,7 @@ final class AudioSyncManager {
                 let maxFrames = targetFrames * 2
                 if self.audioSampleBuffer.count > maxFrames {
                     let overflow = self.audioSampleBuffer.count - maxFrames
-                    self.audioSampleBuffer.removeFirst(overflow)
-                    self.audioSideBuffer.removeFirst(overflow)
-                    if let startPos = self.chunkStartPos, sampleRate > 0 {
-                        self.chunkStartPos = startPos + (Double(overflow) / sampleRate) * self.chunkPlaybackRate
-                    }
+                    self.removeBufferedSamplePrefix(overflow, sampleRate: sampleRate)
                 }
 
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
@@ -1223,7 +1243,7 @@ final class AudioSyncManager {
         let sampleRate = activeSampleRate
         let targetFrames = max(1, Int(sampleRate * chunkDurationSeconds))
         let chunkStart = chunkStartPos ?? currentPlaybackPosition()
-        let bufferedEnd = chunkStart + Double(audioSampleBuffer.count) / max(sampleRate, 1) * chunkPlaybackRate
+        let bufferedEnd = bufferedEndPosition(sampleRate: sampleRate) ?? chunkStart
         let reachesEnd = !sentFinalChunk && activeTrackDuration > 0
             && bufferedEnd >= activeTrackDuration - Self.trackEndMargin
         let isFinal = reachesEnd && audioSampleBuffer.count <= targetFrames
@@ -1232,24 +1252,28 @@ final class AudioSyncManager {
         let frameCount = min(targetFrames, audioSampleBuffer.count)
         let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
         let sideChunk = Array(audioSideBuffer.prefix(frameCount))
-        audioSampleBuffer.removeFirst(frameCount)
-        audioSideBuffer.removeFirst(frameCount)
-        if audioSampleBuffer.isEmpty {
-            chunkStartPos = nil
-        } else if sampleRate > 0 {
-            chunkStartPos = chunkStart + (Double(frameCount) / sampleRate) * chunkPlaybackRate
-        }
+        let spans = captureSpanStarts.prefix { $0.offset < frameCount }
+        removeBufferedSamplePrefix(frameCount, sampleRate: sampleRate)
         if isFinal { sentFinalChunk = true }
 
         let requestSampleRate = Int(sampleRate)
         let requestPlaybackRate = chunkPlaybackRate
-        // Run pitch analysis, normalization, Core ML inference, and CTC Viterbi at `.background` QoS so multi-threaded
-        // CPU fallback (libBNNS) stays on efficiency cores and never preempts interactive UI threads.
+        // Run pitch analysis, chroma extraction, normalization, Core ML inference, and CTC Viterbi at
+        // `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on efficiency cores and never
+        // preempts interactive UI threads.
         chunkProcessingTask = Task.detached(priority: .background) { [weak self] in
             let pitch = requestSampleRate == VocalPitchContour.sampleRate
                 ? VocalPitchContour.analyze(mid: rawChunk, side: sideChunk, start: chunkStart, rate: requestPlaybackRate)
                 : nil
             guard !Task.isCancelled else { return }
+            var chroma = AudioChromaProfile()
+            for index in spans.indices {
+                let span = spans[index]
+                let end = index + 1 < spans.endIndex ? spans[index + 1].offset : rawChunk.count
+                let samples = spans.count == 1 ? rawChunk : Array(rawChunk[span.offset..<end])
+                chroma.append(samples: samples, sampleRate: sampleRate, startTime: span.time, rate: requestPlaybackRate)
+            }
+            let chunkChroma = chroma
             let chunk = AudioLevel.normalizedForRecognition(rawChunk)
             let request = AudioChunkRequest(
                 samples: chunk,
@@ -1281,6 +1305,7 @@ final class AudioSyncManager {
                 if let pitch {
                     self.vocalPitchContour.merge(pitch)
                 }
+                self.chromaProfile.merge(chunkChroma)
                 let voicedFramePercent = self.vocalPitchContour.voicedFraction.map { $0 * 100 }
                 self.diagnostics.update {
                     $0.voicedFramePercent = voicedFramePercent
@@ -1358,7 +1383,32 @@ final class AudioSyncManager {
     /// Aligns the lyrics to every word heard, keeping lines anchored from an earlier play or already
     /// accepted in this Lyrics Alignment session so later audio-level shifts cannot drop them.
     private func currentAlignment() -> AudioAlignmentResult {
-        keepingLockedAndAccepted(alignHeardWords())
+        let fresh = alignHeardWords()
+        return recoveringRepeatedLines(keepingLockedAndAccepted(fresh), fresh: fresh)
+    }
+
+    private func recoveringRepeatedLines(_ result: AudioAlignmentResult, fresh: AudioAlignmentResult) -> AudioAlignmentResult {
+        let locked = lockedLineIDs
+        guard !locked.isEmpty, !chromaProfile.segments.isEmpty else { return result }
+        let protectedTargetIDs = Set(fresh.matchedLineIDs)
+            .intersection(result.matchedLineIDs)
+            .subtracting(fresh.clampedRunawayLineIDs)
+        let recovery = ChorusSelfSimilarity.recoverRepeatedLines(
+            in: result.lines, lockedIDs: locked, protectedTargetIDs: protectedTargetIDs,
+            chroma: chromaProfile, medianOffset: result.medianOffset,
+            sourceTimestamps: Dictionary(uniqueKeysWithValues: baseLines.map { ($0.id, $0.timestamp) })
+        )
+        diagnostics.update { $0.chorusRecoveredCount = recovery.recoveredLineIDs.count }
+        guard !recovery.recoveredLineIDs.isEmpty else { return result }
+        let matched = Set(result.matchedLineIDs).union(recovery.recoveredLineIDs)
+        return AudioAlignmentResult(
+            lines: recovery.lines,
+            matchedLineCount: matched.count,
+            matchedWordCount: result.matchedWordCount,
+            medianOffset: result.medianOffset,
+            matchedLineIDs: recovery.lines.map(\.id).filter(matched.contains),
+            clampedRunawayLineIDs: result.clampedRunawayLineIDs.subtracting(recovery.recoveredLineIDs)
+        )
     }
 
     /// The lyrics aligned to every word heard, before locked and accepted lines are put back.
@@ -1737,16 +1787,15 @@ final class AudioSyncManager {
     private func applyLyricsAlignment(replacingAttempts: Set<Int>) {
         guard !baseLines.isEmpty else { return }
         let fresh = alignHeardWords()
-        let result = keepingLockedAndAccepted(fresh, replacingAttempts: replacingAttempts)
+        let direct = keepingLockedAndAccepted(fresh, replacingAttempts: replacingAttempts)
         // Only a line aligned from this play's audio that survived conflict resolution against existing
         // locks can lock itself, never a conflicting match or one carried over unlocked.
-        let freshMatchedIDs = Set(fresh.matchedLineIDs)
-        let survivedNewMatches = freshMatchedIDs
-            .intersection(result.matchedLineIDs)
+        let survivedNewMatches = Set(fresh.matchedLineIDs)
+            .intersection(direct.matchedLineIDs)
             .subtracting(lockedLineIDs)
             .subtracting(fresh.clampedRunawayLineIDs)
         var lockedNewLine = false
-        for line in result.lines where survivedNewMatches.contains(line.id) && Self.locks(
+        for line in direct.lines where survivedNewMatches.contains(line.id) && Self.locks(
             line,
             confident: confidentLineIDs,
             nearlyConfident: nearlyConfidentLineIDs,
@@ -1756,6 +1805,8 @@ final class AudioSyncManager {
             lockedThisPlay[line.id] = line
             lockedNewLine = true
         }
+        // Only direct alignment can establish a locked template.
+        let result = recoveringRepeatedLines(direct, fresh: fresh)
         let lines = baseLines
         diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
         let progress = Self.lyricsAlignmentProgress(lockedIDs: lockedLineIDs, settledIDs: settledLineIDs, lines: baseLines)
