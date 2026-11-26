@@ -85,6 +85,45 @@ final class OfflineCacheStatsModel: ObservableObject {
     }
 }
 
+@MainActor
+final class VocalSeparatorStatusModel: ObservableObject {
+    enum Status: Equatable, Sendable {
+        case missing
+        case compiledOnly
+        case installed
+    }
+
+    @Published private(set) var status: Status = .missing
+    @Published private(set) var isRefreshing = false
+    private let check: @Sendable () -> Status
+    private var latestRefresh = 0
+
+    init(check: @escaping @Sendable () -> Status = {
+        if VocalSeparatorModel.hasPackage() { return .installed }
+        return VocalSeparatorModel.isInstalled() ? .compiledOnly : .missing
+    }) {
+        self.check = check
+    }
+
+    func invalidate() {
+        latestRefresh += 1
+    }
+
+    @discardableResult
+    func refresh() -> Task<Void, Never> {
+        invalidate()
+        let refreshID = latestRefresh
+        let check = check
+        isRefreshing = true
+        return Task {
+            let result = await Task.detached(priority: .utility) { check() }.value
+            guard refreshID == latestRefresh else { return }
+            status = result
+            isRefreshing = false
+        }
+    }
+}
+
 struct SettingsView: View {
     static let browserMediaDisclosure =
         "Reads playback from Chrome, Arc, Brave, Edge, or Safari when Spotify and Apple Music are idle "
@@ -112,6 +151,11 @@ struct SettingsView: View {
     @State private var lyricsAlignerInstalled: Bool = false
     @State private var isDownloadingAligner: Bool = false
     @State private var alignerDownloadError: String?
+    @StateObject private var vocalSeparatorStatus = VocalSeparatorStatusModel()
+    @State private var isDownloadingVocalSeparator: Bool = false
+    @State private var isRemovingVocalSeparator: Bool = false
+    @State private var vocalSeparatorError: String?
+    @State private var showRemoveVocalSeparatorConfirmation: Bool = false
     /// Held unobserved so samples re-render only `AppPerformanceSection`; averages survive tab switches.
     @State private var resourceMetrics = ResourceMetricsModel()
     @State private var permissions = AppPermissionsSnapshot.empty
@@ -550,6 +594,8 @@ struct SettingsView: View {
                                 .foregroundStyle(.orange)
                         }
                     }
+
+                    vocalIsolationControls
                 }
 
                 if state.audioSyncEngine != .off {
@@ -607,6 +653,74 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .onAppear {
             refreshLyricsAlignerStatus()
+            if !isRemovingVocalSeparator, !isDownloadingVocalSeparator {
+                refreshVocalSeparatorStatus()
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var vocalIsolationControls: some View {
+        let installed = vocalSeparatorStatus.status == .installed
+        Toggle("Isolate Vocals", isOn: $state.isolateVocals)
+
+        Text(
+            "Separates lead vocals from instruments before alignment. The lightweight model requires macOS 14 or later."
+        )
+        .font(.caption)
+        .foregroundStyle(.secondary)
+
+        HStack {
+            Text("Vocal Isolation Model")
+            Spacer()
+            Text(installed ? "Installed" : "Not installed")
+                .font(.caption)
+                .foregroundStyle(installed ? Color.secondary : Color.orange)
+        }
+
+        if vocalSeparatorStatus.status != .missing {
+            Button("Remove Model", role: .destructive) {
+                showRemoveVocalSeparatorConfirmation = true
+            }
+            .disabled(isRemovingVocalSeparator || isDownloadingVocalSeparator || vocalSeparatorStatus.isRefreshing)
+            .alert("Remove Vocal Isolation Model?", isPresented: $showRemoveVocalSeparatorConfirmation) {
+                Button("Cancel", role: .cancel) {}
+                Button("Remove Model", role: .destructive) {
+                    removeVocalSeparator()
+                }
+            } message: {
+                Text("This permanently deletes the downloaded vocal isolation model from disk.")
+            }
+        }
+        if !installed {
+            HStack {
+                if isDownloadingVocalSeparator {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Downloading…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Download Model (\(VocalSeparatorModel.downloadSizeDescription))") {
+                        downloadVocalSeparator()
+                    }
+                    .disabled(!supportsVocalSeparator || isRemovingVocalSeparator || vocalSeparatorStatus.isRefreshing)
+                }
+            }
+            if !supportsVocalSeparator {
+                Text("Update macOS to download this model.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Text("Open-Unmix (UMX-HQ vocals) by SigSep, MIT license.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+
+        if let vocalSeparatorError {
+            Text(vocalSeparatorError)
+                .font(.caption)
+                .foregroundStyle(.orange)
         }
     }
 
@@ -1142,6 +1256,54 @@ struct SettingsView: View {
                     isDownloadingAligner = false
                     alignerDownloadError = error.localizedDescription
                 }
+            }
+        }
+    }
+
+    private var supportsVocalSeparator: Bool {
+        if #available(macOS 14, *) { return true }
+        return false
+    }
+
+    private func refreshVocalSeparatorStatus() {
+        vocalSeparatorStatus.refresh()
+    }
+
+    private func downloadVocalSeparator() {
+        isDownloadingVocalSeparator = true
+        vocalSeparatorStatus.invalidate()
+        vocalSeparatorError = nil
+        Task { @MainActor in
+            defer {
+                refreshVocalSeparatorStatus()
+                isDownloadingVocalSeparator = false
+            }
+            do {
+                try await VocalSeparatorModel.download()
+                if state.isolateVocals {
+                    state.onResyncCurrentTrack?()
+                }
+            } catch {
+                vocalSeparatorError = "Download failed. \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func removeVocalSeparator() {
+        isRemovingVocalSeparator = true
+        vocalSeparatorStatus.invalidate()
+        vocalSeparatorError = nil
+        Task { @MainActor in
+            defer {
+                refreshVocalSeparatorStatus()
+                isRemovingVocalSeparator = false
+            }
+            do {
+                try await Task.detached(priority: .utility) {
+                    try VocalSeparatorModel.remove()
+                }.value
+            } catch {
+                vocalSeparatorError = "Removal failed. \(error.localizedDescription)"
             }
         }
     }

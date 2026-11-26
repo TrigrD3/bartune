@@ -3687,6 +3687,67 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertFalse(config.showsCursor)
         XCTAssertEqual(config.queueDepth, 3)
         XCTAssertGreaterThanOrEqual(config.minimumFrameInterval.seconds, 60.0)
+        let isolation = SystemAudioCapture.makeStreamConfiguration(sampleRate: 48000)
+        XCTAssertEqual(isolation.sampleRate, 48000)
+        XCTAssertEqual(isolation.channelCount, 2)
+    }
+
+    @MainActor
+    func testVocalIsolationFeedsStemToAlignmentAndEnvelopeAndReleasesModelWhenIdle() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
+        let releaseCount = LockedBox(0)
+        let separator = RightChannelVocalSeparator()
+        let clock = ControlledNotifyClock()
+        var deps = makeDependencies(capture: capture, runChunk: { input in
+            request.withLock { $0 = input }
+            return []
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { separator }
+        deps.releaseCachedVocalSeparator = { releaseCount.withLock { $0 += 1 } }
+        deps.idleModelReleaseSleep = { delay in
+            try await clock.sleep(until: clock.now().advanced(by: delay))
+        }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(capture.lastSampleRate, 48000)
+
+        // Only the left channel carries music. The fake separator uses the silent right channel as the stem.
+        let halfSecond = [Float](repeating: 0.3, count: 24000)
+        for _ in 0..<2 {
+            capture.emit(samples: halfSecond, sampleRate: 48000, side: halfSecond)
+        }
+        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        XCTAssertTrue(processed)
+
+        let recognized = try XCTUnwrap(request.withLock { $0 })
+        XCTAssertEqual(recognized.sampleRate, 16000)
+        XCTAssertEqual(recognized.samples.count, 16000)
+        XCTAssertLessThan(recognized.samples.map(abs).max() ?? 1, 0.0001)
+        let segment = try XCTUnwrap(manager.vocalEnvelope.segments.first)
+        XCTAssertEqual(segment.levels.count, 100)
+        XCTAssertEqual(segment.maxPeaks.max(), 0)
+        XCTAssertEqual(separator.priority.withLock { $0 }, .background)
+        let diagnostics = try XCTUnwrap(manager.diagnostics.snapshot)
+        XCTAssertEqual(diagnostics.captureSampleRate, 48000)
+        XCTAssertGreaterThan(try XCTUnwrap(diagnostics.vocalSeparationSeconds), 0)
+        XCTAssertTrue(diagnostics.report().contains("Capture sample rate: 48000 Hz"))
+        XCTAssertTrue(diagnostics.report().contains("per chunk"))
+
+        manager.stop()
+        let timerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(timerArmed)
+        XCTAssertEqual(releaseCount.withLock { $0 }, 0)
+        clock.advance(by: .seconds(60))
+        let released = await waitUntil { releaseCount.withLock { $0 == 1 } }
+        XCTAssertTrue(released)
     }
 
     @MainActor
@@ -3699,6 +3760,10 @@ final class AudioSyncManagerTests: XCTestCase {
         let fakeCapture = FakeAudioCapture()
         let observedPriority = LockedBox<TaskPriority?>(nil)
         var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 1.0)
+        deps.launchVocalSeparator = {
+            XCTFail("The separator must load only when isolation is enabled")
+            return nil
+        }
         deps.launchLyricsAligner = { _, _ in
             FakeChunkEngine { _ in
                 observedPriority.withLock { $0 = Task.currentPriority }
@@ -3709,12 +3774,187 @@ final class AudioSyncManagerTests: XCTestCase {
         manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
         let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
         XCTAssertTrue(started)
+        XCTAssertEqual(fakeCapture.lastSampleRate, 16000)
 
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
         let ran = await waitUntil { observedPriority.withLock { $0 != nil } }
         XCTAssertTrue(ran)
         XCTAssertEqual(observedPriority.withLock { $0 }, .background)
         manager.stop()
+    }
+
+    @MainActor
+    func testVocalIsolationWithMissingModelAlignsFullMix() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
+        var deps = makeDependencies(capture: capture, runChunk: { input in
+            request.withLock { $0 = input }
+            return []
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { nil }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(capture.lastSampleRate, 48000)
+
+        let audio = [Float](repeating: 0.3, count: 48000)
+        capture.emit(samples: audio, sampleRate: 48000, side: audio)
+        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        XCTAssertTrue(processed)
+        let recognized = try XCTUnwrap(request.withLock { $0 })
+        XCTAssertEqual(recognized.sampleRate, 16000)
+        XCTAssertEqual(recognized.samples.count, 16000)
+        XCTAssertGreaterThan(try XCTUnwrap(recognized.samples.dropFirst(8000).first), 0.5)
+        let segment = try XCTUnwrap(manager.vocalEnvelope.segments.first)
+        XCTAssertEqual(try XCTUnwrap(segment.maxPeaks.dropFirst(50).first), 0.6, accuracy: 0.01)
+        XCTAssertNil(manager.diagnostics.snapshot?.vocalSeparationSeconds)
+    }
+
+    @MainActor
+    func testFailed48kHzResamplingStopsAlignmentWithoutSendingTheChunk() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        let requests = LockedBox<[Int]>([])
+        let attemptedConversion = LockedBox(false)
+        var deps = makeDependencies(capture: capture, runChunk: { request in
+            requests.withLock { $0.append(request.sampleRate) }
+            return []
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { nil }
+        deps.resampleForRecognition = { _, source, target in
+            attemptedConversion.withLock { $0 = source == 48000 && target == 16000 }
+            return nil
+        }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        capture.emit(samples: [Float](repeating: 0.3, count: 48000), sampleRate: 48000)
+        let finished = await waitUntil { !manager.isLiveSyncActive || !requests.withLock { $0.isEmpty } }
+        XCTAssertTrue(finished)
+        XCTAssertTrue(attemptedConversion.withLock { $0 })
+        XCTAssertTrue(requests.withLock { $0.isEmpty })
+        XCTAssertFalse(manager.isLiveSyncActive)
+        guard case let .unavailable(message) = state.audioSyncStatus else {
+            XCTFail("Expected the resampling failure to be surfaced")
+            return
+        }
+        XCTAssertTrue(message.contains("resample"))
+    }
+
+    @MainActor
+    func testStoppingBeforeFirstIsolatedChunkCachesStereoFullMixWaveform() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, runChunk: { _ in
+            XCTFail("A five-second preview should not dispatch a chunk")
+            return []
+        })
+        deps.launchVocalSeparator = { RightChannelVocalSeparator() }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        let track = sampleTrack()
+        manager.handleTrackLoaded(track: track, rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let samples = [Float](repeating: 0.3, count: 5 * 48000)
+        capture.emit(samples: samples, sampleRate: 48000, side: samples)
+        let buffered = await waitUntil { manager.bufferedSampleCount == samples.count }
+        XCTAssertTrue(buffered)
+        manager.stop()
+        let next = TrackInfo(id: "spotify:track:next", title: "Next", artist: "", album: "", duration: 120, artworkURL: nil)
+        manager.handleTrackLoaded(track: next, rawLines: [])
+
+        let segment = try XCTUnwrap(manager.vocalEnvelope(for: track.id)?.segments.first)
+        XCTAssertEqual(segment.levels.count, 500)
+        XCTAssertEqual(try XCTUnwrap(segment.maxPeaks.dropFirst(250).first), 0.6, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testSeparatedWaveformAndBufferedFullMixSurviveTranscriptionFailure() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, launchAligner: { _, _ in
+            FakeChunkEngine { _ in throw FakeChunkEngineError.exited }
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { RightChannelVocalSeparator() }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        let track = sampleTrack()
+        manager.handleTrackLoaded(track: track, rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let samples = [Float](repeating: 0.3, count: 72000)
+        capture.emit(samples: samples, sampleRate: 48000, side: samples)
+        let stopped = await waitUntil { !manager.isLiveSyncActive }
+        XCTAssertTrue(stopped)
+        let next = TrackInfo(id: "spotify:track:next", title: "Next", artist: "", album: "", duration: 120, artworkURL: nil)
+        manager.handleTrackLoaded(track: next, rawLines: [])
+
+        let segment = try XCTUnwrap(manager.vocalEnvelope(for: track.id)?.segments.first)
+        XCTAssertEqual(segment.levels.count, 150)
+        XCTAssertEqual(try XCTUnwrap(segment.maxPeaks.dropFirst(50).first), 0, accuracy: 0.0001)
+        XCTAssertEqual(try XCTUnwrap(segment.maxPeaks.dropFirst(125).first), 0.6, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testMonoDeliveryKeepsCurrentChunkAndIsolationResumesWithNextStereoChunk() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        let capture = FakeAudioCapture()
+        let peaks = LockedBox<[Float]>([])
+        let receivedChunks = expectation(description: "Recognizer receives two consecutive chunks")
+        receivedChunks.expectedFulfillmentCount = 2
+        var deps = makeDependencies(capture: capture, runChunk: { input in
+            peaks.withLock { $0.append(input.samples.map(abs).max() ?? 0) }
+            receivedChunks.fulfill()
+            return []
+        }, chunkDurationSeconds: 1)
+        deps.launchVocalSeparator = { RightChannelVocalSeparator() }
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let quarterSecond = [Float](repeating: 0.3, count: 12000)
+        capture.emit(samples: quarterSecond, sampleRate: 48000, side: quarterSecond)
+        let bufferedStereo = await waitUntil { manager.bufferedSampleCount == 12000 }
+        XCTAssertTrue(bufferedStereo)
+        capture.emit(samples: quarterSecond, sampleRate: 48000)
+        let bufferedBoth = await waitUntil { manager.bufferedSampleCount == 24000 }
+        XCTAssertTrue(bufferedBoth)
+        let stereo = [Float](repeating: 0.3, count: 72000)
+        capture.emit(samples: stereo, sampleRate: 48000, side: stereo)
+
+        await fulfillment(of: [receivedChunks], timeout: 10)
+        let recognizedPeaks = peaks.withLock { $0 }
+        XCTAssertGreaterThan(try XCTUnwrap(recognizedPeaks.first), 0.5)
+        XCTAssertLessThan(try XCTUnwrap(recognizedPeaks.dropFirst().first), 0.0001)
+        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 2 }
+        XCTAssertTrue(processed)
+        XCTAssertEqual(manager.vocalEnvelope.segments.count, 1)
+        let segment = try XCTUnwrap(manager.vocalEnvelope.segments.first)
+        XCTAssertEqual(segment.levels.count, 200)
+        XCTAssertGreaterThan(try XCTUnwrap(segment.maxPeaks.dropFirst(75).first), 0.5)
+        XCTAssertEqual(try XCTUnwrap(segment.maxPeaks.dropFirst(125).first), 0, accuracy: 0.0001)
+        XCTAssertNotNil(manager.vocalEnvelope.onsetRise(at: segment.start + 1))
     }
 
     @MainActor
@@ -3881,14 +4121,16 @@ private final class FakeAudioCapture: AudioCaptureProviding {
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []
+    private(set) var lastSampleRate: Int?
     private(set) var calls: [String] = []
     var startError: Error?
 
     @MainActor
-    func start(targetBundleIds: Set<String>) throws {
+    func start(targetBundleIds: Set<String>, sampleRate: Int) throws {
         startCount += 1
         calls.append("start")
         lastTargetBundleIds = targetBundleIds
+        lastSampleRate = sampleRate
         if let startError {
             throw startError
         }
@@ -3902,6 +4144,15 @@ private final class FakeAudioCapture: AudioCaptureProviding {
 
     func emit(samples: [Float], sampleRate: Double, side: [Float] = [], captureDelay: Double? = nil) {
         onAudioSamples?(CapturedAudio(samples: samples, side: side, sampleRate: sampleRate, captureDelay: captureDelay))
+    }
+}
+
+private final class RightChannelVocalSeparator: VocalIsolating {
+    let priority = LockedBox<TaskPriority?>(nil)
+
+    func vocals(left: [Float], right: [Float]) -> (left: [Float], right: [Float]) {
+        priority.withLock { $0 = Task.currentPriority }
+        return (right, right)
     }
 }
 
@@ -3995,7 +4246,8 @@ private final class FakeSystemAudioCaptureBackend: SystemAudioCaptureBackend, @u
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
         output: AudioCaptureStreamOutput,
-        audioQueue: DispatchQueue
+        audioQueue: DispatchQueue,
+        sampleRate: Int
     ) async -> SystemAudioStreamControlling {
         await Task.yield()
         onStartStream?()

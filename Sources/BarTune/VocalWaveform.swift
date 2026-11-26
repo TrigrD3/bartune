@@ -62,6 +62,7 @@ struct VocalEnvelope {
         /// Raw linear min/max sample peaks (`-1...1`) per frame for timeline waveform display.
         var minPeaks: [Float] = []
         var maxPeaks: [Float] = []
+        fileprivate var captureIndex = 0
 
         var end: Double { start + Double(levels.count) * step }
 
@@ -89,6 +90,12 @@ struct VocalEnvelope {
     private var frameMin: Float = 0
     private var frameMax: Float = 0
     private var pendingSamples = 0
+    private var captureIndex = 0
+
+    struct FrameLocation: Sendable {
+        fileprivate let captureIndex: Int
+        fileprivate let time: Double
+    }
 
     /// Appends captured audio starting at `startTime` (track seconds); `side` is empty for mono audio.
     /// Audio that doesn't continue the last append (a seek, a gap, a rate change) starts a new segment.
@@ -105,7 +112,8 @@ struct VocalEnvelope {
             frameMin = 0
             frameMax = 0
             pendingSamples = 0
-            segments.append(Segment(start: startTime, step: samplesPerFrame / sampleRate * rate, levels: []))
+            captureIndex += 1
+            segments.append(Segment(start: startTime, step: samplesPerFrame / sampleRate * rate, levels: [], captureIndex: captureIndex))
         }
         expectedNextStart = startTime + Double(mid.count) / sampleRate * rate
 
@@ -147,6 +155,32 @@ struct VocalEnvelope {
             }
         }
         trimToCapacity()
+    }
+
+    /// Locates a chunk on the live frame grid, accounting for timestamp jitter between deliveries.
+    func frameLocation(at time: Double) -> FrameLocation? {
+        guard let segment = segments.last, let expectedNextStart else { return nil }
+        let gridEnd = segment.end + Double(pendingSamples) / sampleRate * rate
+        return FrameLocation(captureIndex: segment.captureIndex, time: gridEnd - (expectedNextStart - time))
+    }
+
+    /// Replaces the full-mix preview in place so the adjacent capture frames stay contiguous.
+    mutating func replaceFrames(at location: FrameLocation, with stem: Segment) -> Bool {
+        guard !stem.levels.isEmpty,
+              let index = segments.lastIndex(where: { $0.captureIndex == location.captureIndex }),
+              abs(segments[index].step - stem.step) < 1e-6
+        else { return false }
+        let first = Int(((location.time - segments[index].start) / stem.step).rounded())
+        let start = max(0, first)
+        let end = min(segments[index].levels.count, first + stem.levels.count)
+        guard start < end else { return false }
+
+        let frames = start..<end
+        let source = (start - first)..<(end - first)
+        segments[index].levels.replaceSubrange(frames, with: stem.levels[source])
+        segments[index].minPeaks.replaceSubrange(frames, with: stem.minPeaks[source])
+        segments[index].maxPeaks.replaceSubrange(frames, with: stem.maxPeaks[source])
+        return true
     }
 
     private var samplesPerFrame: Double { (sampleRate * Self.frameSeconds).rounded() }

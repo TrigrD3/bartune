@@ -30,6 +30,9 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
     var note: String?
     /// Latest delay between a captured sample and its delivery to BarTune, corrected for in word timings.
     var captureDelay: Double?
+    var captureSampleRate: Double?
+    /// Time spent isolating vocals for the latest chunk, nil when alignment used the full mix.
+    var vocalSeparationSeconds: Double?
     /// Word timings changed by vocal loudness and harmonicity on the latest alignment.
     var waveformRefinement: WaveformTimingRefiner.Stats?
     var voicedFramePercent: Float?
@@ -100,6 +103,10 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
         }
         out.append("Timing offset: \(Self.formatOffset(medianOffset))")
         out.append("Capture delay: \(captureDelay.map(Self.formatTime) ?? "—")")
+        let captureRate = captureSampleRate.map { String(format: "%.0f Hz", $0) } ?? "—"
+        out.append("Capture sample rate: \(captureRate)")
+        let isolation = vocalSeparationSeconds.map { "\(Self.formatTime($0)) per chunk" } ?? "—"
+        out.append("Vocal separation: \(isolation)")
         if let waveformRefinement {
             out.append(
                 "Waveform refinement: \(waveformRefinement.extended) notes held, "
@@ -163,6 +170,11 @@ final class AudioSyncDiagnosticsModel: ObservableObject {
     func recordCaptureDelay(_ delay: Double) {
         guard let current = snapshot, abs((current.captureDelay ?? -1) - delay) >= 0.01 else { return }
         update { $0.captureDelay = delay }
+    }
+
+    func recordCaptureSampleRate(_ rate: Double) {
+        guard snapshot?.captureSampleRate != rate else { return }
+        update { $0.captureSampleRate = rate }
     }
 
     func note(_ message: String) {

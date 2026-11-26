@@ -1242,15 +1242,7 @@ final class LyricsForcedAlignerTests: XCTestCase {
     func testModelInstallVerifiesTheArchiveAndReplacesAStaleCompiledModel() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
-        let source = root.appendingPathComponent("src/\(LyricsAlignerModel.packageName)")
-        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
-        try Data("weights".utf8).write(to: source.appendingPathComponent("Manifest.json"))
-        let archive = root.appendingPathComponent("model.zip")
-        let ditto = Process()
-        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-        ditto.arguments = ["-c", "-k", "--keepParent", source.path, archive.path]
-        try ditto.run()
-        ditto.waitUntilExit()
+        let archive = try makeModelArchive(in: root)
         let digest = try AppUpdateService.sha256Hex(ofFileAt: archive)
 
         let models = root.appendingPathComponent("Models")
@@ -1265,6 +1257,71 @@ final class LyricsForcedAlignerTests: XCTestCase {
         let installed = models.appendingPathComponent("\(LyricsAlignerModel.packageName)/Manifest.json")
         XCTAssertEqual(try String(contentsOf: installed, encoding: .utf8), "weights")
         XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "the old compiled model must be rebuilt from the new package")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: models.path), [LyricsAlignerModel.packageName])
+    }
+
+    func testModelInstallRestoresExistingArtifactsWhenSwapFails() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let archive = try makeModelArchive(in: root)
+        let digest = try AppUpdateService.sha256Hex(ofFileAt: archive)
+        let models = root.appendingPathComponent("Models")
+        let package = models.appendingPathComponent(LyricsAlignerModel.packageName)
+        let compiled = models.appendingPathComponent(LyricsAlignerModel.compiledName)
+        let oldManifest = package.appendingPathComponent("Manifest.json")
+        let oldWeights = compiled.appendingPathComponent("weights")
+        for artifact in [package, compiled] {
+            try FileManager.default.createDirectory(at: artifact, withIntermediateDirectories: true)
+        }
+        try Data("previous package".utf8).write(to: oldManifest)
+        try Data("previous compiled model".utf8).write(to: oldWeights)
+
+        let backupFailure = FailingModelMoveFileManager { source, _ in source.path == compiled.path }
+        let replacementFailure = FailingModelMoveFileManager { source, destination in
+            destination.path == package.path && source.deletingLastPathComponent().lastPathComponent.hasPrefix(".staging-")
+        }
+        for fileManager in [backupFailure, replacementFailure] {
+            XCTAssertThrowsError(
+                try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models, fileManager: fileManager)
+            ) { error in
+                XCTAssertEqual((error as? CocoaError)?.code, .fileWriteNoPermission)
+            }
+
+            XCTAssertEqual(try String(contentsOf: oldManifest, encoding: .utf8), "previous package")
+            XCTAssertEqual(try String(contentsOf: oldWeights, encoding: .utf8), "previous compiled model")
+            XCTAssertEqual(
+                try Set(fileManager.contentsOfDirectory(atPath: models.path)),
+                Set([LyricsAlignerModel.packageName, LyricsAlignerModel.compiledName])
+            )
+        }
+    }
+
+    private func makeModelArchive(in root: URL) throws -> URL {
+        let source = root.appendingPathComponent("src/\(LyricsAlignerModel.packageName)")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: source.appendingPathComponent("Manifest.json"))
+        let archive = root.appendingPathComponent("model.zip")
+        let ditto = Process()
+        ditto.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
+        ditto.arguments = ["-c", "-k", "--keepParent", source.path, archive.path]
+        try ditto.run()
+        ditto.waitUntilExit()
+        XCTAssertEqual(ditto.terminationStatus, 0)
+        return archive
+    }
+
+    private final class FailingModelMoveFileManager: FileManager, @unchecked Sendable {
+        private let shouldFail: (URL, URL) -> Bool
+
+        init(shouldFail: @escaping (URL, URL) -> Bool) {
+            self.shouldFail = shouldFail
+            super.init()
+        }
+
+        override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+            if shouldFail(srcURL, dstURL) { throw CocoaError(.fileWriteNoPermission) }
+            try super.moveItem(at: srcURL, to: dstURL)
+        }
     }
 
     func testAcousticModelCacheReusesModelAcrossTracksAndInvalidatesOnChangeOrRelease() throws {

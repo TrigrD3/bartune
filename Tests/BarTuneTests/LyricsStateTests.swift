@@ -292,6 +292,7 @@ final class LyricsStateTests: XCTestCase {
             "bartune.browserMusicEnabled",
             "bartune.browserYouTubeVideosEnabled",
             "bartune.audioSyncEngine",
+            "bartune.isolateVocals",
             "bartune.showSyncBadge",
             "bartune.lyricsColorPreset",
             "bartune.customLyricsColorHex",
@@ -345,6 +346,8 @@ final class LyricsStateTests: XCTestCase {
         state.browserMusicEnabled = false
         state.browserYouTubeVideosEnabled = true
         state.audioSyncEngine = .lyricsAlignment
+        XCTAssertFalse(state.isolateVocals)
+        state.isolateVocals = true
         state.showSyncBadge = false
         state.lyricsColorPreset = .electricCyan
         state.customLyricsColorHex = "#123456"
@@ -383,6 +386,7 @@ final class LyricsStateTests: XCTestCase {
         XCTAssertFalse(reloaded.browserMusicEnabled)
         XCTAssertTrue(reloaded.browserYouTubeVideosEnabled)
         XCTAssertEqual(reloaded.audioSyncEngine, .lyricsAlignment)
+        XCTAssertTrue(reloaded.isolateVocals)
         XCTAssertFalse(reloaded.showSyncBadge)
         XCTAssertEqual(reloaded.lyricsColorPreset, .electricCyan)
         XCTAssertEqual(reloaded.customLyricsColorHex, "#123456")
