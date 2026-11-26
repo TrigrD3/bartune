@@ -616,6 +616,8 @@ final class AudioSyncManager {
     private var lockedThisPlay: [Int: LyricLine] = [:]
     /// Unlocked lines heard since the locked set last grew, carried over from the record when it didn't.
     private var attemptedLineIDs: Set<Int> = []
+    /// Attempts made in this play, distinct from settled attempts loaded from an earlier record.
+    private var attemptedThisPlay: Set<Int> = []
     /// Lines the engine aligned confidently on this play.
     private var confidentLineIDs: Set<Int> = []
     /// Lines aligned just below that on this play; they lock on a vocal onset.
@@ -783,6 +785,7 @@ final class AudioSyncManager {
         anchoredLines = [:]
         lockedThisPlay = [:]
         attemptedLineIDs = []
+        attemptedThisPlay = []
         confidentLineIDs = []
         nearlyConfidentLineIDs = []
         acceptedSessionLines = [:]
@@ -820,20 +823,25 @@ final class AudioSyncManager {
             let reliable = current && cached.isReliable(expectedSourceLineCount: expectedSourceLineCount)
             // A Lyrics Alignment record keeps filling in until no further play could lock another line.
             let fillsIn = engine == .lyricsAlignment && cached.engine == .lyricsAlignment
+            let canResume = reliable || (current && fillsIn && !rawLines.isEmpty
+                && cached.canResumePartial(expectedSourceLineCount: expectedSourceLineCount))
             let locked = Set(cached.lockedLineIDs ?? [])
             let progress = Self.lyricsAlignmentProgress(lockedIDs: locked, settledIDs: cached.settledLineIDs, lines: rawLines)
             let complete = fillsIn ? progress.isFinished : cached.isComplete(expectedSourceLineCount: expectedSourceLineCount)
-            if reliable, rawLines.isEmpty || complete {
+            let hasCurrentLockProgress = current && fillsIn && cached.lockedLineIDs != nil
+            if rawLines.isEmpty ? reliable : complete && (canResume || hasCurrentLockProgress) {
                 if baseLines.isEmpty {
                     baseLines = cached.lines
                 }
-                state.applyAudioSyncedLines(cached.lines)
+                if canResume {
+                    state.applyAudioSyncedLines(cached.lines)
+                }
                 state.audioSyncStatus = fillsIn && !rawLines.isEmpty
                     ? progress.status(engine: cached.engine)
                     : .cached(cached.engine)
                 return
             }
-            if reliable {
+            if canResume {
                 // Show the partial sync now and keep listening to fill in the lines it missed.
                 state.applyAudioSyncedLines(cached.lines)
                 cachedAlignedLineCount = cached.alignedLineCount
@@ -1248,12 +1256,16 @@ final class AudioSyncManager {
                 else { return }
                 self.diagnostics.update { $0.record(words: words, replacing: false) }
                 self.recognizedWords.append(contentsOf: words)
+                var newAttempts: Set<Int> = []
                 if let reporter = engine as? LineAttemptReporting {
-                    self.attemptedLineIDs.formUnion(reporter.attemptedLineIDs)
+                    let reported = reporter.attemptedLineIDs
+                    newAttempts = reported.subtracting(self.attemptedThisPlay)
+                    self.attemptedLineIDs.formUnion(reported)
+                    self.attemptedThisPlay.formUnion(newAttempts)
                     self.confidentLineIDs.formUnion(reporter.confidentLineIDs)
                     self.nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
                 }
-                self.applyLyricsAlignment()
+                self.applyLyricsAlignment(replacingAttempts: newAttempts)
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
         }
@@ -1294,7 +1306,10 @@ final class AudioSyncManager {
             // Lyrics Alignment never realigns an anchored line, so its saved words are never overlapped.
             return (Self.recognizedWords(of: Array(anchoredLines.values)) + recognizedWords).sorted { $0.startTime < $1.startTime }
         }
-        return Self.mergeHeardWords(prior: priorHeardWords, current: recognizedWords)
+        let unattemptedPriorWords = priorHeardWords.filter { word in
+            word.sourceLineId.map { !attemptedThisPlay.contains($0) } ?? true
+        }
+        return Self.mergeHeardWords(prior: unattemptedPriorWords, current: recognizedWords)
     }
 
     /// Every word heard, refined against this play's vocal envelope.
@@ -1320,7 +1335,7 @@ final class AudioSyncManager {
         )
     }
 
-    private func keepingLockedAndAccepted(_ result: AudioAlignmentResult) -> AudioAlignmentResult {
+    private func keepingLockedAndAccepted(_ result: AudioAlignmentResult, replacingAttempts: Set<Int> = []) -> AudioAlignmentResult {
         let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !lockedThisPlay.isEmpty || !preserved.isEmpty else { return result }
         let minLineGap = 0.15
@@ -1342,7 +1357,7 @@ final class AudioSyncManager {
                 lines.append(line)
                 matched.insert(line.id)
                 freshUnlockedIndices.append(idx)
-            } else if let kept = preserved[line.id] {
+            } else if let kept = preserved[line.id], !replacingAttempts.contains(line.id) {
                 lines.append(kept)
                 matched.insert(line.id)
                 restoredUnlockedIndices.append(idx)
@@ -1632,26 +1647,42 @@ final class AudioSyncManager {
     /// 300 ms of the sung start on songs it was not tuned on.
     nonisolated static let onsetLockRise: Float = 3
 
-    /// Whether an aligned line locks: a confident one always, a nearly confident one when its start sits on a vocal onset.
+    /// A well-timed line locks when confident or when nearly confident and starting on a vocal onset.
     nonisolated static func locks(_ line: LyricLine, confident: Set<Int>, nearlyConfident: Set<Int>, envelope: VocalEnvelope) -> Bool {
+        guard !line.words.contains(where: { ($0.duration ?? 0) <= 0 && !LyricsAudioAligner.normalizeToken($0.text).isEmpty }) else {
+            return false
+        }
+        let groups = LyricsAudioAligner.tokenGroups(of: line) ?? line.words.map { [$0] }
+        let spans = groups.compactMap { group -> (start: Double, end: Double)? in
+            guard let first = group.first, let last = group.last else { return nil }
+            return (first.timestamp, last.timestamp + (last.duration ?? 0))
+        }
+        let maxWordSpan = LyricsForcedAligner.maxWordSpan
+        guard let first = spans.first, let last = spans.last,
+              spans.allSatisfy({ $0.end - $0.start <= maxWordSpan }),
+              last.end - first.start <= LyricsForcedAligner.maxLineSpan(wordCount: spans.count),
+              !zip(spans, spans.dropFirst()).contains(where: { $1.start - $0.end > maxWordSpan }),
+              line.timestamp + (line.duration ?? 0) - last.end <= maxWordSpan
+        else { return false }
         if confident.contains(line.id) { return true }
-        guard nearlyConfident.contains(line.id), let start = line.words.first?.timestamp,
-              let rise = envelope.onsetRise(at: start)
+        guard nearlyConfident.contains(line.id), let rise = envelope.onsetRise(at: first.start)
         else { return false }
         return rise >= onsetLockRise
     }
 
     /// Lyrics Alignment locks each confidently aligned line and keeps listening until no further play could
     /// lock another (see `lyricsAlignmentProgress`), saving after each chunk so a later play only listens for the rest.
-    private func applyLyricsAlignment() {
+    private func applyLyricsAlignment(replacingAttempts: Set<Int>) {
         guard !baseLines.isEmpty else { return }
         let fresh = alignHeardWords()
-        let result = keepingLockedAndAccepted(fresh)
+        let result = keepingLockedAndAccepted(fresh, replacingAttempts: replacingAttempts)
         // Only a line aligned from this play's audio that survived conflict resolution against existing
         // locks can lock itself, never a conflicting match or one carried over unlocked.
-        let survivedNewMatches = Set(fresh.matchedLineIDs)
+        let freshMatchedIDs = Set(fresh.matchedLineIDs)
+        let survivedNewMatches = freshMatchedIDs
             .intersection(result.matchedLineIDs)
             .subtracting(lockedLineIDs)
+            .subtracting(fresh.clampedRunawayLineIDs)
         var lockedNewLine = false
         for line in result.lines where survivedNewMatches.contains(line.id) && Self.locks(
             line,
@@ -1675,15 +1706,23 @@ final class AudioSyncManager {
         // whose lines weren't tracked in `acceptedSessionLines`.
         let matchedIDs = Set(result.matchedLineIDs)
         let displacedAcceptedCount = acceptedSessionLines.keys.filter { !matchedIDs.contains($0) }.count
+        let droppedPreviouslyAccepted = acceptedSessionLines.keys.contains {
+            replacingAttempts.contains($0) && !matchedIDs.contains($0)
+        }
+        let droppedPriorWords = priorHeardWords.contains { word in
+            word.sourceLineId.map { replacingAttempts.contains($0) && !matchedIDs.contains($0) } ?? false
+        }
         let newLockDisplacedCache = lockedNewLine
             && (result.matchedLineCount + displacedAcceptedCount >= cachedAlignedLineCount)
-        if result.matchedLineCount > 0, newLockDisplacedCache || result.matchedLineCount >= cachedAlignedLineCount {
+        if droppedPreviouslyAccepted || (result.matchedLineCount > 0 && (newLockDisplacedCache || result.matchedLineCount >= cachedAlignedLineCount)) {
             acceptedSessionLines = Dictionary(
                 result.lines.filter { matchedIDs.contains($0.id) }.map { ($0.id, $0) },
                 uniquingKeysWith: { _, latest in latest }
             )
-            persistAlignment(result, engine: .lyricsAlignment, forceUpdateCount: newLockDisplacedCache)
+            persistAlignment(result, engine: .lyricsAlignment, forceUpdateCount: newLockDisplacedCache || droppedPreviouslyAccepted)
             state.applyAudioSyncedLines(result.lines)
+        } else if droppedPriorWords {
+            persistAlignment(result, engine: .lyricsAlignment)
         }
         if progress.isFinished {
             stop()
