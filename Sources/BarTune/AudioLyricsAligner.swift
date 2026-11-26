@@ -442,8 +442,8 @@ enum LyricsLanguageDetector {
 }
 
 enum LyricsAudioAligner {
-    fileprivate static let standardOffsetLimit = 5.0
-    fileprivate static let maxOwnedOffset = 8.0
+    static let standardOffsetLimit = 5.0
+    static let maxOwnedOffset = 8.0
 
     struct DisplayToken: Equatable {
         let display: String

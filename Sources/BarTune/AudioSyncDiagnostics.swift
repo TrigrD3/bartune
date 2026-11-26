@@ -23,6 +23,7 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
     var recentWords: [RecognizedAudioWord] = []
     var matchedLineCount = 0
     var matchedWordCount = 0
+    var chorusRecoveredCount = 0
     var totalLines = 0
     var medianOffset: Double?
     var lineResults: [LineResult] = []
@@ -94,6 +95,9 @@ struct AudioSyncDiagnostics: Equatable, Sendable {
         out.append("Words heard: \(totalRecognizedWords)")
         out.append("Lines matched: \(matchedLineCount)/\(totalLines)")
         out.append("Words matched: \(matchedWordCount)")
+        if chorusRecoveredCount > 0 {
+            out.append("Repeated lines recovered: \(chorusRecoveredCount)")
+        }
         out.append("Timing offset: \(Self.formatOffset(medianOffset))")
         out.append("Capture delay: \(captureDelay.map(Self.formatTime) ?? "—")")
         if let waveformRefinement {

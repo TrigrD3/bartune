@@ -18,6 +18,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   LyricTimingSession.swift # Pure tap-stamping, word-splitting, nudging & duration-derivation model for the timing editor
   LyricTimingEditorView.swift # Manual Lyric Timing Editor window (tap-to-time lines/words, fine-tune, per-song source picker)
   LyricsForcedAligner.swift # Lyrics Alignment engine: CTC Viterbi of romanized lyrics over a Core ML acoustic model (Neural Engine); syllable splits (Hangul, hanzi, Latin vowel groups) for Syllable Timing
+  AudioChroma.swift        # Bounded 12-bin chroma profiles for Lyrics Alignment audio chunks; recovers timing for repeated passages against same-lyric locked lines
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
   AudioOutputLatency.swift  # CoreAudio default-output latency monitoring for the overlay clock
   VocalWaveform.swift      # Voice-band vocal envelope (stereo centre-weighted) and word timing refinement for silence gating and held notes
@@ -64,7 +65,7 @@ Spotify / Apple Music (AppleScript + distributed notifications)
   → SpotifyMonitor (track metadata, position, AppleScript latency compensation, interpolation timer)
   → LyricsFetcher (NetEase YRC word-level sync → LRCLIB enhanced/standard LRC fallback)
   → Models (LRCParser / YRC) + Romanizer (CFStringTokenizer) + AlbumArtColorExtractor
-  ↳ Audio sync (optional): ScreenCaptureKit stereo capture → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity → word refinement → LyricsAudioAligner → vocal onset line locking
+  ↳ Audio sync (optional): ScreenCaptureKit stereo capture → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity + AudioChroma profiles → word refinement → LyricsAudioAligner → vocal onset locking & repeat timing recovery
   → LyricsState (observable state, timing offset, hover/theme/precision/browser prefs)
   → OverlayWindowController + LyricsOverlayView (left-of-notch menu bar karaoke sweep)
 ```
