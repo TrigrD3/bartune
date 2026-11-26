@@ -23,6 +23,8 @@
 
 <p align="center">
   <img src="docs/preview.gif" width="840" alt="BarTune preview — real-time karaoke lyrics tucked beside the MacBook notch" />
+  <br/>
+  <sub><a href="docs/preview.mp4">Watch full 1080p 60fps preview (MP4)</a></sub>
 </p>
 
 ---
@@ -37,9 +39,10 @@ Most desktop lyrics apps float over your editor, browser tabs, or terminal. **Ba
 - **Steps aside on hover.** Pick **Cursor Spotlight** to peek only the menu item under your pointer, or **Hide Entire Bar** to reveal the full app menu bar on hover.
 - **Works across desktop and web players.** Tracks **Spotify** and **Apple Music** natively, and falls back to **YouTube Music, Spotify Web, SoundCloud, and Apple Music Web** in Chrome, Arc, Brave, Edge, or Safari. Ordinary **YouTube** videos (including Chapters) are opt-in.
 - **Word-level karaoke sync and audio alignment.** Pulls millisecond **NetEase YRC** lyrics with **LRCLIB** fallback, and can optionally align lyrics to the playing audio using **Lyrics Alignment**, which aligns the fetched lyrics to the audio on the Neural Engine instead of transcribing them (Apple silicon; Settings downloads its 274 MB model, a Core ML conversion of Meta's MMS forced-aligner licensed CC BY-NC 4.0, built by `scripts/convert-lyrics-aligner.py`; it keeps every line it aligns confidently, later plays listen only for the lines still missing, and the sync badge shows Synced once every line is aligned). Lyrics Alignment refines its word timings with the captured vocal waveform: held notes keep a word lit until the singer lets go, words placed in silence are dropped, and a line the model heard less clearly is still kept when the voice comes in right where it starts. With **Syllable Timing** on, it sweeps each syllable on its own note (Korean, Chinese and Latin-script lyrics; Japanese stays word by word). Synced timings are cached on disk so repeat plays load without recalculating, with a toggleable sync badge in the lyrics bar.
+- **Manual Lyric Timing Editor.** Open **Edit Lyric Timing…** from the menu bar or Settings to tap-to-time lines and words by hand, drag boundaries on a timeline overlaid with the captured vocal waveform, loop a line or song with built-in transport controls, preview Romaji, and save a **Custom** lyric source per track.
 - **Translation and offline romanization.** Translate lyrics into your preferred language (cached locally) or turn on offline **Japanese → Romaji**, **Korean → Romanized**, and **Chinese → Pinyin** for sing-along readability.
-- **Offline cache you can inspect.** Stores fetched lyrics, translations, audio-synced timings, and per-track timing offsets locally with a configurable cache limit and a searchable **Cached Songs** list in Settings.
-- **Custom themes, visualizers, and live diagnostics.** Choose from 5 visualizer styles (**Bars, Wave, Dots, Vinyl, Note**), album-art accent or backdrop themes, custom typography, Launch at Login, macOS permission status indicators, and live/average CPU and memory metrics in a 6-tab Settings window (`⌘,`), plus checksum-verified update downloads from **About**.
+- **Offline cache you can inspect.** Stores fetched lyrics, translations, audio-synced timings, and per-track timing offsets locally with a configurable cache limit, a searchable **Cached Songs** list (inspect, reveal in Finder, or remove individual songs), and a separate **Clear Audio Sync** action that keeps fetched, translated, and custom lyrics intact.
+- **Custom themes, visualizers, and live diagnostics.** Choose from 5 visualizer styles (**Bars, Wave, Dots, Vinyl, Note**), album-art accent or backdrop themes, custom highlight colors and typography, Launch at Login, macOS permission status indicators, live/average CPU and memory metrics, and **Advanced Diagnostics** for audio sync in a 6-tab Settings window (`⌘,`), plus SHA-256-verified updates with one-click **Install & Relaunch** (for non-Homebrew installs) from **About**.
 
 ## Install
 
@@ -70,11 +73,11 @@ BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 6-tab nati
 | Tab | Options |
 | :--- | :--- |
 | **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music and Ordinary YouTube Videos toggles (with what is sent to NetEase and LRCLIB), Launch at Login, macOS Permission Status, Live & Average CPU/Memory Usage |
-| **Appearance** | Color Theme (*System*, *Album Accent*, *Album Tint*), Background Opacity, Font Family, Weight, Size, Karaoke Sweep Highlight, Word Pop, Typing Caret, Line Transition (*Subtle*, *Slide*, *Blur Fade*, *Pop*, *Push*, *None*; Speed, Start Early) |
-| **Visualizer** | Live Preview, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width, Animation toggle |
-| **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Audio Karaoke Sync (*Off / Lyrics Alignment*, model download, syllable timing, transcribed-audio overwrite, lyrics-bar sync badge), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
-| **Offline Cache** | Cached song & audio-synced counts, storage usage, cache limit, searchable **Cached Songs** list, Reveal in Finder, Clear Cache |
-| **About** | Installed version, **Update Channel** (*Stable* releases or *Latest from main*), **Check for Updates**, SHA-256-verified DMG download to `~/Downloads` (open it and drag BarTune to Applications), GitHub links. Also reachable from the version label under the sidebar. |
+| **Appearance** | Live Preview, Color Theme (*System*, *Album Accent*, *Album Tint*), Sung Text Color (presets & custom), Background Opacity, Bar Corner Radius, Font Family, Weight, Size, Karaoke Sweep Highlight, Sung Text Glow, Word Pop, Typing Caret, Show Track Title in Bar, Line Transition (*Subtle*, *Slide*, *Blur Fade*, *Pop*, *Push*, *None*; Speed, Start Early) |
+| **Visualizer** | Live Preview, Show & Animate toggles, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width |
+| **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Manual Lyric Timing (**Edit Lyric Timing…**), Audio Karaoke Sync (*Off / Lyrics Alignment*, model download, syllable timing, lyrics-bar sync badge, Re-sync Current Track, **Advanced Diagnostics**), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
+| **Offline Cache** | Cached song & audio-synced counts, storage usage, cache limit, searchable **Cached Songs** list (inspect, reveal in Finder, remove), Reveal in Finder, Clear Cache, **Clear Audio Sync** |
+| **About** | Installed version, **Update Channel** (*Stable* releases or *Latest from main*), **Check for Updates**, SHA-256-verified DMG download with **Install & Relaunch** (in-place update for non-Homebrew installs; `Reveal in Finder` / `Open DMG` for Homebrew installs), GitHub links. Also reachable from the version label under the sidebar. |
 
 ## Permissions
 
