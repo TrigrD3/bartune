@@ -702,7 +702,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
 
     private func startNewRunIfNeeded(for request: AudioSyncManager.AudioChunkRequest) {
         let contiguous = expectedNextChunkStart.map { abs($0 - request.chunkStartTime) <= 0.5 } ?? false
-        if !contiguous || abs(request.playbackRate - runRate) > 0.001 {
+        if request.startsNewSpan || !contiguous || abs(request.playbackRate - runRate) > 0.001 {
             runStartTime = request.chunkStartTime
             runRate = request.playbackRate
             history.removeAll()

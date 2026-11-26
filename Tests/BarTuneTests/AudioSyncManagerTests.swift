@@ -4018,6 +4018,43 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testMarkedCaptureGapStartsSeparateAlignmentChunkAtCaptureTime() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10
+        state.isPlaying = false
+        let capture = FakeAudioCapture()
+        let requests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
+        let deps = makeDependencies(capture: capture, runChunk: { request in
+            requests.withLock { $0.append(request) }
+            return []
+        }, chunkDurationSeconds: 1)
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let halfSecond = [Float](repeating: 0.3, count: 8000)
+        capture.emit(samples: halfSecond, sampleRate: 16000, captureDelay: 0)
+        let buffered = await waitUntil { manager.bufferedSampleCount == halfSecond.count }
+        XCTAssertTrue(buffered)
+        state.playbackAnchorPosition = 10.51
+        capture.emit(samples: halfSecond + halfSecond, sampleRate: 16000, captureDelay: 0, startsNewSpan: true)
+
+        let processed = await waitUntil { requests.withLock(\.count) == 2 }
+        XCTAssertTrue(processed)
+        let chunks = requests.withLock { $0 }
+        let beforeDrop = try XCTUnwrap(chunks.first)
+        let afterDrop = try XCTUnwrap(chunks.dropFirst().first)
+        XCTAssertEqual(beforeDrop.samples.count, halfSecond.count)
+        XCTAssertFalse(beforeDrop.startsNewSpan)
+        XCTAssertEqual(afterDrop.samples.count, halfSecond.count * 2)
+        XCTAssertEqual(afterDrop.chunkStartTime, 10.51, accuracy: 0.0001)
+        XCTAssertTrue(afterDrop.startsNewSpan)
+    }
+
+    @MainActor
     func testChunkInferenceRunsAtBackgroundPriority() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
@@ -4410,8 +4447,10 @@ private final class FakeAudioCapture: AudioCaptureProviding {
         calls.append("stop")
     }
 
-    func emit(samples: [Float], sampleRate: Double, side: [Float] = [], captureDelay: Double? = nil) {
-        onAudioSamples?(CapturedAudio(samples: samples, side: side, sampleRate: sampleRate, captureDelay: captureDelay))
+    func emit(samples: [Float], sampleRate: Double, side: [Float] = [], captureDelay: Double? = nil, startsNewSpan: Bool = false) {
+        onAudioSamples?(CapturedAudio(
+            samples: samples, side: side, sampleRate: sampleRate, captureDelay: captureDelay, startsNewSpan: startsNewSpan
+        ))
     }
 }
 

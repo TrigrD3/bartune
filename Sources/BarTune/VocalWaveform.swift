@@ -99,10 +99,10 @@ struct VocalEnvelope {
 
     /// Appends captured audio starting at `startTime` (track seconds); `side` is empty for mono audio.
     /// Audio that doesn't continue the last append (a seek, a gap, a rate change) starts a new segment.
-    mutating func append(mid: [Float], side: [Float], sampleRate: Double, startTime: Double, rate: Double) {
+    mutating func append(mid: [Float], side: [Float], sampleRate: Double, startTime: Double, rate: Double, startsNewSpan: Bool = false) {
         guard sampleRate > 0, rate > 0, !mid.isEmpty else { return }
         let contiguous = expectedNextStart.map { abs($0 - startTime) <= 0.05 } ?? false
-        if !contiguous || sampleRate != self.sampleRate || abs(rate - self.rate) > 0.001 {
+        if startsNewSpan || !contiguous || sampleRate != self.sampleRate || abs(rate - self.rate) > 0.001 {
             self.sampleRate = sampleRate
             self.rate = rate
             midFilter = VoiceBandFilter(sampleRate: sampleRate)

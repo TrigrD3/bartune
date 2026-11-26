@@ -21,6 +21,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   AudioChroma.swift        # Bounded 12-bin chroma profiles for Lyrics Alignment audio chunks; recovers timing for repeated passages against same-lyric locked lines
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
   AudioOutputLatency.swift  # CoreAudio default-output latency monitoring for the overlay clock
+  ProcessTapAudioCapture.swift # macOS 14.2+ Core Audio Process Tap capture backend (resamples to target rate mid/side, tracks dynamic processes & HAL route changes)
   VocalSeparator.swift     # Optional Open-Unmix UMX-HQ isolation, shared stereo gain and spectral masks, resampling, and download-time Core ML compilation
   VocalWaveform.swift      # Voice-band vocal envelope (stereo centre-weighted) and word timing refinement for silence gating and held notes
   VocalPitch.swift         # Background vDSP/YIN pitch and harmonicity contour for held-note endings and vocal onset locking
@@ -67,7 +68,7 @@ Spotify / Apple Music (AppleScript + distributed notifications)
   → SpotifyMonitor (track metadata, position, AppleScript latency compensation, interpolation timer)
   → LyricsFetcher (NetEase YRC word-level sync → LRCLIB enhanced/standard LRC fallback)
   → Models (LRCParser / YRC) + Romanizer (CFStringTokenizer) + AlbumArtColorExtractor
-  ↳ Audio sync (optional): ScreenCaptureKit stereo capture → optional Open-Unmix vocal isolation (full-mix fallback) → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity + AudioChroma profiles → word refinement → LyricsAudioAligner → vocal onset locking & repeat timing recovery
+  ↳ Audio sync (optional): Core Audio Process Taps (macOS 14.2+) / ScreenCaptureKit (macOS 13–14.1) stereo capture → optional Open-Unmix vocal isolation (full-mix fallback) → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity + AudioChroma profiles → word refinement → LyricsAudioAligner → vocal onset locking & repeat timing recovery
   → LyricsState (observable state, timing offset, hover/theme/precision/browser prefs)
   → OverlayWindowController + LyricsOverlayView (left-of-notch menu bar karaoke sweep)
 ```

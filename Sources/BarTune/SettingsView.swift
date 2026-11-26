@@ -261,10 +261,15 @@ struct SettingsView: View {
             }
 
             Section("Permissions") {
+                let audioPermission = AudioCapturePermissionInfo.resolve(
+                    screenCaptureGranted: permissions.screenAudio.isGranted,
+                    processTapPermission: state.systemAudioCapturePermission,
+                    audioSyncStatus: state.audioSyncStatus
+                )
                 permissionRow(
-                    title: "Screen & System Audio",
-                    status: permissions.screenAudio,
-                    settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                    title: audioPermission.title,
+                    status: audioPermission.state,
+                    settingsURL: audioPermission.settingsURL
                 )
                 permissionRow(
                     title: "Spotify Automation",
@@ -550,7 +555,12 @@ struct SettingsView: View {
                     HStack {
                         if case .permissionRequired = state.audioSyncStatus {
                             Button("Open Privacy Settings") {
-                                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                                let urlString = AudioCapturePermissionInfo.resolve(
+                                    screenCaptureGranted: permissions.screenAudio.isGranted,
+                                    processTapPermission: state.systemAudioCapturePermission,
+                                    audioSyncStatus: state.audioSyncStatus
+                                ).settingsURL
+                                if let url = URL(string: urlString) {
                                     NSWorkspace.shared.open(url)
                                 }
                             }
@@ -1318,7 +1328,7 @@ struct SettingsView: View {
             Spacer()
             Label(status.title, systemImage: status.symbolName)
                 .font(.caption.weight(.medium))
-                .foregroundStyle(status.isGranted ? Color.green : Color.orange)
+                .foregroundStyle(status.tintColor)
             if !status.isGranted {
                 Button("Open") {
                     if let url = URL(string: settingsURL) {
@@ -1334,6 +1344,8 @@ struct SettingsView: View {
 enum PermissionAuthorizationState: Equatable, Sendable {
     case granted
     case notRequested
+    case requestedOnUse
+    case unverified
     case denied
     case targetNotRunning
 
@@ -1343,6 +1355,8 @@ enum PermissionAuthorizationState: Equatable, Sendable {
         switch self {
         case .granted: return "Granted"
         case .notRequested: return "Not Granted"
+        case .requestedOnUse: return "Requested on Use"
+        case .unverified: return "Unverified"
         case .denied: return "Denied"
         case .targetNotRunning: return "App Idle"
         }
@@ -1351,8 +1365,17 @@ enum PermissionAuthorizationState: Equatable, Sendable {
     var symbolName: String {
         switch self {
         case .granted: return "checkmark.circle.fill"
-        case .notRequested, .targetNotRunning: return "exclamationmark.circle"
+        case .requestedOnUse: return "info.circle"
+        case .notRequested, .unverified, .targetNotRunning: return "exclamationmark.circle"
         case .denied: return "xmark.circle.fill"
+        }
+    }
+
+    var tintColor: Color {
+        switch self {
+        case .granted: return .green
+        case .requestedOnUse: return .secondary
+        case .notRequested, .unverified, .targetNotRunning, .denied: return .orange
         }
     }
 
@@ -1374,6 +1397,49 @@ enum PermissionAuthorizationState: Equatable, Sendable {
     }
 }
 
+struct AudioCapturePermissionInfo: Equatable, Sendable {
+    let title: String
+    let settingsURL: String
+    let state: PermissionAuthorizationState
+
+    static var usesProcessTapOnCurrentOS: Bool {
+        if #available(macOS 14.2, *) {
+            return true
+        }
+        return false
+    }
+
+    static func resolve(
+        usesProcessTap: Bool = usesProcessTapOnCurrentOS,
+        screenCaptureGranted: Bool,
+        processTapPermission: SystemAudioCapturePermission,
+        audioSyncStatus: AudioSyncStatus
+    ) -> AudioCapturePermissionInfo {
+        if usesProcessTap {
+            let state: PermissionAuthorizationState = switch processTapPermission {
+            case .denied:
+                .denied
+            case .granted, .unknown:
+                if audioSyncStatus == .processTapNoAudioWarning {
+                    .unverified
+                } else {
+                    processTapPermission == .granted ? .granted : .requestedOnUse
+                }
+            }
+            return AudioCapturePermissionInfo(
+                title: "System Audio Recording",
+                settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_AudioCapture",
+                state: state
+            )
+        }
+        return AudioCapturePermissionInfo(
+            title: "Screen & System Audio",
+            settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture",
+            state: .fromScreenCapture(screenCaptureGranted)
+        )
+    }
+}
+
 struct AppPermissionsSnapshot: Equatable, Sendable {
     let screenAudio: PermissionAuthorizationState
     let spotifyAutomation: PermissionAuthorizationState
@@ -1386,7 +1452,13 @@ struct AppPermissionsSnapshot: Equatable, Sendable {
 
 private enum AppPermissionsChecker {
     static func current() -> AppPermissionsSnapshot {
-        let screenAudio = PermissionAuthorizationState.fromScreenCapture(CGPreflightScreenCaptureAccess())
+        // On macOS 14.2+, Core Audio Process Taps use System Audio Recording Only (no preflight API),
+        // so avoid calling CGPreflightScreenCaptureAccess() which checks Screen Recording.
+        let screenAudio: PermissionAuthorizationState = if AudioCapturePermissionInfo.usesProcessTapOnCurrentOS {
+            .requestedOnUse
+        } else {
+            PermissionAuthorizationState.fromScreenCapture(CGPreflightScreenCaptureAccess())
+        }
         let automation = checkAutomation(bundleIdentifier: "com.spotify.client")
         return AppPermissionsSnapshot(
             screenAudio: screenAudio,
