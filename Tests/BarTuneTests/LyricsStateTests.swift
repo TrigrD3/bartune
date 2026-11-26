@@ -1,4 +1,5 @@
 @testable import BarTune
+import AppKit
 import Combine
 import XCTest
 
@@ -8,6 +9,71 @@ final class LyricsStateTests: XCTestCase {
         let suiteName = "com.arya.bartune.tests.\(UUID().uuidString)"
         let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         return (LyricsState(userDefaults: ud), ud, suiteName)
+    }
+
+    func testOutputLatencyDelaysDisplayWithoutChangingTrackPosition() throws {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertTrue(state.compensateOutputLatency)
+        XCTAssertEqual(state.outputLatencySeconds, 0)
+        let sample = Date(timeIntervalSinceNow: 60)
+        let lead = LyricLine(id: 0, timestamp: 1, duration: 1, text: "Lead", words: [
+            WordTimestamp(timestamp: 1.875, duration: 0.125, text: "Lead"),
+        ])
+        let next = LyricLine(id: 1, timestamp: 2.1, text: "Next")
+        let font = NSFont.systemFont(ofSize: 14)
+        state.lineTransitionStartsEarly = false
+        state.setTrack(nil, lyrics: [lead, next])
+        state.offsetSeconds = 0.2
+        state.outputLatencySeconds = 0.4
+        state.updatePlayback(isPlaying: true, position: 2, playbackRate: 2, sampledAt: sample)
+
+        XCTAssertEqual(state.activeLine, lead)
+        XCTAssertEqual(state.liveProgress(at: sample, font: font), 0)
+        XCTAssertTrue(state.liveIsWaitingForWord(at: sample))
+        XCTAssertNil(state.liveWordPop(at: sample, font: font))
+        XCTAssertEqual(state.liveProgress(at: sample.addingTimeInterval(0.05), font: font), 0)
+        // At 2×, the word starts 0.1625 s before the sample without compensation.
+        // A 0.4 s hardware delay moves its onset to 0.2375 s after the sample.
+        let duringWord = sample.addingTimeInterval(0.25)
+        XCTAssertEqual(state.liveProgress(at: duringWord, font: font), 0.104, accuracy: 1e-5)
+        XCTAssertFalse(state.liveIsWaitingForWord(at: duringWord))
+        XCTAssertEqual(try XCTUnwrap(state.liveWordPop(at: duringWord, font: font)).strength, 0.3125, accuracy: 1e-5)
+        XCTAssertEqual(state.currentPlaybackPosition(at: duringWord), 2.5, accuracy: 1e-5)
+
+        state.compensateOutputLatency = false
+        XCTAssertEqual(state.activeLine, next)
+        XCTAssertFalse(LyricsState(userDefaults: ud).compensateOutputLatency)
+        state.compensateOutputLatency = true
+        XCTAssertEqual(state.activeLine, lead)
+        state.outputLatencySeconds = 0.04
+        XCTAssertEqual(state.activeLine, next)
+        XCTAssertEqual(state.currentPlaybackPosition(at: duringWord), 2.5, accuracy: 1e-5)
+    }
+
+    func testLyricReplacementUsesCompensatedDisplayPosition() throws {
+        let (state, ud, suiteName) = try makeIsolatedState()
+        defer { ud.removePersistentDomain(forName: suiteName) }
+
+        let first = LyricLine(id: 0, timestamp: 1, text: "First")
+        let second = LyricLine(id: 1, timestamp: 2, text: "Second")
+        state.setTrack(nil, lyrics: [first, second])
+        state.translateLyrics = true
+        state.lineTransitionStartsEarly = false
+        state.outputLatencySeconds = 0.4
+        state.updatePlayback(isPlaying: true, position: 2.2, sampledAt: Date(timeIntervalSinceNow: 60))
+
+        let translation = LyricLine(id: 0, timestamp: 1, text: "Translated first")
+        state.setTranslatedLines([translation])
+        XCTAssertEqual(state.currentText, translation.text)
+        state.setTranslatedLines([])
+        XCTAssertEqual(state.currentText, first.text)
+
+        let resyncedFirst = LyricLine(id: 0, timestamp: 1.2, text: first.text)
+        state.applyAudioSyncedLines([resyncedFirst, second])
+        XCTAssertEqual(state.activeLine, resyncedFirst)
+        XCTAssertEqual(state.rawLyricLines, [resyncedFirst, second])
     }
 
     func testClockErrorIsTheOverlayClockMinusThePositionReportedAtTheSampleTime() throws {

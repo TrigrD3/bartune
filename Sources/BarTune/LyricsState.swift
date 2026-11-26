@@ -348,6 +348,7 @@ final class LyricsState: ObservableObject {
         static let browserMusicEnabled = "bartune.browserMusicEnabled"
         static let browserYouTubeVideosEnabled = "bartune.browserYouTubeVideosEnabled"
         static let trackOffsets = "bartune.trackOffsets"
+        static let compensateOutputLatency = "bartune.compensateOutputLatency"
         static let trackLyricSources = "bartune.trackLyricSources"
         static let audioSyncEngine = "bartune.audioSyncEngine"
         static let syllableTiming = "bartune.syllableTiming"
@@ -389,6 +390,23 @@ final class LyricsState: ObservableObject {
             userDefaults.set(trackOffsets, forKey: Keys.trackOffsets)
         }
     }
+    @Published var compensateOutputLatency: Bool {
+        didSet {
+            userDefaults.set(compensateOutputLatency, forKey: Keys.compensateOutputLatency)
+            refreshActiveLineForCurrentPosition()
+        }
+    }
+
+    @Published var outputLatencySeconds: Double = 0.0 {
+        didSet {
+            if compensateOutputLatency, outputLatencySeconds != oldValue {
+                refreshActiveLineForCurrentPosition()
+            }
+        }
+    }
+
+    var activeOutputLatencyCompensation: Double { compensateOutputLatency ? outputLatencySeconds : 0.0 }
+
     @Published var albumColors: ExtractedAlbumColors? = nil
     @Published var audioSyncStatus: AudioSyncStatus = .idle
     var onResyncCurrentTrack: (() -> Void)?
@@ -682,6 +700,7 @@ final class LyricsState: ObservableObject {
     init(userDefaults: UserDefaults = .standard) {
         self.userDefaults = userDefaults
         let ud = userDefaults
+        self.compensateOutputLatency = ud.object(forKey: Keys.compensateOutputLatency) as? Bool ?? true
 
         if let raw = ud.string(forKey: Keys.hoverMode), let parsed = HoverMode(rawValue: raw) {
             self.hoverMode = parsed
@@ -803,7 +822,7 @@ final class LyricsState: ObservableObject {
         userDefaults.set(trackLyricSources, forKey: Keys.trackLyricSources)
     }
 
-    /// Current playback position in track seconds without the per-track sync offset, used for manual stamping.
+    /// Current playback position in track seconds, used for manual stamping.
     func currentPlaybackPosition(at date: Date = Date()) -> Double {
         let elapsed = isPlaying ? max(0.0, date.timeIntervalSince(playbackAnchorDate)) : 0.0
         return max(0.0, playbackAnchorPosition + elapsed * playbackRate)
@@ -811,7 +830,11 @@ final class LyricsState: ObservableObject {
 
     func refreshActiveLineForCurrentPosition(at date: Date = Date()) {
         guard isPlaying, !activeLines.isEmpty else { return }
-        syncActiveLine(for: currentPlaybackPosition(at: date) + offsetSeconds, in: activeLines)
+        syncActiveLine(for: displayPosition(for: currentPlaybackPosition(at: date)), in: activeLines)
+    }
+
+    private func displayPosition(for playbackPosition: Double) -> Double {
+        playbackPosition + offsetSeconds - activeOutputLatencyCompensation * playbackRate
     }
 
     func setTrack(_ track: TrackInfo?, lyrics: [LyricLine]) {
@@ -952,7 +975,7 @@ final class LyricsState: ObservableObject {
             translationsById = [:]
             translatedLines = []
             if isPlaying {
-                syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
+                syncActiveLine(for: displayPosition(for: extrapolatedPlaybackPosition()), in: activeLines)
             } else {
                 refreshCurrentLineText()
             }
@@ -962,7 +985,7 @@ final class LyricsState: ObservableObject {
             translationsById = [:]
             translatedLines = lines
             if isPlaying {
-                syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
+                syncActiveLine(for: displayPosition(for: extrapolatedPlaybackPosition()), in: activeLines)
             } else {
                 refreshCurrentLineText()
             }
@@ -985,7 +1008,7 @@ final class LyricsState: ObservableObject {
         translationsById = entries
         translatedLines = Self.projectTranslatedLines(entries, onto: rawLines)
         if isPlaying {
-            syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
+            syncActiveLine(for: displayPosition(for: extrapolatedPlaybackPosition()), in: activeLines)
         } else {
             refreshCurrentLineText()
         }
@@ -1020,7 +1043,7 @@ final class LyricsState: ObservableObject {
             )
         }
         if isPlaying {
-            syncActiveLine(for: extrapolatedPlaybackPosition() + offsetSeconds, in: activeLines)
+            syncActiveLine(for: displayPosition(for: extrapolatedPlaybackPosition()), in: activeLines)
         } else {
             refreshCurrentLineText()
         }
@@ -1079,8 +1102,7 @@ final class LyricsState: ObservableObject {
         return playbackAnchorPosition + elapsed * playbackRate
     }
 
-    /// How far ahead of the player the overlay's clock was when the player reported `reportedPosition`;
-    /// nil while paused.
+    /// How far ahead of the player the interpolated track clock was at the reported time. Nil while paused.
     func clockError(reportedPosition: Double, at date: Date) -> Double? {
         isPlaying ? extrapolatedPlaybackPosition(at: date) - reportedPosition : nil
     }
@@ -1112,7 +1134,7 @@ final class LyricsState: ObservableObject {
             return
         }
 
-        syncActiveLine(for: position + offsetSeconds, in: lines)
+        syncActiveLine(for: displayPosition(for: position), in: lines)
     }
 
     private static func areTimestampsNonDecreasing(_ lines: [LyricLine]) -> Bool {
@@ -1214,8 +1236,7 @@ final class LyricsState: ObservableObject {
     /// The word popping now on the active line, for the overlay; nil without measured word positions.
     func liveWordPop(at date: Date, font: NSFont) -> WordPop? {
         guard isPlaying, let line = activeLine, let boundaries = wordBoundaries(for: line, font: font) else { return nil }
-        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
-        let position = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
+        let position = displayPosition(for: extrapolatedPlaybackPosition(at: date))
         return Self.wordPop(words: line.words, boundaries: boundaries, position: position)
     }
 
@@ -1236,8 +1257,7 @@ final class LyricsState: ObservableObject {
 
     func liveIsWaitingForWord(at date: Date) -> Bool {
         guard isPlaying, let line = activeLine else { return true }
-        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
-        let position = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
+        let position = displayPosition(for: extrapolatedPlaybackPosition(at: date))
         return Self.isWaitingForWord(line: line, nextTimestamp: activeLineNextTimestamp, position: position)
     }
 
@@ -1252,8 +1272,7 @@ final class LyricsState: ObservableObject {
     /// `font` is the overlay's font; with it, the edge moves through measured glyph positions.
     func liveProgress(at date: Date, font: NSFont? = nil) -> Double {
         guard isPlaying, let line = activeLine else { return 0.0 }
-        let elapsedSinceAnchor = max(0.0, date.timeIntervalSince(playbackAnchorDate))
-        let effectivePos = playbackAnchorPosition + elapsedSinceAnchor * playbackRate + offsetSeconds
+        let effectivePos = displayPosition(for: extrapolatedPlaybackPosition(at: date))
         let boundaries = font.flatMap { wordBoundaries(for: line, font: $0) }
         return Self.computeLineProgress(
             line: line,

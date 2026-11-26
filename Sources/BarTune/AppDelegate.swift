@@ -4,7 +4,7 @@ import os
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    /// Overlay clock vs player position on every poll; `scripts/playback-clock-report.py` summarizes it.
+    /// Interpolated track clock vs player position on every poll; `scripts/playback-clock-report.py` summarizes it.
     private static let clockLogger = Logger(subsystem: "com.arya.BarTune", category: "playback-clock")
     private let state: LyricsState
     private let spotifyMonitor: SpotifyMonitor
@@ -14,6 +14,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let colorExtractor: AlbumArtColorExtractor
     private let appUpdater = AppUpdaterModel()
     private let audioSyncManager: AudioSyncManager
+    private let audioOutputLatencyMonitor = AudioOutputLatencyMonitor()
     private let customLyricsStore: CustomLyricsStore
     private var overlayController: OverlayWindowController?
     private var settingsController: SettingsWindowController?
@@ -110,6 +111,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func startPlaybackMonitoring() {
         cancellables.removeAll()
+        audioOutputLatencyMonitor.start { [weak self] latency in
+            guard let self, self.state.outputLatencySeconds != latency else { return }
+            self.state.outputLatencySeconds = latency
+        }
         spotifyMonitor.onUpdate = { [weak self] snapshot in
             self?.handlePlaybackUpdate(snapshot)
         }
@@ -213,6 +218,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func stopPlaybackMonitoring() {
         cancellables.removeAll()
+        audioOutputLatencyMonitor.stop()
         audioSyncManager.stop()
         spotifyMonitor.stop()
         fetchTask?.cancel()
