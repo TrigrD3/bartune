@@ -21,6 +21,10 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="GPLv3 License" /></a>
 </p>
 
+<p align="center">
+  <img src="docs/preview.gif" width="840" alt="BarTune preview — real-time karaoke lyrics tucked beside the MacBook notch" />
+</p>
+
 ---
 
 ## Why BarTune?
