@@ -80,9 +80,10 @@ enum ForcedAlignmentText {
         case latin, japanese, korean, chinese
 
         static func detect(in lines: [LyricLine]) -> Script {
-            if JapaneseRomanizer.isJapaneseTrack(lines) { return .japanese }
-            if KoreanRomanizer.isKoreanTrack(lines) { return .korean }
-            if ChineseRomanizer.isChineseTrack(lines) { return .chinese }
+            let lyricalLines = lines.filter { !ForcedAlignmentText.isStructuralTag($0.text) }
+            if JapaneseRomanizer.isJapaneseTrack(lyricalLines) { return .japanese }
+            if KoreanRomanizer.isKoreanTrack(lyricalLines) { return .korean }
+            if ChineseRomanizer.isChineseTrack(lyricalLines) { return .chinese }
             return .latin
         }
     }
@@ -90,6 +91,7 @@ enum ForcedAlignmentText {
     struct Word: Equatable {
         let display: String
         let reading: String
+        let tokenIndex: Int
         var tokenIDs: [Int] { reading.compactMap { ForcedAlignmentText.vocabulary[$0] } }
     }
 
@@ -97,22 +99,173 @@ enum ForcedAlignmentText {
     static let vocabulary: [Character: Int] = Dictionary(uniqueKeysWithValues: Array("aienoutsrmkldghybpwcvjzf'qx")
         .enumerated().map { ($1, $0 + 4) })
 
+    private static let structuralTag = try! NSRegularExpression(
+        pattern: #"^(?:\[\s*(?:(?:pre|post)[ -]?)?(?:chorus|verse|intro|bridge|outro|instrumental|interlude|refrain|hook|break|(?:guitar\s+)?solo)(?:\s+\d+)?(?:\s+x\d+)?(?:\s*:[^\[\]]*)?\s*\]|\(\s*(?:x\s*\d+|\d+\s*x)\s*\))$"#,
+        options: .caseInsensitive
+    )
+
+    static func isStructuralTag(_ text: String) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.first == "[" || trimmed.first == "(" else { return false }
+        return structuralTag.firstMatch(in: trimmed, range: NSRange(trimmed.startIndex..., in: trimmed)) != nil
+    }
+
+    private static let symbolReadings: [Character: String] = ["&": "and", "%": "percent", "+": "plus"]
+
+    /// A symbol-only display token can still be spoken by the forced alignment model.
+    static func displaySymbols(in text: String) -> String {
+        String(text.filter { symbolReadings[$0] != nil })
+    }
+
+    static func containsLead(_ display: String, withBackingVocalsRemoved lead: String) -> Bool {
+        display == lead || lead.contains(where: canBeSung)
+    }
+
+    private static func canBeSung(_ character: Character) -> Bool {
+        character.isLetter || character.isNumber || symbolReadings[character] != nil
+    }
+
+    /// Same token boundaries as the original display, with inline backing vocals removed from readings.
+    static func leadDisplays(in displays: [String]) -> [String] {
+        guard displays.contains(where: { $0.contains("(") }) else { return displays }
+
+        var groups: [Range<Int>] = []
+        var depth = 0
+        var start = 0
+        for (offset, character) in displays.lazy.flatMap({ $0 }).enumerated() {
+            if character == "(" {
+                if depth == 0 { start = offset }
+                depth += 1
+            } else if character == ")", depth > 0 {
+                depth -= 1
+                if depth == 0 { groups.append(start..<(offset + 1)) }
+            }
+        }
+        guard !groups.isEmpty else { return displays }
+
+        var offset = 0
+        var group = 0
+        let outside = displays.map { display in
+            display.filter { _ in
+                defer { offset += 1 }
+                if group < groups.count, offset == groups[group].upperBound { group += 1 }
+                return group == groups.count || !groups[group].contains(offset)
+            }
+        }
+        let hasLead = outside.contains { $0.contains(where: canBeSung) }
+        return hasLead ? outside : displays
+    }
+
     /// Lyric tokens of one line (as `LyricsAudioAligner.tokenizeLine` splits it) with their readings.
-    /// Tokens with no readable letters, such as punctuation or symbols, are left out.
+    /// Tokens with no model reading, such as decorative punctuation, are left out.
     static func words(for text: String, script: Script) -> [Word] {
-        let displays = LyricsAudioAligner.tokenizeLine(text)
-            .map { $0.display.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        guard !isStructuralTag(text) else { return [] }
+        let tokens = LyricsAudioAligner.tokenizeLine(text)
+        let lead = leadDisplays(in: tokens.map(\.display)).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let leadIndices = lead.indices.filter { !lead[$0].isEmpty }
+        let spoken = leadIndices.map { lead[$0] }
         let readings: [String] = switch script {
-        case .japanese: JapaneseRomanizer.romanizeWords(displays)
-        case .korean: displays.map(KoreanRomanizer.romanizeLine)
-        case .chinese: displays.map(ChineseRomanizer.romanizeLine)
-        case .latin: displays
+        case .japanese: JapaneseRomanizer.romanizeWords(spoken)
+        case .korean: spoken.map(KoreanRomanizer.romanizeLine)
+        case .chinese: spoken.map(ChineseRomanizer.romanizeLine)
+        case .latin: spoken
         }
-        return zip(displays, readings).compactMap { display, reading in
-            let letters = letters(of: reading)
-            return letters.isEmpty ? nil : Word(display: display, reading: letters)
+        return zip(leadIndices, readings).compactMap { index, reading in
+            let leadDisplay = lead[index]
+            let isLatin = script == .latin || (!JapaneseRomanizer.containsJapaneseOrCJK(leadDisplay) && !KoreanRomanizer.containsHangul(leadDisplay))
+            let letters = letters(of: isLatin && !reading.isEmpty ? latinReading(leadDisplay) : reading)
+            let display = tokens[index].display.trimmingCharacters(in: .whitespacesAndNewlines)
+            return letters.isEmpty ? nil : Word(display: display, reading: letters, tokenIndex: index)
         }
+    }
+
+    private static let elisions = ["'bout": "about", "'cause": "cause", "'cuz": "cause", "'til": "until", "'em": "them", "'round": "around"]
+    private static let numericToken = try! NSRegularExpression(
+        pattern: #"(?<![\p{L}\p{N}])(?:[0-9]{1,3}(?:,[0-9]{3})+|24/7|[0-9]{1,4}(?:st|nd|rd|th)?)(?![\p{L}\p{N}])"#
+    )
+    private static let smallNumbers = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+        "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen",
+    ]
+    private static let tens = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"]
+    private static let cardinalScales: [(Int, String)] = [
+        (1_000_000_000_000_000_000, "quintillion"),
+        (1_000_000_000_000_000, "quadrillion"),
+        (1_000_000_000_000, "trillion"),
+        (1_000_000_000, "billion"),
+        (1_000_000, "million"),
+        (1000, "thousand"),
+    ]
+    private static let irregularOrdinals = [
+        "one": "first",
+        "two": "second",
+        "three": "third",
+        "five": "fifth",
+        "eight": "eighth",
+        "nine": "ninth",
+        "twelve": "twelfth"
+    ]
+
+    private static func latinReading(_ text: String) -> String {
+        guard !text.allSatisfy(\.isLetter) else { return text }
+        let straight = text.lowercased().replacingOccurrences(of: "’", with: "'").replacingOccurrences(of: "‘", with: "'")
+        var reading = straight
+        if let apostrophe = straight.firstIndex(where: { $0.isLetter || $0 == "'" }), straight[apostrophe] == "'" {
+            let word = straight[straight.index(after: apostrophe)...].prefix(while: \.isLetter)
+            if let expansion = elisions["'" + word] {
+                reading.replaceSubrange(apostrophe..<word.endIndex, with: expansion)
+            }
+        }
+        if reading.utf8.contains(where: { (48...57).contains($0) }) {
+            let numericMatches = numericToken.matches(in: reading, range: NSRange(reading.startIndex..., in: reading))
+            // Edit in reverse order so the next match's UTF-16 offsets still refer to the same text.
+            for match in numericMatches.reversed() {
+                guard let range = Range(match.range, in: reading) else { continue }
+                reading.replaceSubrange(range, with: numberReading(reading[range]))
+            }
+        }
+        for (symbol, spoken) in symbolReadings where reading.contains(symbol) {
+            reading = reading.replacingOccurrences(of: String(symbol), with: spoken)
+        }
+        return reading
+    }
+
+    private static func numberReading(_ text: Substring) -> String {
+        if text == "24/7" { return "twenty four seven" }
+        // Comma grouping makes the cardinal reading explicit, even for four-digit values.
+        if text.contains(",") {
+            guard let number = Int(text.replacingOccurrences(of: ",", with: "")) else { return String(text) }
+            return cardinal(number)
+        }
+        let digits = text.prefix(while: \.isNumber)
+        guard let number = Int(digits) else { return String(text) }
+        if digits.count < text.count {
+            var components = cardinal(number).split(separator: " ")
+            guard let last = components.popLast() else { return String(text) }
+            let ordinal = irregularOrdinals[String(last)] ?? (last.hasSuffix("y") ? "\(last.dropLast())ieth" : "\(last)th")
+            return (components + [Substring(ordinal)]).joined(separator: " ")
+        }
+        let remainder = number % 100
+        if (1100...1999).contains(number) {
+            let century = cardinal(number / 100)
+            if remainder == 0 { return century + " hundred" }
+            return century + (remainder < 10 ? " oh " : " ") + cardinal(remainder)
+        }
+        if (2010...2099).contains(number) { return "twenty " + cardinal(remainder) }
+        return cardinal(number)
+    }
+
+    private static func cardinal(_ number: Int) -> String {
+        if number < smallNumbers.count { return smallNumbers[number] }
+        for (base, scale) in cardinalScales where number >= base {
+            let high = cardinal(number / base) + " " + scale
+            let low = number % base
+            return low == 0 ? high : high + " " + cardinal(low)
+        }
+        let base = number < 100 ? 10 : 100
+        let high = base == 10 ? tens[number / base] : smallNumbers[number / base] + " hundred"
+        let low = number % base
+        return low == 0 ? high : high + " " + cardinal(low)
     }
 
     /// The model's letters in `reading`, with diacritics stripped.
@@ -310,6 +463,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let contextEnd: Double
         let searchEnd: Double
         let words: [ForcedAlignmentText.Word]
+        let wordIntervals: [ClosedRange<Double>]?
         /// Each word's syllables, empty for a word of one.
         let syllables: [[ForcedAlignmentText.Syllable]]
         /// Track-time limits from the nearest lines already aligned before and after this one.
@@ -326,6 +480,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         /// The search edges before neighboring anchors constrain the CTC path.
         let rawStart: Double
         let rawEnd: Double
+        /// Estimated track-time shift for word priors; nil while testing a coarse offset.
+        let wordOffset: Double?
     }
 
     private struct Alignment {
@@ -386,15 +542,16 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         self.model = model
         self.lineWindow = lineWindow
         holdBackSamples = Int(holdBack * Double(Self.sampleRate))
+        let alignmentRows = lines.filter { !ForcedAlignmentText.isStructuralTag($0.text) }
         let script = ForcedAlignmentText.Script.detect(in: lines)
-        let latinRules = LatinSyllabifier.Rules.detect(in: lines)
+        let latinRules = LatinSyllabifier.Rules.detect(in: alignmentRows)
         let instrumentalGap = 12.0
         var prepared: [PreparedLine] = []
         var spans: [ClosedRange<Double>?] = []
-        for (index, line) in lines.enumerated() {
+        for (index, line) in alignmentRows.enumerated() {
             let words = ForcedAlignmentText.words(for: line.text, script: script)
             guard !words.isEmpty else { continue }
-            let next = index + 1 < lines.count ? lines[index + 1] : nil
+            let next = index + 1 < alignmentRows.count ? alignmentRows[index + 1] : nil
             let endsAtBlank = next?.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
             let duration = line.duration ?? 0
             let nextTime = next?.timestamp ?? (line.timestamp + max(5, duration))
@@ -408,6 +565,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 contextEnd: contextEnd,
                 searchEnd: endsAtBlank || hasLongGap ? contextEnd : max(contextEnd, line.timestamp + duration),
                 words: words,
+                wordIntervals: Self.wordIntervals(in: line, matching: words),
                 syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
             ))
             spans.append(anchors[line.id])
@@ -436,6 +594,37 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         anchoredIndices = anchored
         done = anchored
         lineOffsets = offsets
+    }
+
+    private static func wordIntervals(in line: LyricLine, matching words: [ForcedAlignmentText.Word]) -> [ClosedRange<Double>]? {
+        guard !line.words.isEmpty,
+              line.words.allSatisfy({ word in
+                  let duration = word.duration ?? 0
+                  return word.timestamp >= 0 && duration >= 0 && (word.timestamp + duration).isFinite
+              }),
+              !zip(line.words, line.words.dropFirst()).contains(where: { $0.timestamp > $1.timestamp })
+        else { return nil }
+
+        let groups: [[WordTimestamp]]
+        if let displayGroups = LyricsAudioAligner.tokenGroups(of: line) {
+            groups = words.map { displayGroups[$0.tokenIndex] }
+        } else {
+            // Some providers omit surrounding whitespace on individual timed words.
+            let displays = LyricsAudioAligner.tokenizeLine(line.text).map(\.display)
+            let coversAllDisplayTokens = line.words.count == displays.count
+            let expected = coversAllDisplayTokens ? displays : words.map(\.display)
+            guard line.words.count == expected.count, zip(line.words, expected).allSatisfy({ word, display in
+                word.text.trimmingCharacters(in: .whitespacesAndNewlines) == display.trimmingCharacters(in: .whitespacesAndNewlines)
+            }) else { return nil }
+            groups = coversAllDisplayTokens ? words.map { [line.words[$0.tokenIndex]] } : line.words.map { [$0] }
+        }
+        let intervals = groups.compactMap { group -> ClosedRange<Double>? in
+            guard let start = group.first?.timestamp,
+                  let end = group.map({ $0.timestamp + ($0.duration ?? 0) }).max()
+            else { return nil }
+            return start...end
+        }
+        return intervals.count == words.count ? intervals : nil
     }
 
     var attemptedLineIDs: Set<Int> {
@@ -662,27 +851,34 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     }
 
     /// Aligns `batch` together and evaluates the words of its first `keep` lines.
-    private func align(_ batch: [Int], keeping keep: Int, coarseShift: Double? = nil) -> Alignment? {
+    private func align(
+        _ batch: [Int], keeping keep: Int, coarseShift: Double? = nil, usesWordPriors: Bool = true, frameBounds: ClosedRange<Int>? = nil
+    ) -> Alignment? {
         let windows = batch.map { searchWindow(for: $0, coarseShift: coarseShift) }
         guard let start = windows.map(\.start).min(), let end = windows.map(\.end).max() else { return nil }
-        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: start))
-        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: end))
+        let lowFrame = max(alignedUntilFrame, runFrame(atTrackTime: start), frameBounds?.lowerBound ?? 0)
+        let highFrame = min(committedFrames - 1, runFrame(atTrackTime: end), frameBounds?.upperBound ?? Int.max)
         guard highFrame > lowFrame else { return nil }
 
         var tokens: [Int] = []
         var allowed: [ClosedRange<Int>] = []
         var pinningRanges: [ClosedRange<Int>] = []
         var owners: [(line: Int, word: Int)] = []
+        var restrictedByWordPriors = false
         for (index, window) in zip(batch, windows) {
             let line = lines[index]
             let low = max(lowFrame, runFrame(atTrackTime: window.start))
             let high = min(highFrame, runFrame(atTrackTime: window.end))
             guard high >= low else { return nil }
+            let lineRange = (low - lowFrame)...(high - lowFrame)
+            let wordRanges = usesWordPriors ? priorFrameRanges(line.wordIntervals, in: window, frames: low...high, from: lowFrame) : nil
             pinningRanges.append(runFrame(atTrackTime: window.rawStart)...min(committedFrames - 1, runFrame(atTrackTime: window.rawEnd)))
             for (wordIndex, word) in line.words.enumerated() {
+                let range = wordRanges?[wordIndex] ?? lineRange
+                if range != lineRange { restrictedByWordPriors = true }
                 for token in word.tokenIDs {
                     tokens.append(token)
-                    allowed.append((low - lowFrame)...(high - lowFrame))
+                    allowed.append(range)
                     owners.append((index, wordIndex))
                 }
             }
@@ -690,7 +886,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let vocab = model.vocabSize
         let slice = Array(frames[(lowFrame * vocab)..<((highFrame + 1) * vocab)])
         guard let spans = CTCForcedAlignment.align(logProbs: slice, vocabSize: vocab, tokens: tokens, allowedFrames: allowed)
-        else { return nil }
+        else { return restrictedByWordPriors ? align(batch, keeping: keep, coarseShift: coarseShift, usesWordPriors: false) : nil }
 
         let kept = Set(batch.prefix(keep))
         var words: [RecognizedAudioWord] = []
@@ -716,7 +912,59 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             ))
             cursor = end + 1
         }
-        return dropUnreliableLines(words, lines: batch.prefix(keep), pinningRanges: pinningRanges)
+        let keptLines = batch.prefix(keep)
+        let alignment = dropUnreliableLines(words, lines: keptLines, pinningRanges: pinningRanges)
+        guard restrictedByWordPriors else { return alignment }
+        if alignment.words.isEmpty {
+            // A provider's times can spell the lyrics correctly yet miss the actual vocal entirely.
+            return align(batch, keeping: keep, coarseShift: coarseShift, usesWordPriors: false) ?? alignment
+        }
+        return retryRejectedLines(in: alignment, keeping: keptLines, coarseShift: coarseShift)
+    }
+
+    private func retryRejectedLines(in alignment: Alignment, keeping kept: ArraySlice<Int>, coarseShift: Double?) -> Alignment {
+        let accepted = Dictionary(grouping: alignment.words, by: \.sourceLineId)
+        let rejectedRuns = kept.split { accepted[lines[$0].id] != nil }
+        guard !rejectedRuns.isEmpty else { return alignment }
+
+        var combined = alignment
+        // Each rejected run can search the full line windows between its accepted neighbors.
+        for run in rejectedRuns {
+            var low = alignedUntilFrame
+            var high = committedFrames - 1
+            if run.startIndex > kept.startIndex, let previous = accepted[lines[kept[run.startIndex - 1]].id]?.last {
+                low = runFrame(atTrackTime: previous.startTime + previous.duration)
+            }
+            if run.endIndex < kept.endIndex, let next = accepted[lines[kept[run.endIndex]].id]?.first {
+                high = runFrame(atTrackTime: next.startTime) - 1
+            }
+            guard low < high,
+                  let retry = align(Array(run), keeping: run.count, coarseShift: coarseShift, usesWordPriors: false, frameBounds: low...high)
+            else { continue }
+            combined.words.append(contentsOf: retry.words)
+            combined.confidentOffsets.merge(retry.confidentOffsets) { accepted, _ in accepted }
+            combined.nearlyConfident.formUnion(retry.nearlyConfident)
+            combined.confidenceSum += retry.confidenceSum
+        }
+        combined.words.sort { $0.startTime < $1.startTime }
+        return combined
+    }
+
+    private func priorFrameRanges(
+        _ intervals: [ClosedRange<Double>]?, in window: SearchWindow, frames: ClosedRange<Int>, from lowFrame: Int
+    ) -> [ClosedRange<Int>]? {
+        guard let intervals, let offset = window.wordOffset else { return nil }
+        let start = max(window.start, trackTime(ofRunFrame: frames.lowerBound))
+        let end = min(window.end, trackTime(ofRunFrame: frames.upperBound))
+        let padding = 1.0
+        var ranges: [ClosedRange<Int>] = []
+        for interval in intervals {
+            let lower = max(start, interval.lowerBound + offset - padding)
+            let upper = min(end, interval.upperBound + offset + padding)
+            guard lower <= upper else { return nil }
+            ranges.append((runFrame(atTrackTime: lower) - lowFrame)...(runFrame(atTrackTime: upper) - lowFrame))
+        }
+        return ranges
     }
 
     private func commit(_ alignment: Alignment) -> [RecognizedAudioWord] {
@@ -794,7 +1042,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             // Later anchors can widen the search on replay; an earlier match can establish a missed onset.
             latestOnset: coarseShift.map { line.start + $0 } ?? max(0, priorCount < 2 ? max(line.start, shiftedOnset) : shiftedOnset),
             rawStart: rawStart,
-            rawEnd: rawEnd
+            rawEnd: rawEnd,
+            wordOffset: coarseShift == nil ? offset : nil
         )
     }
 

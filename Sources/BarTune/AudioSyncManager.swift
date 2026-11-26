@@ -1375,7 +1375,9 @@ final class AudioSyncManager {
         let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !lockedThisPlay.isEmpty || !preserved.isEmpty else { return result }
         let minLineGap = 0.15
-        let isNonEmpty: (LyricLine) -> Bool = { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let isNonEmpty: (LyricLine) -> Bool = {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !ForcedAlignmentText.isStructuralTag($0.text)
+        }
         let lockedIDs = Set(anchoredLines.keys).union(lockedThisPlay.keys)
         let resultMatched = Set(result.matchedLineIDs)
         let baseByID = Dictionary(uniqueKeysWithValues: baseLines.map { ($0.id, $0) })
@@ -1551,7 +1553,7 @@ final class AudioSyncManager {
                     let hasCompressedBlankBefore = prevBlankTimestamp != nil && idx > 0
                         && lines[idx - 1].timestamp < prevLineEnd
                     if placed.timestamp < prevLineEnd || hasCompressedBlankBefore {
-                        LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: placed.timestamp)
+                        LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: placed.timestamp, ignoringStructuralTags: true)
                     }
                     prevEmittedTimestamp = placed.timestamp
                     let placedEnd = placed.timestamp + max(0.25, placed.duration ?? 0.25)
@@ -1607,7 +1609,7 @@ final class AudioSyncManager {
         // Reconcile preceding boundaries for matched lines so restoring a locked line's held tail
         // trims cleanly against an earlier recovered next line and keeps intervening blanks ordered.
         for idx in lines.indices where isNonEmpty(lines[idx]) && matched.contains(lines[idx].id) {
-            LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: lines[idx].timestamp)
+            LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: lines[idx].timestamp, ignoringStructuralTags: true)
         }
         return AudioAlignmentResult(
             lines: lines,
@@ -1655,14 +1657,15 @@ final class AudioSyncManager {
     private var settledLineIDs: Set<Int> { lockedThisPlay.isEmpty ? attemptedLineIDs : [] }
 
     nonisolated static func sungSpan(of line: LyricLine) -> ClosedRange<Double>? {
-        guard let first = line.words.first, let last = line.words.last else { return nil }
+        let lead = LyricsAudioAligner.leadTokenGroups(of: line)
+        guard let first = lead.first?.first, let last = lead.last?.last else { return nil }
         return first.timestamp...max(first.timestamp, last.timestamp + (last.duration ?? 0))
     }
 
     /// Words of aligned lines, with a word timed by syllable regrouped so it carries its syllables again.
     nonisolated static func recognizedWords(of lines: [LyricLine]) -> [RecognizedAudioWord] {
         lines.flatMap { line in
-            (LyricsAudioAligner.tokenGroups(of: line) ?? line.words.map { [$0] }).compactMap { group in
+            LyricsAudioAligner.leadTokenGroups(of: line).compactMap { group in
                 guard let first = group.first, let last = group.last else { return nil }
                 return RecognizedAudioWord(
                     text: group.map(\.text).joined().trimmingCharacters(in: .whitespaces),
@@ -1692,20 +1695,24 @@ final class AudioSyncManager {
         envelope: VocalEnvelope,
         pitchContour: VocalPitchContour? = nil
     ) -> Bool {
-        guard !line.words.contains(where: { ($0.duration ?? 0) <= 0 && !LyricsAudioAligner.normalizeToken($0.text).isEmpty }) else {
+        let groups = LyricsAudioAligner.leadTokenGroups(of: line)
+        guard !groups.joined().contains(where: { word in
+            (word.duration ?? 0) <= 0 && (!LyricsAudioAligner.normalizeToken(word.text).isEmpty || !ForcedAlignmentText.displaySymbols(in: word.text).isEmpty)
+        }) else {
             return false
         }
-        let groups = LyricsAudioAligner.tokenGroups(of: line) ?? line.words.map { [$0] }
         let spans = groups.compactMap { group -> (start: Double, end: Double)? in
             guard let first = group.first, let last = group.last else { return nil }
             return (first.timestamp, last.timestamp + (last.duration ?? 0))
         }
         let maxWordSpan = LyricsForcedAligner.maxWordSpan
-        guard let first = spans.first, let last = spans.last,
-              spans.allSatisfy({ $0.end - $0.start <= maxWordSpan }),
+        guard let first = spans.first, let last = spans.last else { return false }
+        // Interpolated backing vocals extend the displayed line beyond the last lead word.
+        let finalDisplayEnd = line.words.last.map { $0.timestamp + ($0.duration ?? 0) } ?? last.end
+        guard spans.allSatisfy({ $0.end - $0.start <= maxWordSpan }),
               last.end - first.start <= LyricsForcedAligner.maxLineSpan(wordCount: spans.count),
               !zip(spans, spans.dropFirst()).contains(where: { $1.start - $0.end > maxWordSpan }),
-              line.timestamp + (line.duration ?? 0) - last.end <= maxWordSpan
+              line.timestamp + (line.duration ?? 0) - max(last.end, finalDisplayEnd) <= maxWordSpan
         else { return false }
         if confident.contains(line.id) { return true }
         guard nearlyConfident.contains(line.id) else { return false }
