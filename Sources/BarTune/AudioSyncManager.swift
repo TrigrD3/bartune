@@ -47,7 +47,7 @@ struct CapturedAudio: Sendable {
 
 protocol AudioCaptureProviding: AnyObject {
     var onAudioSamples: (@Sendable (CapturedAudio) -> Void)? { get set }
-    @MainActor func start(targetBundleIds: Set<String>) async throws
+    @MainActor func start(targetBundleIds: Set<String>, sampleRate: Int) async throws
     @MainActor func stop()
 }
 
@@ -265,7 +265,8 @@ protocol SystemAudioCaptureBackend: Sendable {
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
         output: AudioCaptureStreamOutput,
-        audioQueue: DispatchQueue
+        audioQueue: DispatchQueue,
+        sampleRate: Int
     ) async throws -> SystemAudioStreamControlling
 }
 
@@ -297,7 +298,8 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
         display: CaptureDisplay,
         includedApplications: [CaptureApplication],
         output: AudioCaptureStreamOutput,
-        audioQueue: DispatchQueue
+        audioQueue: DispatchQueue,
+        sampleRate: Int
     ) async throws -> SystemAudioStreamControlling {
         guard let scDisplay = display.scDisplay else {
             throw SystemAudioCaptureError.noDisplayAvailable
@@ -308,7 +310,7 @@ private struct LiveSystemAudioCaptureBackend: SystemAudioCaptureBackend {
         }
 
         let scFilter = SCContentFilter(display: scDisplay, including: scApps, exceptingWindows: [])
-        let config = SystemAudioCapture.makeStreamConfiguration()
+        let config = SystemAudioCapture.makeStreamConfiguration(sampleRate: sampleRate)
 
         let newStream = SCStream(filter: scFilter, configuration: config, delegate: nil)
         try newStream.addStreamOutput(output, type: .audio, sampleHandlerQueue: audioQueue)
@@ -414,11 +416,11 @@ final class SystemAudioCapture: AudioCaptureProviding, @unchecked Sendable {
     private let audioQueue = DispatchQueue(label: "com.arya.bartune.audiocapture", qos: .utility)
     @MainActor private var streamOutput: AudioCaptureStreamOutput?
 
-    static func makeStreamConfiguration() -> SCStreamConfiguration {
+    static func makeStreamConfiguration(sampleRate: Int = 16000) -> SCStreamConfiguration {
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.excludesCurrentProcessAudio = true
-        config.sampleRate = 16000
+        config.sampleRate = sampleRate
         // Stereo lets the vocal envelope weigh the centre of the mix; recognition gets the mono mix.
         config.channelCount = 2
         // Minimal video footprint since we only consume audio buffers; a long frame interval avoids
@@ -444,7 +446,7 @@ final class SystemAudioCapture: AudioCaptureProviding, @unchecked Sendable {
     }
 
     @MainActor
-    func start(targetBundleIds: Set<String> = []) async throws {
+    func start(targetBundleIds: Set<String> = [], sampleRate: Int = 16000) async throws {
         stop()
         sessionID &+= 1
         let currentSession = sessionID
@@ -472,7 +474,8 @@ final class SystemAudioCapture: AudioCaptureProviding, @unchecked Sendable {
                 display: display,
                 includedApplications: includedApps,
                 output: output,
-                audioQueue: audioQueue
+                audioQueue: audioQueue,
+                sampleRate: sampleRate
             )
         } catch {
             if streamOutput === output {
@@ -577,11 +580,16 @@ final class AudioSyncManager {
         ) async -> AudioChunkTranscribing? = {
             await LyricsAlignerModel.launch(lines: $0, anchors: $1)
         }
+        var launchVocalSeparator: @Sendable () async -> VocalIsolating? = { await VocalSeparatorModel.launch() }
+        var resampleForRecognition: @Sendable ([Float], Double, Double) -> [Float]? = {
+            AudioResampler.resample($0, from: $1, to: $2)
+        }
         var vocalEnvelopeNow: @Sendable () -> ContinuousClock.Instant = { .now }
         var vocalEnvelopeSleep: @Sendable (ContinuousClock.Instant) async throws -> Void = {
             try await Task.sleep(until: $0, clock: .continuous)
         }
         var releaseCachedModel: @Sendable () -> Void = { LyricsAlignerModel.releaseCachedModel() }
+        var releaseCachedVocalSeparator: @Sendable () -> Void = { VocalSeparatorModel.releaseCachedModel() }
         var idleModelReleaseDelay: Duration = .seconds(60)
         var idleModelReleaseSleep: @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
@@ -682,6 +690,7 @@ final class AudioSyncManager {
 
     // Audio chunk state
     private var audioSampleBuffer: [Float] = []
+    /// Stereo side samples for the contiguous suffix of the mid buffer after any mono delivery.
     private var audioSideBuffer: [Float] = []
     /// Sample offsets and track times for contiguous capture spans in the buffer.
     private var captureSpanStarts: [(offset: Int, time: Double)] = []
@@ -699,6 +708,7 @@ final class AudioSyncManager {
     private var modelIdleReleaseTask: Task<Void, Never>?
     private var modelMayBeCached = false
     private var chunkEngine: AudioChunkTranscribing?
+    private var vocalSeparator: VocalIsolating?
     private var activeSampleRate: Double = 16000.0
     private var chromaProfile = AudioChromaProfile()
     private var capturedSeconds: Double = 0
@@ -736,6 +746,7 @@ final class AudioSyncManager {
         let delay = dependencies.idleModelReleaseDelay
         let sleepFor = dependencies.idleModelReleaseSleep
         let release = dependencies.releaseCachedModel
+        let releaseSeparator = dependencies.releaseCachedVocalSeparator
         modelIdleReleaseTask = Task { [weak self] in
             do {
                 try await sleepFor(delay)
@@ -750,6 +761,7 @@ final class AudioSyncManager {
             self.modelIdleReleaseTask = nil
             self.modelMayBeCached = false
             release()
+            releaseSeparator()
         }
     }
 
@@ -768,6 +780,7 @@ final class AudioSyncManager {
         pendingVocalEnvelopeNotification = nil
         chunkEngine?.shutdown()
         chunkEngine = nil
+        vocalSeparator = nil
         discardBufferedAudio(keepingCapacity: false)
         chunkPlaybackRate = 1.0
         pendingSeekPos = nil
@@ -915,6 +928,8 @@ final class AudioSyncManager {
         let captureGeneration = captureTargetGeneration
         installChunkHandler(trackId: trackId, generation: generation, captureGeneration: captureGeneration)
         let targetBundles = Self.targetBundleIdentifiers(for: trackId, sourceBundleId: activeSourceBundleId)
+        // ScreenCaptureKit supports 48 kHz, but the separator's native 44.1 kHz needs resampling.
+        let sampleRate = state.isolateVocals ? 48000 : 16000
         Task { [weak self] in
             guard let self,
                   self.syncGeneration == generation,
@@ -924,7 +939,7 @@ final class AudioSyncManager {
                   self.state.audioSyncEngine == engine
             else { return }
             do {
-                try await self.capture.start(targetBundleIds: targetBundles)
+                try await self.capture.start(targetBundleIds: targetBundles, sampleRate: sampleRate)
             } catch {
                 guard self.syncGeneration == generation,
                       self.captureTargetGeneration == captureGeneration
@@ -1013,8 +1028,9 @@ final class AudioSyncManager {
             discardBufferedAudio()
             return
         }
+        let unpairedCount = audioSampleBuffer.count - audioSideBuffer.count
         audioSampleBuffer.removeFirst(count)
-        audioSideBuffer.removeFirst(count)
+        if count > unpairedCount { audioSideBuffer.removeFirst(count - unpairedCount) }
         guard let index = captureSpanStarts.lastIndex(where: { $0.offset <= count }) else { return }
         let span = captureSpanStarts[index]
         let start = span.time + Double(count - span.offset) / max(sampleRate, 1) * chunkPlaybackRate
@@ -1103,6 +1119,7 @@ final class AudioSyncManager {
         modelMayBeCached = true
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
+        let launchSeparator = state.isolateVocals ? dependencies.launchVocalSeparator : nil
         discardBufferedAudio()
         chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
         pendingSeekPos = nil
@@ -1112,6 +1129,10 @@ final class AudioSyncManager {
         let anchors = anchoredLines.compactMapValues(Self.sungSpan)
         alignerStartupTask = Task { [weak self] in
             let engine = await launch(lines, anchors)
+            var separator: VocalIsolating?
+            if engine != nil, !Task.isCancelled, let launchSeparator {
+                separator = await launchSeparator()
+            }
             guard let self,
                   !Task.isCancelled,
                   self.syncGeneration == generation,
@@ -1134,6 +1155,7 @@ final class AudioSyncManager {
                 return
             }
             self.chunkEngine = engine
+            self.vocalSeparator = separator
             self.diagnostics.update { $0.localeIdentifier = "lyrics alignment" }
             self.beginChunkCapture(track: track, generation: generation)
         }
@@ -1165,14 +1187,14 @@ final class AudioSyncManager {
                 else { return }
                 let samples = audio.samples
                 let sampleRate = audio.sampleRate
-                if sampleRate != self.activeSampleRate, !self.audioSampleBuffer.isEmpty {
+                guard sampleRate.isFinite, sampleRate > 0, !samples.isEmpty else { return }
+                if !self.audioSampleBuffer.isEmpty, sampleRate != self.activeSampleRate {
                     self.discardBufferedAudio()
                 }
                 self.activeSampleRate = sampleRate
-                if sampleRate > 0 {
-                    self.capturedSeconds += Double(samples.count) / sampleRate
-                    self.diagnostics.recordAudio(totalSeconds: self.capturedSeconds)
-                }
+                self.capturedSeconds += Double(samples.count) / sampleRate
+                self.diagnostics.recordAudio(totalSeconds: self.capturedSeconds)
+                self.diagnostics.recordCaptureSampleRate(sampleRate)
                 if let delay = audio.captureDelay {
                     self.diagnostics.recordCaptureDelay(delay)
                 }
@@ -1184,7 +1206,6 @@ final class AudioSyncManager {
                 )
                 var continuedStart = self.bufferedEndPosition(sampleRate: sampleRate)
                 if let expectedStart = continuedStart,
-                   sampleRate > 0,
                    audio.captureDelay != nil || audio.capturedAt != nil,
                    abs(livePos - expectedStart) > 0.05 {
                     continuedStart = nil
@@ -1194,28 +1215,13 @@ final class AudioSyncManager {
                     }
                 }
                 let deliveryStart = continuedStart ?? self.beginCaptureSpan(at: livePos)
-                if sampleRate > 0 {
-                    let previousFrameCount = self.vocalEnvelope.totalFrameCount
-                    let previousEnd = self.vocalEnvelope.segments.last?.end
-                    self.vocalEnvelope.append(
-                        mid: samples,
-                        side: audio.side,
-                        sampleRate: sampleRate,
-                        startTime: deliveryStart,
-                        rate: self.chunkPlaybackRate
-                    )
-                    let updatedFrameCount = self.vocalEnvelope.totalFrameCount
-                    if updatedFrameCount > 0,
-                       updatedFrameCount > previousFrameCount || self.vocalEnvelope.segments.last?.end != previousEnd {
-                        self.vocalEnvelopeRevision &+= 1
-                        self.notifyVocalEnvelopeChanged(for: trackId, throttled: previousFrameCount > 0)
-                    }
-                }
+                self.appendFullMixEnvelope(audio, at: deliveryStart, trackId: trackId)
                 self.audioSampleBuffer.append(contentsOf: samples)
                 if audio.side.count == samples.count {
                     self.audioSideBuffer.append(contentsOf: audio.side)
                 } else {
-                    self.audioSideBuffer.append(contentsOf: repeatElement(0, count: samples.count))
+                    // Keep the mid samples so a mixed mono/stereo chunk can still use full-mix alignment.
+                    self.audioSideBuffer.removeAll(keepingCapacity: true)
                 }
 
                 let targetFrames = max(1, Int(sampleRate * self.chunkDurationSeconds))
@@ -1227,6 +1233,25 @@ final class AudioSyncManager {
 
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
+        }
+    }
+
+    private func appendFullMixEnvelope(_ audio: CapturedAudio, at start: Double, trackId: String) {
+        let rate = min(audio.sampleRate, Double(LyricsForcedAligner.sampleRate))
+        guard let mid = AudioResampler.resample(audio.samples, from: audio.sampleRate, to: rate) else { return }
+        let side = AudioResampler.resample(audio.side, from: audio.sampleRate, to: rate) ?? []
+        let previousFrameCount = vocalEnvelope.totalFrameCount
+        let previousEnd = vocalEnvelope.segments.last?.end
+        vocalEnvelope.append(mid: mid, side: side, sampleRate: rate, startTime: start, rate: chunkPlaybackRate)
+        recordVocalEnvelopeChange(trackId: trackId, previousFrameCount: previousFrameCount, previousEnd: previousEnd)
+    }
+
+    private func recordVocalEnvelopeChange(trackId: String, previousFrameCount: Int, previousEnd: Double?) {
+        let updatedFrameCount = vocalEnvelope.totalFrameCount
+        if updatedFrameCount > 0,
+           updatedFrameCount > previousFrameCount || vocalEnvelope.segments.last?.end != previousEnd {
+            vocalEnvelopeRevision &+= 1
+            notifyVocalEnvelopeChanged(for: trackId, throttled: previousFrameCount > 0)
         }
     }
 
@@ -1251,20 +1276,44 @@ final class AudioSyncManager {
 
         let frameCount = min(targetFrames, audioSampleBuffer.count)
         let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
-        let sideChunk = Array(audioSideBuffer.prefix(frameCount))
+        let sideChunk = audioSideBuffer.count == audioSampleBuffer.count ? Array(audioSideBuffer.prefix(frameCount)) : []
         let spans = captureSpanStarts.prefix { $0.offset < frameCount }
         removeBufferedSamplePrefix(frameCount, sampleRate: sampleRate)
         if isFinal { sentFinalChunk = true }
 
-        let requestSampleRate = Int(sampleRate)
         let requestPlaybackRate = chunkPlaybackRate
-        // Run pitch analysis, chroma extraction, normalization, Core ML inference, and CTC Viterbi at
-        // `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on efficiency cores and never
-        // preempts interactive UI threads.
+        let separator = vocalSeparator
+        let envelopeLocation = separator.flatMap { _ in vocalEnvelope.frameLocation(at: chunkStart) }
+        let resample = dependencies.resampleForRecognition
+        // Run vocal isolation, pitch analysis, chroma extraction, normalization, Core ML inference,
+        // and CTC Viterbi at `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on
+        // efficiency cores and never preempts interactive UI threads.
         chunkProcessingTask = Task.detached(priority: .background) { [weak self] in
-            let pitch = requestSampleRate == VocalPitchContour.sampleRate
-                ? VocalPitchContour.analyze(mid: rawChunk, side: sideChunk, start: chunkStart, rate: requestPlaybackRate)
-                : nil
+            let recognized = Self.recognitionAudio(mid: rawChunk, side: sideChunk, sampleRate: sampleRate, separator: separator, resample: resample)
+            guard !Task.isCancelled else { return }
+            guard let audio = recognized else {
+                await self?.stopAfterChunkFailure(
+                    generation: generation, message: "Could not resample captured audio for lyrics alignment; it restarts with the next track"
+                )
+                return
+            }
+            if let envelopeLocation, audio.vocalSeparationSeconds != nil {
+                var stem = VocalEnvelope()
+                stem.append(mid: audio.samples, side: [], sampleRate: Double(audio.sampleRate), startTime: 0, rate: requestPlaybackRate)
+                if let segment = stem.segments.first {
+                    await self?.publishSeparatedEnvelope(segment, at: envelopeLocation, trackId: trackId, generation: generation)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            let pitch: VocalPitchContour.Segment? = if audio.vocalSeparationSeconds != nil, audio.sampleRate == VocalPitchContour.sampleRate {
+                VocalPitchContour.analyze(mid: audio.samples, side: [], start: chunkStart, rate: requestPlaybackRate)
+            } else if Int(sampleRate) == VocalPitchContour.sampleRate {
+                VocalPitchContour.analyze(mid: rawChunk, side: sideChunk, start: chunkStart, rate: requestPlaybackRate)
+            } else if audio.sampleRate == VocalPitchContour.sampleRate {
+                VocalPitchContour.analyze(mid: audio.samples, side: [], start: chunkStart, rate: requestPlaybackRate)
+            } else {
+                nil
+            }
             guard !Task.isCancelled else { return }
             var chroma = AudioChromaProfile()
             for index in spans.indices {
@@ -1274,10 +1323,10 @@ final class AudioSyncManager {
                 chroma.append(samples: samples, sampleRate: sampleRate, startTime: span.time, rate: requestPlaybackRate)
             }
             let chunkChroma = chroma
-            let chunk = AudioLevel.normalizedForRecognition(rawChunk)
+            guard !Task.isCancelled else { return }
             let request = AudioChunkRequest(
-                samples: chunk,
-                sampleRate: requestSampleRate,
+                samples: AudioLevel.normalizedForRecognition(audio.samples),
+                sampleRate: audio.sampleRate,
                 chunkStartTime: chunkStart,
                 playbackRate: requestPlaybackRate,
                 isFinal: isFinal
@@ -1286,13 +1335,9 @@ final class AudioSyncManager {
             do {
                 words = try await engine.transcribe(request)
             } catch {
-                await MainActor.run { [weak self] in
-                    guard let self, self.syncGeneration == generation else { return }
-                    self.chunkProcessingTask = nil
-                    self.persistCurrentAlignmentIfReady()
-                    self.stop()
-                    self.state.audioSyncStatus = .unavailable("Lyrics alignment stopped unexpectedly; it restarts with the next track")
-                }
+                await self?.stopAfterChunkFailure(
+                    generation: generation, message: "Lyrics alignment stopped unexpectedly; it restarts with the next track"
+                )
                 return
             }
             await MainActor.run { [weak self] in
@@ -1309,6 +1354,7 @@ final class AudioSyncManager {
                 let voicedFramePercent = self.vocalPitchContour.voicedFraction.map { $0 * 100 }
                 self.diagnostics.update {
                     $0.voicedFramePercent = voicedFramePercent
+                    $0.vocalSeparationSeconds = audio.vocalSeparationSeconds
                     $0.record(words: words, replacing: false)
                 }
                 self.recognizedWords.append(contentsOf: words)
@@ -1325,6 +1371,53 @@ final class AudioSyncManager {
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
         }
+    }
+
+    private func publishSeparatedEnvelope(
+        _ segment: VocalEnvelope.Segment,
+        at location: VocalEnvelope.FrameLocation,
+        trackId: String,
+        generation: UInt64
+    ) {
+        guard syncGeneration == generation, activeTrackId == trackId, isLiveSyncActive,
+              state.audioSyncEngine == .lyricsAlignment,
+              vocalEnvelope.replaceFrames(at: location, with: segment)
+        else { return }
+        vocalEnvelopeRevision &+= 1
+        notifyVocalEnvelopeChanged(for: trackId, throttled: true)
+    }
+
+    private func stopAfterChunkFailure(generation: UInt64, message: String) {
+        guard syncGeneration == generation else { return }
+        chunkProcessingTask = nil
+        persistCurrentAlignmentIfReady()
+        stop()
+        state.audioSyncStatus = .unavailable(message)
+    }
+
+    nonisolated static func recognitionAudio(
+        mid: [Float],
+        side: [Float],
+        sampleRate: Double,
+        separator: VocalIsolating?,
+        resample: ([Float], Double, Double) -> [Float]? = { AudioResampler.resample($0, from: $1, to: $2) }
+    ) -> (samples: [Float], sampleRate: Int, vocalSeparationSeconds: Double?)? {
+        let target = Double(LyricsForcedAligner.sampleRate)
+        if let separator, !mid.isEmpty, side.count == mid.count {
+            let start = ProcessInfo.processInfo.systemUptime
+            let stemRate = VocalSeparation.sampleRate
+            if let left = resample(zip(mid, side).map(+), sampleRate, stemRate),
+               let right = resample(zip(mid, side).map(-), sampleRate, stemRate),
+               let stem = try? separator.vocals(left: left, right: right) {
+                let vocals = zip(stem.left, stem.right).map { ($0 + $1) / 2 }
+                if let samples = resample(vocals, stemRate, target), !samples.isEmpty {
+                    return (samples, Int(target), ProcessInfo.processInfo.systemUptime - start)
+                }
+            }
+        }
+        guard sampleRate > target else { return (mid, Int(sampleRate), nil) }
+        guard let samples = resample(mid, sampleRate, target), !samples.isEmpty else { return nil }
+        return (samples, Int(target), nil)
     }
 
     /// Track position at `capturedAt`, given the position `now` and the rate the track is playing at (0 when paused).

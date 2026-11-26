@@ -21,6 +21,7 @@ Sources/BarTune/           # Native Swift macOS menu-bar app
   AudioChroma.swift        # Bounded 12-bin chroma profiles for Lyrics Alignment audio chunks; recovers timing for repeated passages against same-lyric locked lines
   AudioSyncDiagnostics.swift # Live audio sync diagnostics (Settings → Advanced Diagnostics, unified log `audio-sync`)
   AudioOutputLatency.swift  # CoreAudio default-output latency monitoring for the overlay clock
+  VocalSeparator.swift     # Optional SigSep Open-Unmix UMX-HQ Core ML vocal isolation, Swift spectral mask, audio resampling and idle model cache
   VocalWaveform.swift      # Voice-band vocal envelope (stereo centre-weighted) and word timing refinement for silence gating and held notes
   VocalPitch.swift         # Background vDSP/YIN pitch and harmonicity contour for held-note endings and vocal onset locking
   Models.swift             # TrackInfo, LyricLine, WordTimestamp, LRC/YRC parsers
@@ -35,6 +36,7 @@ Casks/
 scripts/
   lint.sh                  # Runs SwiftFormat (--lint) and SwiftLint (--strict)
   convert-lyrics-aligner.py # Builds LyricsAligner.mlpackage (MMS forced-aligner → Core ML, 8-bit) for the Lyrics Alignment engine
+  convert-vocal-separator.py # Converts SigSep Open-Unmix UMX-HQ vocals-only model to an 8-bit Core ML package for optional vocal isolation (macOS 14+)
   export-coverage.sh       # CI LCOV export; fails when the test binary, profdata, or report is missing
   fetch-jamendolyrics.sh   # Downloads JamendoLyrics (word-annotated, Creative Commons audio; never commit it) for AlignmentEvalTests
   playback-clock-report.py # Per-track summary of the `playback-clock` debug log (overlay clock vs player position per poll)
@@ -65,7 +67,7 @@ Spotify / Apple Music (AppleScript + distributed notifications)
   → SpotifyMonitor (track metadata, position, AppleScript latency compensation, interpolation timer)
   → LyricsFetcher (NetEase YRC word-level sync → LRCLIB enhanced/standard LRC fallback)
   → Models (LRCParser / YRC) + Romanizer (CFStringTokenizer) + AlbumArtColorExtractor
-  ↳ Audio sync (optional): ScreenCaptureKit stereo capture → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity + AudioChroma profiles → word refinement → LyricsAudioAligner → vocal onset locking & repeat timing recovery
+  ↳ Audio sync (optional): ScreenCaptureKit stereo capture → optional Open-Unmix vocal isolation (full-mix fallback) → Lyrics Alignment words + VocalWaveform loudness + VocalPitch harmonicity + AudioChroma profiles → word refinement → LyricsAudioAligner → vocal onset locking & repeat timing recovery
   → LyricsState (observable state, timing offset, hover/theme/precision/browser prefs)
   → OverlayWindowController + LyricsOverlayView (left-of-notch menu bar karaoke sweep)
 ```

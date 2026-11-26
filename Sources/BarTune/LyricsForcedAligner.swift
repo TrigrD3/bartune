@@ -1182,15 +1182,17 @@ final class CoreMLAcousticModel: CTCAcousticModel, @unchecked Sendable {
     }
 }
 
-/// Reuses the compiled acoustic model across tracks so Core ML avoids re-running ANECompiler on every song.
-final class AcousticModelCache: @unchecked Sendable {
+typealias AcousticModelCache = CompiledModelCache<CTCAcousticModel>
+
+/// Reuses loaded Core ML models across tracks and coalesces concurrent loads of the same model.
+final class CompiledModelCache<Model>: @unchecked Sendable {
     private struct Key: Hashable {
         let url: URL
         let modificationDate: Date?
     }
 
     private final class PendingLoad {
-        var model: CTCAcousticModel?
+        var model: Model?
         var finished = false
     }
 
@@ -1198,13 +1200,13 @@ final class AcousticModelCache: @unchecked Sendable {
     private var inFlight: [Key: PendingLoad] = [:]
     private var generation = 0
     private var currentKey: Key?
-    private var cached: CTCAcousticModel?
+    private var cached: Model?
 
     func load(
         compiledURL: URL,
         modificationDate: Date?,
-        loader: (URL) -> CTCAcousticModel?
-    ) -> CTCAcousticModel? {
+        loader: (URL) -> Model?
+    ) -> Model? {
         let key = Key(url: compiledURL.standardizedFileURL, modificationDate: modificationDate)
         condition.lock()
         defer { condition.unlock() }
@@ -1253,6 +1255,8 @@ enum LyricsAlignerModel {
     static let packageName = "LyricsAligner.mlpackage"
     static let compiledName = "LyricsAligner.mlmodelc"
     private static let sharedModelCache = AcousticModelCache()
+    // Keep first-use compilation from publishing an older model after a replacement.
+    private static let modelFilesLock = NSLock()
 
     static func releaseCachedModel() {
         sharedModelCache.invalidate()
@@ -1274,6 +1278,7 @@ enum LyricsAlignerModel {
         case httpStatus(Int)
         case unpackFailed
         case invalidURL
+        case rollbackFailed(installError: String, restoreError: String)
 
         var errorDescription: String? {
             switch self {
@@ -1281,6 +1286,8 @@ enum LyricsAlignerModel {
             case let .httpStatus(code): "Download failed with HTTP \(code)."
             case .unpackFailed: "The downloaded model could not be unpacked."
             case .invalidURL: "The model download address is invalid."
+            case let .rollbackFailed(installError, restoreError):
+                "Model installation failed. \(installError) The previous model could not be fully restored. \(restoreError)"
             }
         }
     }
@@ -1297,12 +1304,18 @@ enum LyricsAlignerModel {
         }.value
     }
 
-    /// Verifies and unpacks a zipped `LyricsAligner.mlpackage` into `directory`, replacing any earlier model.
-    static func install(archive: URL, expectedSHA256: String, into directory: URL) throws {
+    /// Verifies and unpacks a zipped Core ML package into `directory`, replacing any earlier model.
+    static func install(
+        archive: URL,
+        expectedSHA256: String,
+        into directory: URL,
+        packageName: String = packageName,
+        compiledName: String = compiledName,
+        fileManager: FileManager = .default
+    ) throws {
         guard try AppUpdateService.sha256Hex(ofFileAt: archive) == expectedSHA256.lowercased() else {
             throw InstallError.checksumMismatch
         }
-        let fileManager = FileManager.default
         let staging = directory.appendingPathComponent(".staging-\(UUID().uuidString)", isDirectory: true)
         try fileManager.createDirectory(at: staging, withIntermediateDirectories: true)
         defer { try? fileManager.removeItem(at: staging) }
@@ -1316,11 +1329,45 @@ enum LyricsAlignerModel {
         guard ditto.terminationStatus == 0, fileManager.fileExists(atPath: unpacked.path) else {
             throw InstallError.unpackFailed
         }
-        releaseCachedModel()
-        for name in [packageName, compiledName] {
-            try? fileManager.removeItem(at: directory.appendingPathComponent(name))
+        try modelFilesLock.withLock {
+            let package = directory.appendingPathComponent(packageName)
+            let compiled = directory.appendingPathComponent(compiledName)
+            let backupPrefix = ".backup-\(UUID().uuidString)-"
+            var backups: [(original: URL, backup: URL)] = []
+            do {
+                for original in [package, compiled] {
+                    let backup = directory.appendingPathComponent(backupPrefix + original.lastPathComponent)
+                    do {
+                        try fileManager.moveItem(at: original, to: backup)
+                        backups.append((original, backup))
+                    } catch let error as NSError where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+                        continue
+                    }
+                }
+                try fileManager.moveItem(at: unpacked, to: package)
+            } catch {
+                let installError = error
+                var restoreError: Error?
+                for (original, backup) in backups.reversed() {
+                    do {
+                        try fileManager.moveItem(at: backup, to: original)
+                    } catch {
+                        restoreError = restoreError ?? error
+                    }
+                }
+                if let restoreError {
+                    throw InstallError.rollbackFailed(
+                        installError: installError.localizedDescription,
+                        restoreError: restoreError.localizedDescription
+                    )
+                }
+                throw installError
+            }
+            for (_, backup) in backups {
+                try? fileManager.removeItem(at: backup)
+            }
+            if compiledName == Self.compiledName { releaseCachedModel() }
         }
-        try fileManager.moveItem(at: unpacked, to: directory.appendingPathComponent(packageName))
     }
 
     static func isInstalled(in directory: URL = directory) -> Bool {
@@ -1338,20 +1385,22 @@ enum LyricsAlignerModel {
         directory: URL = directory
     ) async -> AudioChunkTranscribing? {
         #if arch(arm64)
-            let compiled = directory.appendingPathComponent(compiledName)
-            let package = directory.appendingPathComponent(packageName)
-            let fileManager = FileManager.default
-            if !fileManager.fileExists(atPath: compiled.path), fileManager.fileExists(atPath: package.path) {
-                guard let temporary = try? await MLModel.compileModel(at: package) else { return nil }
-                releaseCachedModel()
-                try? fileManager.removeItem(at: compiled)
-                guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
-            }
-            let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
             return await Task.detached(priority: .utility) {
-                sharedModelCache.load(compiledURL: compiled, modificationDate: modDate) {
-                    CoreMLAcousticModel(compiledModelURL: $0)
-                }.map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
+                modelFilesLock.withLock {
+                    let compiled = directory.appendingPathComponent(compiledName)
+                    let package = directory.appendingPathComponent(packageName)
+                    let fileManager = FileManager.default
+                    if !fileManager.fileExists(atPath: compiled.path), fileManager.fileExists(atPath: package.path) {
+                        guard let temporary = try? MLModel.compileModel(at: package) else { return nil }
+                        defer { try? fileManager.removeItem(at: temporary) }
+                        guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
+                        releaseCachedModel()
+                    }
+                    let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
+                    return sharedModelCache.load(compiledURL: compiled, modificationDate: modDate) {
+                        CoreMLAcousticModel(compiledModelURL: $0)
+                    }.map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
+                }
             }.value
         #else
             return nil

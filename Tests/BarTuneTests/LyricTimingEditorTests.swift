@@ -1930,6 +1930,6 @@ final class CustomLyricsStoreAndSourceResolverTests: XCTestCase {
 
 private final class NoopAudioCapture: AudioCaptureProviding {
     var onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
-    func start(targetBundleIds: Set<String>) {}
+    func start(targetBundleIds: Set<String>, sampleRate: Int) {}
     func stop() {}
 }

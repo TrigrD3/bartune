@@ -210,6 +210,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.restartAudioSyncForCurrentTrack()
             }
             .store(in: &cancellables)
+
+        state.$isolateVocals
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self, self.state.audioSyncEngine == .lyricsAlignment else { return }
+                self.restartAudioSyncForCurrentTrack()
+            }
+            .store(in: &cancellables)
     }
 
     func applicationWillTerminate(_ notification: Notification) {

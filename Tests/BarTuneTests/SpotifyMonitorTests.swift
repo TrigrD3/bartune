@@ -732,7 +732,7 @@ private final class MonitorFakeAudioCapture: AudioCaptureProviding {
     private(set) var lastTargetBundleIds: Set<String> = []
 
     @MainActor
-    func start(targetBundleIds: Set<String>) {
+    func start(targetBundleIds: Set<String>, sampleRate: Int) {
         startCount += 1
         lastTargetBundleIds = targetBundleIds
     }

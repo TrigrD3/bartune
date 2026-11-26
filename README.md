@@ -75,7 +75,7 @@ BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 6-tab nati
 | **General** | Hover Behavior (*Cursor Spotlight* + width slider, or *Hide Entire Bar*), Browser Music and Ordinary YouTube Videos toggles (with what is sent to NetEase and LRCLIB), Launch at Login, macOS Permission Status, Live & Average CPU/Memory Usage |
 | **Appearance** | Live Preview, Color Theme (*System*, *Album Accent*, *Album Tint*), Sung Text Color (presets & custom), Background Opacity, Bar Corner Radius, Font Family, Weight, Size, Karaoke Sweep Highlight, Sung Text Glow, Word Pop, Typing Caret, Show Track Title in Bar, Line Transition (*Subtle*, *Slide*, *Blur Fade*, *Pop*, *Push*, *None*; Speed, Start Early) |
 | **Visualizer** | Live Preview, Show & Animate toggles, Style (*Bars / Wave / Dots / Vinyl / Note*), Color Theme, Width |
-| **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Manual Lyric Timing (**Edit Lyric Timing…**), Audio Karaoke Sync (*Off / Lyrics Alignment*, model download, syllable timing, lyrics-bar sync badge, Re-sync Current Track, **Advanced Diagnostics**), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
+| **Lyrics & Sync** | Translation & Target Language, Romanization (*Japanese / Korean / Chinese*), Manual Lyric Timing (**Edit Lyric Timing…**), Audio Karaoke Sync (*Off / Lyrics Alignment*, model download, opt-in Isolate Vocals, syllable timing, lyrics-bar sync badge, Re-sync Current Track, **Advanced Diagnostics**), Karaoke Precision (*Low CPU* vs *High Precision 30fps*), Per-Track Timing Offset |
 | **Offline Cache** | Cached song & audio-synced counts, storage usage, cache limit, searchable **Cached Songs** list (inspect, reveal in Finder, remove), Reveal in Finder, Clear Cache, **Clear Audio Sync** |
 | **About** | Installed version, **Update Channel** (*Stable* releases or *Latest from main*), **Check for Updates**, SHA-256-verified DMG download with **Install & Relaunch** (in-place update for non-Homebrew installs; `Reveal in Finder` / `Open DMG` for Homebrew installs), GitHub links. Also reachable from the version label under the sidebar. |
 
@@ -90,6 +90,8 @@ BarTune runs as a lightweight menu bar utility (`LSUIElement`) with a 6-tab nati
 ## Contributing
 
 Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup, Conventional Commits, and testing guidelines.
+
+The audio-sync pipeline includes optional vocal isolation for Lyrics Alignment on macOS 14 or later. BarTune uses SigSep's Open-Unmix UMX-HQ vocals-only model (5.96 MB download), with 8-bit Core ML weights and a spectral mask applied in Swift. If the model is unavailable or isolation fails, alignment continues with the full mix. Build the model package with `scripts/convert-vocal-separator.py`, following the local setup and usage pattern in `scripts/convert-lyrics-aligner.py`.
 
 ## License
 
