@@ -410,6 +410,8 @@ final class LyricsState: ObservableObject {
 
     @Published var albumColors: ExtractedAlbumColors? = nil
     @Published var audioSyncStatus: AudioSyncStatus = .idle
+    /// The latest confirmed Process Tap permission result, independent of the current track.
+    @Published var systemAudioCapturePermission: SystemAudioCapturePermission = .unknown
     var onResyncCurrentTrack: (() -> Void)?
 
     // Persisted user settings

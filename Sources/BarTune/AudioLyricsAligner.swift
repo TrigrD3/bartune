@@ -43,6 +43,10 @@ enum AudioSyncStatus: Equatable, Sendable {
     /// The song's lyric source overrides the enabled engine.
     case offForTrack(TrackLyricSource)
 
+    static let processTapNoAudioWarning = AudioSyncStatus.permissionRequired(
+        "No audio detected — check player volume or System Audio Recording permission in Privacy & Security"
+    )
+
     /// No longer listening: the sync is as complete as the audio allows.
     var isFinished: Bool {
         switch self {

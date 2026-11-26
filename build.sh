@@ -92,6 +92,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <true/>
     <key>NSAppleEventsUsageDescription</key>
     <string>BarTune needs Automation access to read the currently playing track and playback position from Spotify.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>BarTune captures playback audio from your active music player to synchronize lyrics in real time.</string>
 </dict>
 </plist>
 EOF
