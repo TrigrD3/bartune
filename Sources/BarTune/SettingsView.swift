@@ -588,6 +588,20 @@ struct SettingsView: View {
                 Text("Timing offsets are saved automatically per track.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+
+                HStack {
+                    Toggle("Compensate Output Latency", isOn: $state.compensateOutputLatency)
+                    Spacer()
+                    Text("\(Int((state.outputLatencySeconds * 1000).rounded())) ms")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(
+                    "Delays the karaoke display by the latency macOS reports for audio outputs like Bluetooth or AirPlay, without changing saved lyric timestamps."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
