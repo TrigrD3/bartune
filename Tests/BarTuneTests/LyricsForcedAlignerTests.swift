@@ -632,6 +632,136 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(aligner.confidentLineIDs, [1, 2])
     }
 
+    func testCoarseProbeRequiresConsistentWordSupport() async throws {
+        let lines = [12.0, 15.0].enumerated().map { LyricLine(id: $0, timestamp: $1, text: "i a i a i") }
+        let cases: [([Float], Set<Int>)] = [
+            ([0.91, 0.028, 0.028, 0.61, 0.028], []),
+            ([0.21, 0.13, 0.17, 0.22, 0.16], [0, 1]),
+        ]
+        for (confidences, expectedLocks) in cases {
+            let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+            var peaks: [Int: Int] = [:]
+            // The window starts at 4 s. Both rows start 5.5 s after their uncaptured LRC onsets.
+            for onsetFrame in [675, 825] {
+                for (index, token) in [5, 4, 5, 4, 5].enumerated() {
+                    let frame = onsetFrame + 12 * index
+                    peaks[frame] = token
+                    model.logProbabilityByFrame[frame] = log(confidences[index])
+                }
+            }
+            model.peaksForCall = [peaks]
+            let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+            let words = try await aligner.transcribe(chunk(start: 16, isFinal: true))
+
+            XCTAssertEqual(aligner.confidentLineIDs, expectedLocks, "\(confidences)")
+            XCTAssertTrue(aligner.nearlyConfidentLineIDs.isEmpty)
+            XCTAssertEqual(words.count, expectedLocks.count * 5)
+            if !expectedLocks.isEmpty {
+                XCTAssertEqual(words.first?.startTime ?? 0, 17.5, accuracy: 0.01)
+            }
+        }
+    }
+
+    func testShortLineWithLowMedianConfidenceCanStillLockWithAnEstablishedOffset() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, text: "ka"),
+            LyricLine(id: 1, timestamp: 15, text: "i a i"),
+        ]
+        // The existing anchor places the 15 s row at 20.5 s. Its mean clears the normal lock threshold.
+        model.peaksForCall = [[825: 5, 837: 4, 849: 5]]
+        model.logProbabilityByFrame = [825: log(0.47), 837: log(0.047), 849: log(0.045)]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: [0: 17.5...17.6])
+
+        let words = try await aligner.transcribe(chunk(start: 16, isFinal: true))
+
+        XCTAssertEqual(words.compactMap(\.sourceLineId), [1, 1, 1])
+        XCTAssertEqual(words.first?.startTime ?? 0, 20.5, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [1])
+    }
+
+    func testSmallInitialLockClusterIsReleasedAfterSustainedMisses() async throws {
+        let aligner = sessionWithMisses(Array(repeating: "zephyr", count: 8), laterShift: -5.5)
+
+        _ = try await aligner.transcribe(chunk(start: 16))
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1])
+        XCTAssertFalse(aligner.discardStaleOffset(lockedLineIDs: [0, 1]))
+        _ = try await aligner.transcribe(chunk(start: 28))
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1], "The instrumental gap contains no attempted lines")
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+        XCTAssertFalse(aligner.discardStaleOffset(lockedLineIDs: [0, 1]))
+        for start in [40.0, 52] {
+            _ = try await aligner.transcribe(chunk(start: start))
+            XCTAssertFalse(aligner.discardStaleOffset(lockedLineIDs: [0, 1]))
+        }
+        _ = try await aligner.transcribe(chunk(start: 64))
+        XCTAssertEqual(aligner.attemptedLineIDs, Set(0...9))
+        XCTAssertTrue(aligner.discardStaleOffset(lockedLineIDs: [0, 1]))
+        XCTAssertTrue(aligner.confidentLineIDs.isEmpty)
+        XCTAssertTrue(aligner.nearlyConfidentLineIDs.isEmpty)
+
+        let recovered = try await aligner.transcribe(chunk(start: 76, isFinal: true))
+
+        XCTAssertEqual(recovered.compactMap(\.sourceLineId), [20, 21])
+        XCTAssertEqual(recovered.first?.startTime ?? 0, 74.5, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [20, 21])
+    }
+
+    func testEightNearlyConfidentLinesPreserveTheInitialLocks() async throws {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let verse = ["ka", "mu", "so", "la"].enumerated().map {
+            LyricLine(id: $0, timestamp: 6 + Double($0 * 3), text: $1)
+        }
+        let chorus = ["fi", "do", "re", "mi", "sa", "nu", "go", "pe"].enumerated().map {
+            LyricLine(id: $0 + 4, timestamp: 37.5 + Double($0 * 3), text: $1)
+        }
+        let lines = verse + [LyricLine(id: 12, timestamp: 16, text: "")] + chorus
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+        let locks = Set(0..<4)
+
+        for start in [4.0, 16, 28, 40, 52, 64] {
+            let windowStart = start - 12
+            var peaks: [Int: Int] = [:]
+            model.weakFrames = []
+            for line in verse + chorus {
+                let frame = Int(((line.timestamp + 5.5 - windowStart) * 50).rounded())
+                let tokens = ForcedAlignmentText.words(for: line.text, script: .latin)[0].tokenIDs
+                for (offset, token) in tokens.enumerated() {
+                    peaks[frame + offset] = token
+                    if !locks.contains(line.id) {
+                        model.weakFrames.insert(frame + offset)
+                    }
+                }
+            }
+            model.peaksForCall = [peaks]
+            _ = try await aligner.transcribe(chunk(start: start))
+        }
+
+        XCTAssertEqual(aligner.confidentLineIDs, locks)
+        XCTAssertEqual(aligner.nearlyConfidentLineIDs, Set(4..<12))
+        XCTAssertFalse(aligner.discardStaleOffset(lockedLineIDs: locks))
+    }
+
+    func testFourMissedAdLibLinesPreserveTheInitialLocks() async throws {
+        let aligner = sessionWithMisses(Array(repeating: "(Ha-ah-oh-oh)", count: 4), laterShift: 5.5)
+
+        _ = try await aligner.transcribe(chunk(start: 16))
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1])
+        for start in [28.0, 40, 52, 64, 76] {
+            _ = try await aligner.transcribe(chunk(start: start))
+            XCTAssertFalse(aligner.discardStaleOffset(lockedLineIDs: [0, 1]))
+        }
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1, 2, 3, 4, 5])
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1])
+
+        let resumed = try await aligner.transcribe(chunk(start: 88, isFinal: true))
+
+        XCTAssertEqual(resumed.compactMap(\.sourceLineId), [20, 21])
+        XCTAssertEqual(resumed.first?.startTime ?? 0, 85.5, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1, 20, 21])
+    }
+
     func testFinalCoarseProbeClipsWindowsAtCaptureEnd() async throws {
         let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
         let lines = [
@@ -1492,6 +1622,33 @@ final class LyricsForcedAlignerTests: XCTestCase {
             model.peaksForCall.append(peaks)
         }
         return (LyricsForcedAligner(lines: lines, model: model), model)
+    }
+
+    private func sessionWithMisses(_ missedLyrics: [String], laterShift: Double) -> LyricsForcedAligner {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let missed = missedLyrics.enumerated().map { LyricLine(id: $0 + 2, timestamp: 37 + Double($0 * 3), text: $1) }
+        let lines = [
+            LyricLine(id: 0, timestamp: 12, text: "ka"),
+            LyricLine(id: 1, timestamp: 15, text: "fi"),
+            LyricLine(id: 18, timestamp: 16, text: ""),
+        ] + missed + [
+            LyricLine(id: 19, timestamp: (missed.last?.timestamp ?? 37) + 1, text: ""),
+            LyricLine(id: 20, timestamp: 80, text: "mu"),
+            LyricLine(id: 21, timestamp: 83, text: "so"),
+        ]
+        let vocals = [(17.5, "ka"), (20.5, "fi"), (80 + laterShift, "mu"), (83 + laterShift, "so")]
+        for index in 0..<7 {
+            let windowStart = 4 + Double(index * 12)
+            var peaks: [Int: Int] = [:]
+            for (onset, lyric) in vocals {
+                let firstFrame = Int(((onset - windowStart) * 50).rounded())
+                for (letter, token) in ForcedAlignmentText.words(for: lyric, script: .latin)[0].tokenIDs.enumerated() {
+                    peaks[firstFrame + letter] = token
+                }
+            }
+            model.peaksForCall.append(peaks)
+        }
+        return LyricsForcedAligner(lines: lines, model: model)
     }
 
     private func chunk(start: Double, isFinal: Bool = false) -> AudioSyncManager.AudioChunkRequest {

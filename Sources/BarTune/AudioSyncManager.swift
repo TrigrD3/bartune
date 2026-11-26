@@ -577,6 +577,7 @@ protocol AudioChunkTranscribing: AnyObject, Sendable {
 final class AudioSyncManager {
     struct Dependencies {
         var capture: AudioCaptureProviding
+        var cacheQueue = DispatchQueue(label: "com.arya.bartune.audiosynccache", qos: .utility)
         var hasScreenCaptureAccess: () -> Bool
         var requestScreenCaptureAccess: () -> Void
         var chunkDurationSeconds: Double
@@ -691,6 +692,8 @@ final class AudioSyncManager {
     private var captureTargetGeneration: UInt64 = 0
 
     private static let seekTolerance: Double = 2.0
+    /// The first poll after a repeat may arrive a few playback seconds into the new play.
+    private static let restartWindow: Double = 4.0
     /// Audio this close to the track's end is sent as its final chunk, before the player moves on.
     static let trackEndMargin: Double = 1.0
 
@@ -709,6 +712,7 @@ final class AudioSyncManager {
     private var seekBoundary: TimeInterval = 0
     /// Last playback state this manager saw; seeks are detected against it because `LyricsState` is updated first.
     private var lastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
+    private var cacheLoadTask: Task<Void, Never>?
     private var alignerStartupTask: Task<Void, Never>?
     private var chunkProcessingTask: Task<Void, Never>?
     private var modelIdleReleaseTask: Task<Void, Never>?
@@ -735,6 +739,20 @@ final class AudioSyncManager {
         self.dependencies = dependencies
         self.diagnostics = diagnostics ?? AudioSyncDiagnosticsModel()
         self.nextVocalEnvelopeNotifyAt = dependencies.vocalEnvelopeNow()
+    }
+
+    func flushCacheOperations() async {
+        // Applying a cache load can enqueue a removal of its own.
+        await cacheLoadTask?.value
+        await withCheckedContinuation { continuation in
+            dependencies.cacheQueue.async { continuation.resume() }
+        }
+    }
+
+    private func removeCachedAlignment(trackId: String) {
+        dependencies.cacheQueue.async { [cache] in
+            cache.remove(trackId: trackId)
+        }
     }
 
     private func cacheActiveVocalEnvelopeIfNonEmpty() {
@@ -778,6 +796,8 @@ final class AudioSyncManager {
         isLiveSyncActive = false
         capture.onAudioSamples = nil
         capture.stop()
+        cacheLoadTask?.cancel()
+        cacheLoadTask = nil
         alignerStartupTask?.cancel()
         alignerStartupTask = nil
         chunkProcessingTask?.cancel()
@@ -796,23 +816,20 @@ final class AudioSyncManager {
     }
 
     /// Evaluates whether the current track can load cached audio-synced lyrics or needs live alignment.
-    func handleTrackLoaded(track: TrackInfo, rawLines: [LyricLine], forceResync: Bool = false) {
+    func handleTrackLoaded(
+        track: TrackInfo,
+        rawLines: [LyricLine],
+        forceResync: Bool = false,
+        onCacheLoad: (() -> Void)? = nil
+    ) {
         let trackChanged = activeTrackId != track.id
         stop()
         activeTrackId = track.id
         activeSourceBundleId = track.sourceBundleId
         baseLines = rawLines
-        recognizedWords = []
+        clearSessionAlignment()
         chromaProfile = AudioChromaProfile()
-        cachedAlignedLineCount = 0
-        priorHeardWords = []
         anchoredLines = [:]
-        lockedThisPlay = [:]
-        attemptedLineIDs = []
-        attemptedThisPlay = []
-        confidentLineIDs = []
-        nearlyConfidentLineIDs = []
-        acceptedSessionLines = [:]
         activeTrackDuration = track.duration
         // Always start a fresh live envelope so WaveformTimingRefiner never mixes levels across plays;
         // `vocalEnvelope(for:)` falls back to `vocalEnvelopeCache` for timeline display until new frames arrive.
@@ -834,14 +851,53 @@ final class AudioSyncManager {
             return
         }
 
+        if forceResync {
+            guard !rawLines.isEmpty else {
+                state.audioSyncStatus = .idle
+                return
+            }
+            removeCachedAlignment(trackId: track.id)
+            startLiveSync(for: track, lines: rawLines, engine: engine)
+            return
+        }
+
+        state.audioSyncStatus = .idle
+        let generation = syncGeneration
+        let cacheQueue = dependencies.cacheQueue
+        cacheLoadTask = Task { [weak self, cache] in
+            // A rapid reload must see all earlier saves and removals.
+            let loaded: AudioSyncedLyricsRecord? = await withCheckedContinuation { continuation in
+                cacheQueue.async {
+                    continuation.resume(returning: cache.load(trackId: track.id))
+                }
+            }
+            guard !Task.isCancelled,
+                  let self,
+                  self.syncGeneration == generation,
+                  self.activeTrackId == track.id,
+                  self.state.audioSyncEngine == engine
+            else { return }
+            self.cacheLoadTask = nil
+            self.applyLoadedAlignment(loaded, track: track, rawLines: rawLines, engine: engine)
+            onCacheLoad?()
+        }
+    }
+
+    private func applyLoadedAlignment(
+        _ loaded: AudioSyncedLyricsRecord?,
+        track: TrackInfo,
+        rawLines: [LyricLine],
+        engine: AudioSyncEngine
+    ) {
         let rawNonEmptyCount = rawLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         let expectedSourceLineCount = rawNonEmptyCount > 0 ? rawNonEmptyCount : nil
 
-        if forceResync {
-            if !rawLines.isEmpty {
-                cache.remove(trackId: track.id)
+        if !rawLines.isEmpty, loaded?.hasLowYieldLocks == true {
+            removeCachedAlignment(trackId: track.id)
+            if rawLines != state.rawLyricLines {
+                state.applyAudioSyncedLines(rawLines)
             }
-        } else if let loaded = cache.load(trackId: track.id) {
+        } else if let loaded {
             let current = rawLines.isEmpty
                 || loaded.matchesSource(rawLines)
             let cached = (current && !rawLines.isEmpty) ? loaded.remapped(to: rawLines) : loaded
@@ -888,11 +944,11 @@ final class AudioSyncManager {
             } else if current {
                 // Keep recognized words for refinement without applying unreliable timings.
                 priorHeardWords = cached.heardWords ?? []
-                if priorHeardWords.isEmpty {
-                    cache.remove(trackId: track.id)
+                if priorHeardWords.isEmpty, !cached.hasLowYieldLocks {
+                    removeCachedAlignment(trackId: track.id)
                 }
             } else {
-                cache.remove(trackId: track.id)
+                removeCachedAlignment(trackId: track.id)
             }
         }
 
@@ -901,7 +957,7 @@ final class AudioSyncManager {
             return
         }
 
-        if !forceResync, Self.hasPreexistingWordSync(rawLines) {
+        if Self.hasPreexistingWordSync(rawLines) {
             state.audioSyncStatus = .cached(engine)
             return
         }
@@ -1048,10 +1104,20 @@ final class AudioSyncManager {
     }
 
     private func discardChunkIfSeeked(to position: Double, playbackRate: Double, isPlaying: Bool) {
-        guard isLiveSyncActive, state.audioSyncEngine == .lyricsAlignment else { return }
+        guard state.audioSyncEngine == .lyricsAlignment, isLiveSyncActive || lastPlayback != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let last = lastPlayback
         lastPlayback = (position, now, playbackRate, isPlaying)
+        if let last,
+           position <= Self.restartWindow * max(1, playbackRate),
+           last.position - position > Self.seekTolerance,
+           !baseLines.isEmpty,
+           hasLowYieldLocks {
+            state.applyAudioSyncedLines(baseLines)
+            resyncCurrentTrack()
+            return
+        }
+        guard isLiveSyncActive else { return }
         if let expected = bufferedEndPosition(sampleRate: activeSampleRate) {
             let seeked = abs(position - expected) > Self.seekTolerance
             let rateChanged = abs(playbackRate - chunkPlaybackRate) > 0.01
@@ -1367,7 +1433,8 @@ final class AudioSyncManager {
                 }
                 self.recognizedWords.append(contentsOf: words)
                 var newAttempts: Set<Int> = []
-                if let reporter = engine as? LineAttemptReporting {
+                let reporter = engine as? LineAttemptReporting
+                if let reporter {
                     let reported = reporter.attemptedLineIDs
                     newAttempts = reported.subtracting(self.attemptedThisPlay)
                     self.attemptedLineIDs.formUnion(reported)
@@ -1375,7 +1442,7 @@ final class AudioSyncManager {
                     self.confidentLineIDs.formUnion(reporter.confidentLineIDs)
                     self.nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
                 }
-                self.applyLyricsAlignment(replacingAttempts: newAttempts)
+                self.applyLyricsAlignment(replacingAttempts: newAttempts, reporter: reporter)
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
             }
         }
@@ -1804,6 +1871,10 @@ final class AudioSyncManager {
 
     private var lockedLineIDs: Set<Int> { Set(anchoredLines.keys).union(lockedThisPlay.keys) }
 
+    private var hasLowYieldLocks: Bool {
+        AudioSyncedLyricsRecord.hasLowYieldLocks(lockedIDs: lockedLineIDs, attemptedIDs: attemptedLineIDs)
+    }
+
     /// Attempted lines count as settled only while this play hasn't locked anything new.
     private var settledLineIDs: Set<Int> { lockedThisPlay.isEmpty ? attemptedLineIDs : [] }
 
@@ -1883,9 +1954,21 @@ final class AudioSyncManager {
         return (envelope.onsetRise(at: first.start) ?? 0) >= onsetLockRise
     }
 
+    private func clearSessionAlignment() {
+        recognizedWords = []
+        priorHeardWords = []
+        lockedThisPlay = [:]
+        attemptedLineIDs = []
+        attemptedThisPlay = []
+        confidentLineIDs = []
+        nearlyConfidentLineIDs = []
+        acceptedSessionLines = [:]
+        cachedAlignedLineCount = 0
+    }
+
     /// Lyrics Alignment locks each confidently aligned line and keeps listening until no further play could
     /// lock another (see `lyricsAlignmentProgress`), saving after each chunk so a later play only listens for the rest.
-    private func applyLyricsAlignment(replacingAttempts: Set<Int>) {
+    private func applyLyricsAlignment(replacingAttempts: Set<Int>, reporter: LineAttemptReporting?) {
         guard !baseLines.isEmpty else { return }
         let fresh = alignHeardWords()
         let direct = keepingLockedAndAccepted(fresh, replacingAttempts: replacingAttempts)
@@ -1905,6 +1988,21 @@ final class AudioSyncManager {
         ) {
             lockedThisPlay[line.id] = line
             lockedNewLine = true
+        }
+        if reporter?.discardStaleOffset(lockedLineIDs: lockedLineIDs) == true {
+            clearSessionAlignment()
+            if let trackId = activeTrackId { removeCachedAlignment(trackId: trackId) }
+            let lines = baseLines
+            let fallback = AudioAlignmentResult(lines: lines, matchedLineCount: 0, matchedWordCount: 0, medianOffset: nil)
+            diagnostics.update {
+                $0.totalRecognizedWords = 0
+                $0.recentWords.removeAll()
+                $0.record(alignment: fallback, sourceLines: lines)
+            }
+            diagnostics.note("Released provisional lyric timing after consecutive missed lines")
+            state.applyAudioSyncedLines(lines)
+            state.audioSyncStatus = .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: lines.count)
+            return
         }
         // Only direct alignment can establish a locked template.
         let result = recoveringRepeatedLines(direct, fresh: fresh)
@@ -1940,7 +2038,10 @@ final class AudioSyncManager {
             persistAlignment(result, engine: .lyricsAlignment)
         }
         if progress.isFinished {
+            // Keep the playback boundary so the next repeat can retry a poorly aligned pass.
+            let restartBoundary = hasLowYieldLocks ? lastPlayback : nil
             stop()
+            lastPlayback = restartBoundary
             state.audioSyncStatus = progress.status(engine: .lyricsAlignment)
         } else {
             state.audioSyncStatus = .syncing(
@@ -1975,7 +2076,9 @@ final class AudioSyncManager {
             attemptedLineIDs: engine == .lyricsAlignment ? attemptedLineIDs.subtracting(lockedLineIDs).sorted() : nil,
             lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil
         )
-        cache.save(record)
+        dependencies.cacheQueue.async { [cache] in
+            cache.save(record)
+        }
         cachedAlignedLineCount = forceUpdateCount
             ? result.matchedLineCount
             : max(cachedAlignedLineCount, result.matchedLineCount)

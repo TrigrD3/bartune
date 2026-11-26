@@ -443,7 +443,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
     }
 
     @MainActor
-    func testCachedTrackSkipsLiveResyncAndAppliesCachedWordTimestamps() throws {
+    func testCachedTrackSkipsLiveResyncAndAppliesCachedWordTimestamps() async throws {
         let suiteName = "bartune.test.cachedskip.\(UUID().uuidString)"
         let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { ud.removePersistentDomain(forName: suiteName) }
@@ -488,6 +488,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         state.setTrack(track, lyrics: rawLines)
         let manager = AudioSyncManager(state: state, cache: cache)
         manager.handleTrackLoaded(track: track, rawLines: rawLines)
+        await manager.flushCacheOperations()
 
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
@@ -628,7 +629,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
     }
 
     @MainActor
-    func testSkipsLiveSyncWhenTrackAlreadyHasWordLevelTimestamps() throws {
+    func testSkipsLiveSyncWhenTrackAlreadyHasWordLevelTimestamps() async throws {
         let suiteName = "bartune.test.wordsyncskip.\(UUID().uuidString)"
         let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { ud.removePersistentDomain(forName: suiteName) }
@@ -661,6 +662,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         state.setTrack(track, lyrics: yrcLines)
         let manager = AudioSyncManager(state: state, cache: cache)
         manager.handleTrackLoaded(track: track, rawLines: yrcLines)
+        await manager.flushCacheOperations()
 
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
@@ -786,6 +788,29 @@ final class AudioLyricsAlignerTests: XCTestCase {
             ]
         )
         XCTAssertFalse(duplicateTimestamp.isReliable)
+    }
+
+    func testPartialCacheRequiresMoreThanSparseLocksAfterManyMisses() {
+        let lines = (0..<48).map { id in
+            let start = Double(id) * 3
+            return LyricLine(id: id, timestamp: start, text: "Verse", words: [
+                WordTimestamp(timestamp: start, duration: 0.5, text: "Verse"),
+            ])
+        }
+        func record(locked: Int, missed: Int) -> AudioSyncedLyricsRecord {
+            AudioSyncedLyricsRecord(
+                trackId: "spotify:track:partial", engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 7.36,
+                alignedLineCount: locked, sourceLineCount: lines.count, lines: lines,
+                lockedLineIDs: Array(0..<locked), attemptedLineIDs: Array(locked..<(locked + missed))
+            )
+        }
+
+        let poisoned = record(locked: 4, missed: 44)
+        XCTAssertFalse(poisoned.canResumePartial(expectedSourceLineCount: lines.count))
+        XCTAssertFalse(poisoned.isReliable)
+        XCTAssertTrue(record(locked: 4, missed: 16).canResumePartial(expectedSourceLineCount: lines.count))
+        XCTAssertTrue(record(locked: 5, missed: 43).canResumePartial(expectedSourceLineCount: lines.count))
+        XCTAssertTrue(record(locked: 2, missed: 9).canResumePartial(expectedSourceLineCount: lines.count))
     }
 
     func testAlignPreventsCrossLineWordBleedAndOverlappingTimestamps() {
@@ -1067,7 +1092,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
     }
 
     @MainActor
-    func testOfflineRecoveryUsesCachedAudioSyncedLyricsWhenRawLyricsEvicted() throws {
+    func testOfflineRecoveryUsesCachedAudioSyncedLyricsWhenRawLyricsEvicted() async throws {
         let suiteName = "bartune.test.offlinerecovery.\(UUID().uuidString)"
         let ud = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { ud.removePersistentDomain(forName: suiteName) }
@@ -1125,6 +1150,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
 
         let manager = AudioSyncManager(state: state, cache: cache)
         manager.handleTrackLoaded(track: track, rawLines: [])
+        await manager.flushCacheOperations()
 
         XCTAssertFalse(manager.isLiveSyncActive)
         XCTAssertEqual(state.audioSyncStatus, .cached(.lyricsAlignment))
@@ -1159,6 +1185,7 @@ final class AudioLyricsAlignerTests: XCTestCase {
         manager.handleTrackLoaded(track: track, rawLines: [])
         XCTAssertEqual(state.audioSyncStatus, .idle)
         XCTAssertFalse(state.hasLyrics)
+        await manager.flushCacheOperations()
         XCTAssertNil(cache.load(trackId: track.id))
     }
 
