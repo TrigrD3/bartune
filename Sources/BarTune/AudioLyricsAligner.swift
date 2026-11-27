@@ -316,7 +316,9 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         if let offset = medianOffset, abs(offset) > offsetLimit {
             return false
         }
-        for idx in 1..<nonEmpty.count where nonEmpty[idx].timestamp < nonEmpty[idx - 1].timestamp + 0.15 {
+        // Lyrics Alignment schedules section tags as markers, so only lyrics need the minimum gap.
+        let lyrics = engine == .lyricsAlignment ? nonEmpty.filter { !ForcedAlignmentText.isStructuralTag($0.text) } : nonEmpty
+        for (previous, next) in zip(lyrics, lyrics.dropFirst()) where next.timestamp < previous.timestamp + 0.15 {
             return false
         }
         // Playback lookup binary-searches every line, so blank markers must be in order too.
@@ -713,9 +715,6 @@ enum LyricsAudioAligner {
         let ownedMedian = consistentMedian(ownedOffsetSamples)
         let medianOffset = consistentMedian(offsetSamples) ?? ownedMedian
         let shift = medianOffset ?? 0.0
-        func predictedFallbackStart(at timestamp: Double) -> Double {
-            abs(shift) >= 0.15 ? max(0, timestamp + shift) : timestamp
-        }
         var recentOwnedOffset = ownedMedian ?? shift
         let firstLyricIndex = lines.indices.first { !isEmptyLine(lines[$0]) && !structuralRows[$0] }
         let localPadding = min(searchWindow, regroupsCJKWords ? (medianOffset != nil ? 1.5 : 2.0) : 3.0)
@@ -887,7 +886,7 @@ enum LyricsAudioAligner {
                 lastConsumedWordStart = max(lastConsumedWordStart, maxMatchedStart)
                 if !regroupsCJKWords {
                     // Keep the full tail until the next lyric's actual onset or fallback is known.
-                    let boundary = nextAnyTs.map(predictedFallbackStart(at:))
+                    let boundary = nextAnyTs.map { predictedFallbackStart(at: $0, medianOffset: medianOffset) }
                     let fallbackEnd = boundary.flatMap { best.end > $0 + localPadding ? max(best.start + 0.3, $0) : nil }
                     previousMatch = (fallbackEnd, recentOwnedOffset)
                 }
@@ -904,7 +903,8 @@ enum LyricsAudioAligner {
                 continue lineLoop
             }
 
-            let baseStart = predictedFallbackStart(at: line.timestamp)
+            let baseStart = predictedFallbackStart(at: line.timestamp, medianOffset: medianOffset)
+            let canTrimPreviousMatch = isNonEmpty && previousMatch != nil && previousMatch?.fallbackEnd == nil
             let fallbackEnd = previousMatch?.fallbackEnd ?? previousLineEnd
             if let match = previousMatch, match.fallbackEnd != nil, let previousIndex = trimmablePreviousIndex,
                isNonEmpty || nextNonEmptyTs == nil {
@@ -915,8 +915,10 @@ enum LyricsAudioAligner {
                 recentOwnedOffset = match.offsetBeforeMatch
                 previousMatch = nil
             }
-            // Place blanks provisionally at their fallback boundary until a matched onset can move them.
-            let fallbackStart: Double = if previousEmittedTimestamp != nil || previousBlankTimestamp != nil {
+            // A lyric's fallback timestamp can cut short the previous match and move provisional markers.
+            let fallbackStart: Double = if canTrimPreviousMatch {
+                max(baseStart, previousEmittedTimestamp.map { $0 + 0.25 } ?? 0)
+            } else if previousEmittedTimestamp != nil || previousBlankTimestamp != nil {
                 max(baseStart, spacingFloor, fallbackEnd)
             } else {
                 baseStart
@@ -933,14 +935,16 @@ enum LyricsAudioAligner {
                 : line.words
 
             if isNonEmpty {
+                if canTrimPreviousMatch,
+                   fallbackStart < previousLineEnd || previousBlankTimestamp.map({ $0 >= fallbackStart }) == true {
+                    Self.reconcilePrecedingBoundary(
+                        in: &alignedLines, before: alignedLines.count, targetStart: fallbackStart, ignoringStructuralTags: true
+                    )
+                }
                 previousMatch = nil
                 previousEmittedTimestamp = fallbackStart
                 previousBlankTimestamp = nil
-                if let dur = line.duration {
-                    previousLineEnd = max(previousLineEnd, fallbackStart + max(0.25, dur))
-                } else {
-                    previousLineEnd = max(previousLineEnd, fallbackStart + 0.25)
-                }
+                previousLineEnd = fallbackStart + max(0.25, line.duration ?? 0.25)
             } else {
                 previousBlankTimestamp = fallbackStart
             }
@@ -963,6 +967,11 @@ enum LyricsAudioAligner {
             matchedLineIDs: matchedLineIDs,
             clampedRunawayLineIDs: clampedRunawayLineIDs
         )
+    }
+
+    static func predictedFallbackStart(at timestamp: Double, medianOffset: Double?) -> Double {
+        let shift = medianOffset ?? 0
+        return abs(shift) >= 0.15 ? max(0, timestamp + shift) : timestamp
     }
 
     /// `line` cut to end at `end`, with any word running past it shortened to fit.
