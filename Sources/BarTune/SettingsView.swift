@@ -630,10 +630,10 @@ struct SettingsView: View {
                     Text("Timing Offset")
                     Spacer()
                     let sign = state.offsetSeconds > 0 ? "+" : ""
-                    Text(String(format: "%@%.1fs", sign, state.offsetSeconds))
+                    Text(String(format: "%@%.2fs", sign, state.offsetSeconds))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
-                    Stepper("", value: $state.offsetSeconds, in: -5.0...5.0, step: 0.2)
+                    Stepper("", value: $state.offsetSeconds, in: -5.0...5.0, step: 0.05)
                         .labelsHidden()
                     Button("Reset") {
                         state.offsetSeconds = 0.0

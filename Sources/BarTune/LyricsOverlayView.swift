@@ -170,10 +170,12 @@ struct KaraokeLineView: View {
                 availableWidth: availableWidth
             )
 
-            TimelineView(.animation(minimumInterval: lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0), paused: timelinePaused)) { timeline in
+            let frameInterval = lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0)
+            TimelineView(.animation(minimumInterval: frameInterval, paused: timelinePaused)) { timeline in
+                let renderDate = isPlaying ? timeline.date.addingTimeInterval(frameInterval) : timeline.date
                 let progress = Self.scrollProgress(
                     state: state,
-                    at: timeline.date,
+                    at: renderDate,
                     karaokeEnabled: karaokeEnabled,
                     measureFont: measureFont
                 )
@@ -185,15 +187,15 @@ struct KaraokeLineView: View {
                 )
 
                 let pop = wordPopEnabled && karaokeEnabled
-                    ? measureFont.flatMap { state.liveWordPop(at: timeline.date, font: $0) }
+                    ? measureFont.flatMap { state.liveWordPop(at: renderDate, font: $0) }
                     : nil
                 Group {
                     if let pop, pop.strength > 0.001 {
                         let strength = CGFloat(pop.strength)
                         ZStack(alignment: .leading) {
-                            sweptText(progress: progress, measuring: true)
+                            sweptText(progress: progress)
                                 .mask(WordSpanMask(start: pop.start, end: pop.end, inverted: true))
-                            sweptText(progress: progress, measuring: false)
+                            sweptText(progress: progress)
                                 .mask(WordSpanMask(start: pop.start, end: pop.end, inverted: false))
                                 .brightness(0.18 * strength)
                                 .scaleEffect(1 + 0.08 * strength, anchor: UnitPoint(x: (pop.start + pop.end) / 2, y: 0.5))
@@ -201,35 +203,36 @@ struct KaraokeLineView: View {
                                 .shadow(color: sungColor.opacity(0.6 * strength), radius: 3 * strength)
                         }
                     } else {
-                        sweptText(progress: progress, measuring: true)
+                        sweptText(progress: progress)
                     }
                 }
                 .overlay(alignment: .leading) {
                     if typingCaretEnabled, karaokeEnabled, textWidth > 0 {
-                        typingCaret(progress: progress, waiting: state.liveIsWaitingForWord(at: timeline.date), at: timeline.date)
+                        typingCaret(progress: progress, waiting: state.liveIsWaitingForWord(at: renderDate), at: renderDate)
                     }
                 }
                 .offset(x: scrollOffset)
                 .frame(maxHeight: .infinity, alignment: .center)
             }
         }
+        .background(alignment: .leading) {
+            StaticLyricText(text: text, font: font, color: .clear)
+                .background(widthReader)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+        }
         .clipped()
     }
 
-    /// The line with the karaoke sweep at `progress`; `measuring` attaches the width reader (once per line).
-    private func sweptText(progress: Double, measuring: Bool) -> some View {
+    /// The line with the karaoke sweep at `progress`.
+    private func sweptText(progress: Double) -> some View {
         ZStack(alignment: .leading) {
             if karaokeEnabled {
-                Text(text)
-                    .font(font)
-                    .foregroundStyle(unsungColor)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(measuring ? widthReader : nil)
+                StaticLyricText(text: text, font: font, color: unsungColor)
+                    .equatable()
 
-                Text(text)
-                    .font(font)
-                    .foregroundStyle(sungColor)
-                    .fixedSize(horizontal: true, vertical: false)
+                let sungLayer = StaticLyricText(text: text, font: font, color: sungColor)
+                    .equatable()
                     .mask {
                         let feather = Self.sweepFeather(progress: progress, textWidth: textWidth)
                         LinearGradient(
@@ -243,20 +246,19 @@ struct KaraokeLineView: View {
                             endPoint: .trailing
                         )
                     }
-                    .shadow(
-                        color: glowEnabled ? sungColor.opacity(0.55) : .clear,
-                        radius: glowEnabled ? 4 : 0
-                    )
+                if glowEnabled {
+                    sungLayer.shadow(color: sungColor.opacity(0.55), radius: 4)
+                } else {
+                    sungLayer
+                }
             } else {
-                Text(text)
-                    .font(font)
-                    .foregroundStyle(sungColor)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .background(measuring ? widthReader : nil)
-                    .shadow(
-                        color: glowEnabled ? sungColor.opacity(0.55) : .clear,
-                        radius: glowEnabled ? 4 : 0
-                    )
+                let plainLayer = StaticLyricText(text: text, font: font, color: sungColor)
+                    .equatable()
+                if glowEnabled {
+                    plainLayer.shadow(color: sungColor.opacity(0.55), radius: 4)
+                } else {
+                    plainLayer
+                }
             }
         }
     }
@@ -280,6 +282,19 @@ struct KaraokeLineView: View {
                 .onChange(of: text) { _ in textWidth = textGeo.size.width }
                 .onChange(of: textGeo.size.width) { newWidth in textWidth = newWidth }
         }
+    }
+}
+
+private struct StaticLyricText: View, Equatable {
+    let text: String
+    let font: Font
+    let color: Color
+
+    var body: some View {
+        Text(text)
+            .font(font)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: true, vertical: false)
     }
 }
 
