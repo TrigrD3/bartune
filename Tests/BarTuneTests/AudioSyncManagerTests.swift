@@ -4526,8 +4526,11 @@ final class AudioSyncManagerTests: XCTestCase {
     func testReplayPassesPriorUnlockedLinesToAligner() async {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         defer { try? FileManager.default.removeItem(at: dir) }
+        let suiteName = "test.prior-replay.\(UUID().uuidString)"
+        let ud = UserDefaults(suiteName: suiteName) ?? .standard
+        defer { ud.removePersistentDomain(forName: suiteName) }
         let cache = AudioSyncedLyricsCache(directory: dir)
-        let state = LyricsState()
+        let state = LyricsState(userDefaults: ud)
         state.audioSyncEngine = .lyricsAlignment
         let track = TrackInfo(id: "spotify:track:prior-replay", title: "T", artist: "A", album: "B", duration: 60, artworkURL: nil)
         let rawLines = sampleLines()
@@ -4582,6 +4585,62 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(launched)
         XCTAssertEqual(receivedPriors.withLock { Array($0.keys) }, [1])
         XCTAssertEqual(receivedPriors.withLock { $0[1]?.timestamp }, 15.4)
+        manager.stop()
+    }
+
+    @MainActor
+    func testRepeatAfterFullPassRollsOverIntoNextPassFromCache() async {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let suiteName = "test.repeat-rollover.\(UUID().uuidString)"
+        let ud = UserDefaults(suiteName: suiteName) ?? .standard
+        defer { ud.removePersistentDomain(forName: suiteName) }
+        let cache = AudioSyncedLyricsCache(directory: dir)
+        let state = LyricsState(userDefaults: ud)
+        state.audioSyncEngine = .lyricsAlignment
+        let track = TrackInfo(id: "spotify:track:repeat-rollover", title: "T", artist: "A", album: "B", duration: 60, artworkURL: nil)
+        let rawLines = sampleLines()
+
+        let launchAnchors = LockedBox<[[Int: ClosedRange<Double>]]>([])
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAlignerWithPriors = { _, anchors, _ in
+            launchAnchors.withLock { $0.append(anchors) }
+            let words = [
+                RecognizedAudioWord(text: "Hello", startTime: 10.1, duration: 0.4, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "world", startTime: 10.5, duration: 0.4, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "from", startTime: 10.9, duration: 0.4, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "test", startTime: 11.3, duration: 0.4, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "Second", startTime: 15.1, duration: 0.4, confidence: 0.05, sourceLineId: 1),
+                RecognizedAudioWord(text: "line", startTime: 15.5, duration: 0.4, confidence: 0.05, sourceLineId: 1),
+                RecognizedAudioWord(text: "of", startTime: 15.9, duration: 0.4, confidence: 0.05, sourceLineId: 1),
+                RecognizedAudioWord(text: "lyrics", startTime: 16.3, duration: 0.4, confidence: 0.05, sourceLineId: 1),
+            ]
+            return FakeChunkEngine(attempted: [0, 1], confident: anchors.isEmpty ? [0] : []) { _ in words }
+        }
+
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        state.updatePlayback(isPlaying: true, position: 10.0)
+        manager.handleTrackLoaded(track: track, rawLines: rawLines)
+
+        let pass1Started = await waitUntil { launchAnchors.withLock { $0.count == 1 } && capture.startCount == 1 }
+        XCTAssertTrue(pass1Started)
+
+        // Emit 1 s of audio so Pass 1 locks line 0 and attempts line 1 (all readable lines attempted).
+        capture.emit(samples: Array(repeating: Float(0.2), count: 16000), sampleRate: 16000)
+        let pass1Persisted = await waitUntil {
+            guard let record = cache.load(trackId: track.id) else { return false }
+            return record.lockedLineIDs == [0] && record.attemptedLineIDs == [1]
+        }
+        XCTAssertTrue(pass1Persisted)
+
+        // Advance playback to 55 s then loop back to 1 s (track repeat).
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 55.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 1.0)
+
+        let pass2Started = await waitUntil { launchAnchors.withLock { $0.count == 2 } }
+        XCTAssertTrue(pass2Started)
+        XCTAssertEqual(launchAnchors.withLock { Array($0[1].keys) }, [0])
         manager.stop()
     }
 
