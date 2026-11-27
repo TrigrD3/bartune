@@ -12,22 +12,27 @@ extension ProcessTapAudioCaptureTests {
             mBytesPerPacket: 4, mFramesPerPacket: 1, mBytesPerFrame: 4, mChannelsPerFrame: 1,
             mBitsPerChannel: 32, mReserved: 0
         )
-        let initialDrain = expectation(description: "Drained the eight original FIFO slots")
+        let capacity = LiveProcessTapBackend.RawIOBufferHandoff.slotCount
+        let lastAccepted = Float(capacity - 1)
+        let dropped = Float(capacity)
+        let afterDrop = Float(capacity + 1)
+        let afterContiguous = Float(capacity + 2)
+        let initialDrain = expectation(description: "Drained the original FIFO slots")
         let marked = expectation(description: "Marked the first accepted buffer after overflow")
         let contiguous = expectation(description: "Kept the next contiguous buffer unmarked")
         let fifo = LiveProcessTapBackend.RawIOBufferHandoff(format: format, maxFrames: 1, workerQueue: worker) { buffer in
             switch buffer.channels.first?.first {
-            case 7:
+            case lastAccepted:
                 XCTAssertFalse(buffer.startsNewSpan)
                 initialDrain.fulfill()
-            case 9:
+            case afterDrop:
                 XCTAssertTrue(buffer.startsNewSpan)
                 marked.fulfill()
-            case 10:
+            case afterContiguous:
                 XCTAssertFalse(buffer.startsNewSpan)
                 contiguous.fulfill()
             default:
-                XCTAssertNotEqual(buffer.channels.first?.first, 8)
+                XCTAssertNotEqual(buffer.channels.first?.first, dropped)
                 XCTAssertFalse(buffer.startsNewSpan)
             }
         }
@@ -42,15 +47,15 @@ extension ProcessTapAudioCaptureTests {
         }
 
         worker.suspend()
-        for value in 0...8 {
+        for value in 0...capacity {
             enqueue(Float(value))
         }
         worker.resume()
         await fulfillment(of: [initialDrain], timeout: 2)
         worker.sync {}
         worker.suspend()
-        enqueue(9)
-        enqueue(10)
+        enqueue(afterDrop)
+        enqueue(afterContiguous)
         worker.resume()
         await fulfillment(of: [marked, contiguous], timeout: 2)
     }

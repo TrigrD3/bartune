@@ -63,7 +63,7 @@ enum AudioResampler {
 }
 
 /// Centered real FFT matching PyTorch's periodic Hann window and reflect padding.
-final class SpectralSTFT {
+final class SpectralSTFT: @unchecked Sendable {
     static let nFFT = 4096
     static let hopLength = 1024
     static let nbBins = 1487
@@ -71,6 +71,8 @@ final class SpectralSTFT {
     private static let log2FFT: vDSP_Length = 12
     private let setup: FFTSetup
     private let window: [Float]
+    private let scaledWindow: [Float]
+    private let windowSquared: [Float]
 
     init() {
         guard let setup = vDSP_create_fftsetup(Self.log2FFT, FFTRadix(kFFTRadix2)) else {
@@ -80,6 +82,8 @@ final class SpectralSTFT {
         var window = [Float](repeating: 0, count: Self.nFFT)
         vDSP_hann_window(&window, vDSP_Length(Self.nFFT), Int32(vDSP_HANN_DENORM))
         self.window = window
+        scaledWindow = vDSP.multiply(1 / Float(Self.nFFT), window)
+        windowSquared = vDSP.multiply(window, window)
     }
 
     deinit {
@@ -90,7 +94,18 @@ final class SpectralSTFT {
         var real: [Float]
         var imag: [Float]
 
-        var magnitudes: [Float] { real.indices.map { magnitude(at: $0) } }
+        var magnitudes: [Float] {
+            guard !real.isEmpty else { return [] }
+            let count = real.count
+            var sq = [Float](repeating: 0, count: count)
+            var out = [Float](repeating: 0, count: count)
+            let n = vDSP_Length(count)
+            vDSP_vsq(real, 1, &sq, 1, n)
+            vDSP_vma(imag, 1, imag, 1, sq, 1, &sq, 1, n)
+            var n32 = Int32(count)
+            vvsqrtf(&out, sq, &n32)
+            return out
+        }
 
         func magnitude(at index: Int) -> Float {
             let re = real[index]
@@ -120,23 +135,47 @@ final class SpectralSTFT {
         let bins = Self.spectrumBins
         var real = [Float](repeating: 0, count: frameCount * bins)
         var imag = real
+        var windowed = [Float](repeating: 0, count: Self.nFFT)
         var even = [Float](repeating: 0, count: half)
         var odd = even
+        var halfScale: Float = 0.5
+        let nFFT = vDSP_Length(Self.nFFT)
+        let nBins = vDSP_Length(half - 1)
         for frame in 0..<frameCount {
             let start = frame * Self.hopLength - half
-            for index in 0..<half {
-                let sample = index * 2
-                even[index] = samples[Self.reflect(start + sample, count: samples.count)] * window[sample]
-                odd[index] = samples[Self.reflect(start + sample + 1, count: samples.count)] * window[sample + 1]
+            if start >= 0 && start + Self.nFFT <= samples.count {
+                samples.withUnsafeBufferPointer { src in
+                    guard let base = src.baseAddress else { return }
+                    vDSP_vmul(base.advanced(by: start), 1, window, 1, &windowed, 1, nFFT)
+                }
+                windowed.withUnsafeBufferPointer { src in
+                    guard let base = src.baseAddress else { return }
+                    cblas_scopy(Int32(half), base, 2, &even, 1)
+                    cblas_scopy(Int32(half), base.advanced(by: 1), 2, &odd, 1)
+                }
+            } else {
+                for index in 0..<half {
+                    let sample = index * 2
+                    even[index] = samples[Self.reflect(start + sample, count: samples.count)] * window[sample]
+                    odd[index] = samples[Self.reflect(start + sample + 1, count: samples.count)] * window[sample + 1]
+                }
             }
             fft(real: &even, imag: &odd, direction: FFT_FORWARD)
             let offset = frame * bins
             // vDSP returns twice the unnormalized DFT, with Nyquist packed into the imaginary DC slot.
             real[offset] = even[0] * 0.5
             real[offset + half] = odd[0] * 0.5
-            for bin in 1..<half {
-                real[offset + bin] = even[bin] * 0.5
-                imag[offset + bin] = odd[bin] * 0.5
+            real.withUnsafeMutableBufferPointer { dst in
+                even.withUnsafeBufferPointer { src in
+                    guard let d = dst.baseAddress, let s = src.baseAddress else { return }
+                    vDSP_vsmul(s.advanced(by: 1), 1, &halfScale, d.advanced(by: offset + 1), 1, nBins)
+                }
+            }
+            imag.withUnsafeMutableBufferPointer { dst in
+                odd.withUnsafeBufferPointer { src in
+                    guard let d = dst.baseAddress, let s = src.baseAddress else { return }
+                    vDSP_vsmul(s.advanced(by: 1), 1, &halfScale, d.advanced(by: offset + 1), 1, nBins)
+                }
             }
         }
         return Spectrum(real: real, imag: imag)
@@ -147,28 +186,54 @@ final class SpectralSTFT {
         let half = Self.nFFT / 2
         let bins = Self.spectrumBins
         let frameCount = real.count / bins
-        let inverseScale = 1 / Float(Self.nFFT)
         var output = [Float](repeating: 0, count: outputLength)
         var weights = output
         var even = [Float](repeating: 0, count: half)
         var odd = even
+        var interleaved = [Float](repeating: 0, count: Self.nFFT)
         for frame in 0..<frameCount {
             let start = frame * Self.hopLength - half
             if start >= outputLength { break }
             let offset = frame * bins
             even[0] = real[offset]
             odd[0] = real[offset + half]
-            for bin in 1..<half {
-                even[bin] = real[offset + bin]
-                odd[bin] = imag[offset + bin]
+            even.withUnsafeMutableBufferPointer { dst in
+                real.withUnsafeBufferPointer { src in
+                    guard let d = dst.baseAddress, let s = src.baseAddress else { return }
+                    d.advanced(by: 1).update(from: s.advanced(by: offset + 1), count: half - 1)
+                }
+            }
+            odd.withUnsafeMutableBufferPointer { dst in
+                imag.withUnsafeBufferPointer { src in
+                    guard let d = dst.baseAddress, let s = src.baseAddress else { return }
+                    d.advanced(by: 1).update(from: s.advanced(by: offset + 1), count: half - 1)
+                }
             }
             fft(real: &even, imag: &odd, direction: FFT_INVERSE)
-            let end = min(Self.nFFT, outputLength - start)
-            for sample in max(0, -start)..<end {
-                let coefficient = window[sample]
-                let value = sample.isMultiple(of: 2) ? even[sample / 2] : odd[sample / 2]
-                output[start + sample] += value * inverseScale * coefficient
-                weights[start + sample] += coefficient * coefficient
+            interleaved.withUnsafeMutableBufferPointer { dst in
+                guard let base = dst.baseAddress else { return }
+                cblas_scopy(Int32(half), even, 1, base, 2)
+                cblas_scopy(Int32(half), odd, 1, base.advanced(by: 1), 2)
+            }
+            let sampleStart = max(0, -start)
+            let sampleEnd = min(Self.nFFT, outputLength - start)
+            let count = sampleEnd - sampleStart
+            guard count > 0 else { continue }
+            let outStart = start + sampleStart
+            let n = vDSP_Length(count)
+            output.withUnsafeMutableBufferPointer { outBuf in
+                interleaved.withUnsafeBufferPointer { inBuf in
+                    scaledWindow.withUnsafeBufferPointer { winBuf in
+                        guard let o = outBuf.baseAddress, let i = inBuf.baseAddress, let w = winBuf.baseAddress else { return }
+                        vDSP_vma(i.advanced(by: sampleStart), 1, w.advanced(by: sampleStart), 1, o.advanced(by: outStart), 1, o.advanced(by: outStart), 1, n)
+                    }
+                }
+            }
+            weights.withUnsafeMutableBufferPointer { wBuf in
+                windowSquared.withUnsafeBufferPointer { sqBuf in
+                    guard let w = wBuf.baseAddress, let sq = sqBuf.baseAddress else { return }
+                    vDSP_vadd(w.advanced(by: outStart), 1, sq.advanced(by: sampleStart), 1, w.advanced(by: outStart), 1, n)
+                }
             }
         }
         for index in output.indices where weights[index] > 0 {
@@ -199,6 +264,7 @@ final class SpectralSTFT {
 
 final class SpectralVocalSeparator: VocalIsolating {
     private let model: VocalMaskPredicting
+    private let stft = SpectralSTFT()
 
     init(model: VocalMaskPredicting) {
         self.model = model
@@ -215,9 +281,10 @@ final class SpectralVocalSeparator: VocalIsolating {
         // Open-Unmix expects full-scale audio. One gain preserves the stereo balance it uses to separate sources.
         let peak = max(vDSP.maximumMagnitude(left), vDSP.maximumMagnitude(right))
         let gain = AudioLevel.normalizationGain(peak: peak)
-        let stft = SpectralSTFT()
         var leftSpectrum = stft.stft(samples: gain == 1 ? left : vDSP.multiply(gain, left))
         var rightSpectrum = stft.stft(samples: gain == 1 ? right : vDSP.multiply(gain, right))
+        let leftMags = leftSpectrum.magnitudes
+        let rightMags = rightSpectrum.magnitudes
         let stride = SpectralSTFT.spectrumBins
         let frameCount = leftSpectrum.real.count / stride
         let overlap = min(16, window / 4)
@@ -228,12 +295,20 @@ final class SpectralVocalSeparator: VocalIsolating {
         for (index, start) in starts.enumerated() {
             try Task.checkCancellation()
             let count = min(window, frameCount - start)
-            for frame in 0..<window {
-                let source = (start + frame) * stride
-                let offset = frame * frameSize
-                for bin in 0..<bins {
-                    mixture[offset + bin] = frame < count ? leftSpectrum.magnitude(at: source + bin) : 0
-                    mixture[offset + bins + bin] = frame < count ? rightSpectrum.magnitude(at: source + bin) : 0
+            mixture.withUnsafeMutableBufferPointer { mixBuf in
+                leftMags.withUnsafeBufferPointer { lBuf in
+                    rightMags.withUnsafeBufferPointer { rBuf in
+                        guard let mix = mixBuf.baseAddress, let l = lBuf.baseAddress, let r = rBuf.baseAddress else { return }
+                        for frame in 0..<count {
+                            let source = (start + frame) * stride
+                            let offset = frame * frameSize
+                            mix.advanced(by: offset).update(from: l.advanced(by: source), count: bins)
+                            mix.advanced(by: offset + bins).update(from: r.advanced(by: source), count: bins)
+                        }
+                        if count < window {
+                            mix.advanced(by: count * frameSize).initialize(repeating: 0, count: (window - count) * frameSize)
+                        }
+                    }
                 }
             }
             var prediction = try model.predictVocalMagnitude(mixMagnitude: mixture)
