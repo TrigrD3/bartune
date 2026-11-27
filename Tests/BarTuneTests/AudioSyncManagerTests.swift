@@ -2948,16 +2948,28 @@ final class AudioSyncManagerTests: XCTestCase {
     @MainActor
     private func waitUntil(
         timeout: TimeInterval = 2.0,
+        pollInterval: Duration? = nil,
         _ condition: () -> Bool
     ) async -> Bool {
-        let deadline = Date().addingTimeInterval(timeout)
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(timeout))
         while !condition() {
-            if Date() >= deadline {
+            if clock.now >= deadline {
                 return false
             }
-            await Task.yield()
+            if let pollInterval {
+                try? await Task.sleep(for: pollInterval)
+            } else {
+                await Task.yield()
+            }
         }
         return true
+    }
+
+    @MainActor
+    private func waitForVocalIsolationChunk(_ condition: () -> Bool) async -> Bool {
+        // Real audio preprocessing runs at background priority, even with fake capture and inference.
+        await waitUntil(timeout: 20, pollInterval: .milliseconds(5), condition)
     }
 
     private func sampleTrack() -> TrackInfo {
@@ -4015,7 +4027,7 @@ final class AudioSyncManagerTests: XCTestCase {
         for _ in 0..<2 {
             capture.emit(samples: halfSecond, sampleRate: 48000, side: halfSecond)
         }
-        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        let processed = await waitForVocalIsolationChunk { manager.diagnostics.snapshot?.resultCount == 1 }
         XCTAssertTrue(processed)
 
         let recognized = try XCTUnwrap(request.withLock { $0 })
@@ -4069,7 +4081,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(buffered)
         state.playbackAnchorPosition = 10.7
         capture.emit(samples: [Float](repeating: 0.5, count: 24000), sampleRate: 48000, side: firstHalf, captureDelay: 0)
-        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        let processed = await waitForVocalIsolationChunk { manager.diagnostics.snapshot?.resultCount == 1 }
         XCTAssertTrue(processed)
 
         let recognized = try XCTUnwrap(request.withLock { $0 })
@@ -4175,7 +4187,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let audio = [Float](repeating: 0.3, count: 48000)
         capture.emit(samples: audio, sampleRate: 48000, side: audio)
-        let processed = await waitUntil { manager.diagnostics.snapshot?.resultCount == 1 }
+        let processed = await waitForVocalIsolationChunk { manager.diagnostics.snapshot?.resultCount == 1 }
         XCTAssertTrue(processed)
         let recognized = try XCTUnwrap(request.withLock { $0 })
         XCTAssertEqual(recognized.sampleRate, 16000)
@@ -4210,7 +4222,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started)
 
         capture.emit(samples: [Float](repeating: 0.3, count: 48000), sampleRate: 48000)
-        let finished = await waitUntil { !manager.isLiveSyncActive || !requests.withLock { $0.isEmpty } }
+        let finished = await waitForVocalIsolationChunk { !manager.isLiveSyncActive || !requests.withLock { $0.isEmpty } }
         XCTAssertTrue(finished)
         XCTAssertTrue(attemptedConversion.withLock { $0 })
         XCTAssertTrue(requests.withLock { $0.isEmpty })
@@ -4270,7 +4282,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let samples = [Float](repeating: 0.3, count: 72000)
         capture.emit(samples: samples, sampleRate: 48000, side: samples)
-        let stopped = await waitUntil { !manager.isLiveSyncActive }
+        let stopped = await waitForVocalIsolationChunk { !manager.isLiveSyncActive }
         XCTAssertTrue(stopped)
         let next = TrackInfo(id: "spotify:track:next", title: "Next", artist: "", album: "", duration: 120, artworkURL: nil)
         manager.handleTrackLoaded(track: next, rawLines: [])
