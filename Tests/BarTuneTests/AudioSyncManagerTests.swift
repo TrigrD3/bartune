@@ -4475,6 +4475,116 @@ final class AudioSyncManagerTests: XCTestCase {
         }
     }
 
+    func testNearlyConfidentLineLocksByCrossPassConsensusWithoutOnsetRise() {
+        let pass2Line = LyricLine(
+            id: 3,
+            timestamp: 20.05,
+            duration: 1.95,
+            text: "Hello world",
+            words: [
+                WordTimestamp(timestamp: 20.05, duration: 0.95, text: "Hello "),
+                WordTimestamp(timestamp: 21.00, duration: 1.00, text: "world"),
+            ]
+        )
+        let matchingPrior = LyricLine(
+            id: 3,
+            timestamp: 20.00,
+            duration: 2.00,
+            text: "Hello world",
+            words: [
+                WordTimestamp(timestamp: 20.00, duration: 1.00, text: "Hello "),
+                WordTimestamp(timestamp: 21.00, duration: 1.00, text: "world"),
+            ]
+        )
+        let disagreeingPrior = LyricLine(
+            id: 3,
+            timestamp: 20.40,
+            duration: 2.00,
+            text: "Hello world",
+            words: [
+                WordTimestamp(timestamp: 20.40, duration: 1.00, text: "Hello "),
+                WordTimestamp(timestamp: 21.40, duration: 1.00, text: "world"),
+            ]
+        )
+        let flatEnvelope = VocalEnvelope()
+
+        XCTAssertFalse(
+            AudioSyncManager.locks(pass2Line, confident: [], nearlyConfident: [3], envelope: flatEnvelope),
+            "without onset rise or prior agreement, a nearly confident line stays unlocked"
+        )
+        XCTAssertFalse(
+            AudioSyncManager.locks(pass2Line, confident: [], nearlyConfident: [3], envelope: flatEnvelope, priorAlignedLine: disagreeingPrior),
+            "disagreeing prior timing must not lock"
+        )
+        XCTAssertTrue(
+            AudioSyncManager.locks(pass2Line, confident: [], nearlyConfident: [3], envelope: flatEnvelope, priorAlignedLine: matchingPrior),
+            "agreeing prior pass timing should promote a nearly confident line to locked"
+        )
+    }
+
+    @MainActor
+    func testReplayPassesPriorUnlockedLinesToAligner() async {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let cache = AudioSyncedLyricsCache(directory: dir)
+        let state = LyricsState()
+        state.audioSyncEngine = .lyricsAlignment
+        let track = TrackInfo(id: "spotify:track:prior-replay", title: "T", artist: "A", album: "B", duration: 60, artworkURL: nil)
+        let rawLines = sampleLines()
+        let lockedLine = LyricLine(
+            id: 0,
+            timestamp: 10.2,
+            duration: 1.8,
+            text: rawLines[0].text,
+            words: [
+                WordTimestamp(timestamp: 10.2, duration: 0.4, text: "Hello "),
+                WordTimestamp(timestamp: 10.6, duration: 0.5, text: "world "),
+                WordTimestamp(timestamp: 11.1, duration: 0.4, text: "from "),
+                WordTimestamp(timestamp: 11.5, duration: 0.5, text: "test"),
+            ]
+        )
+        let unlockedPriorLine = LyricLine(
+            id: 1,
+            timestamp: 15.4,
+            duration: 1.6,
+            text: rawLines[1].text,
+            words: [
+                WordTimestamp(timestamp: 15.4, duration: 0.4, text: "Second "),
+                WordTimestamp(timestamp: 15.8, duration: 0.4, text: "line "),
+                WordTimestamp(timestamp: 16.2, duration: 0.4, text: "of "),
+                WordTimestamp(timestamp: 16.6, duration: 0.4, text: "lyrics"),
+            ]
+        )
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: track.id,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 2,
+            sourceLineCount: 2,
+            lines: [lockedLine, unlockedPriorLine],
+            lockedLineIDs: [0],
+            attemptedLineIDs: [1],
+            lockedAtPlayStart: 0
+        ))
+
+        let receivedPriors = LockedBox<[Int: LyricLine]>([:])
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture)
+        deps.launchLyricsAlignerWithPriors = { _, _, priorLines in
+            receivedPriors.withLock { $0 = priorLines }
+            return FakeChunkEngine { _ in [] }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        manager.handleTrackLoaded(track: track, rawLines: rawLines)
+
+        let launched = await waitUntil { !receivedPriors.withLock { $0.isEmpty } }
+        XCTAssertTrue(launched)
+        XCTAssertEqual(receivedPriors.withLock { Array($0.keys) }, [1])
+        XCTAssertEqual(receivedPriors.withLock { $0[1]?.timestamp }, 15.4)
+        manager.stop()
+    }
+
     private func sampleLines() -> [LyricLine] {
         [
             LyricLine(id: 0, timestamp: 10.0, text: "Hello world from test"),

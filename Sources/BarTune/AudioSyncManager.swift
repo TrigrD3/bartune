@@ -1,3 +1,4 @@
+import Accelerate
 import AppKit
 import AVFoundation
 import Combine
@@ -92,17 +93,25 @@ enum AudioSampleExtractor {
         guard let first = channels.first else { return ([], []) }
         let count = channels.map(\.count).min() ?? 0
         guard channels.count > 1 else { return (Array(first.prefix(count)), []) }
-        let scale = 1 / Float(channels.count)
+        guard count > 0 else { return ([], []) }
         var mid = [Float](repeating: 0, count: count)
         var side = [Float](repeating: 0, count: count)
-        for index in 0..<count {
-            var sum: Float = 0
-            for channel in channels {
-                sum += channel[index]
-            }
-            mid[index] = sum * scale
-            side[index] = (channels[0][index] - channels[1][index]) / 2
+        let n = vDSP_Length(count)
+        var half: Float = 0.5
+        if channels.count == 2 {
+            vDSP_vadd(channels[0], 1, channels[1], 1, &mid, 1, n)
+            vDSP_vsmul(mid, 1, &half, &mid, 1, n)
+            vDSP_vsub(channels[1], 1, channels[0], 1, &side, 1, n)
+            vDSP_vsmul(side, 1, &half, &side, 1, n)
+            return (mid, side)
         }
+        var scale = 1 / Float(channels.count)
+        for channel in channels {
+            vDSP_vadd(mid, 1, channel, 1, &mid, 1, n)
+        }
+        vDSP_vsmul(mid, 1, &scale, &mid, 1, n)
+        vDSP_vsub(channels[1], 1, channels[0], 1, &side, 1, n)
+        vDSP_vsmul(side, 1, &half, &side, 1, n)
         return (mid, side)
     }
 
@@ -110,8 +119,20 @@ enum AudioSampleExtractor {
     static func deinterleave(_ samples: [Float], channelCount: Int) -> [[Float]] {
         guard channelCount > 1 else { return [samples] }
         let frames = samples.count / channelCount
-        return (0..<channelCount).map { channel in
-            (0..<frames).map { samples[$0 * channelCount + channel] }
+        guard frames > 0 else { return Array(repeating: [], count: channelCount) }
+        let stride = Int32(channelCount)
+        let n = Int32(frames)
+        return samples.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return Array(repeating: [], count: channelCount) }
+            return (0..<channelCount).map { channel in
+                var output = [Float](repeating: 0, count: frames)
+                output.withUnsafeMutableBufferPointer { destination in
+                    if let dst = destination.baseAddress {
+                        cblas_scopy(n, base.advanced(by: channel), stride, dst, 1)
+                    }
+                }
+                return output
+            }
         }
     }
 
@@ -612,6 +633,13 @@ final class AudioSyncManager {
         ) async -> AudioChunkTranscribing? = {
             await LyricsAlignerModel.launch(lines: $0, anchors: $1)
         }
+        var launchLyricsAlignerWithPriors: (
+            @Sendable (
+                _ lines: [LyricLine],
+                _ anchors: [Int: ClosedRange<Double>],
+                _ priorLines: [Int: LyricLine]
+            ) async -> AudioChunkTranscribing?
+        )?
         var launchVocalSeparator: @Sendable () async -> VocalIsolating? = { await VocalSeparatorModel.launch() }
         var resampleForRecognition: @Sendable ([Float], Double, Double) -> [Float]? = {
             AudioResampler.resample($0, from: $1, to: $2)
@@ -631,13 +659,17 @@ final class AudioSyncManager {
         }
 
         static func live() -> Dependencies {
+            let launchWithPriors: @Sendable ([LyricLine], [Int: ClosedRange<Double>], [Int: LyricLine]) async -> AudioChunkTranscribing? = {
+                await LyricsAlignerModel.launch(lines: $0, anchors: $1, priorLines: $2)
+            }
             if #available(macOS 14.2, *) {
                 return Dependencies(
                     capture: ProcessTapAudioCapture(),
                     hasScreenCaptureAccess: { true },
                     requestScreenCaptureAccess: {},
                     chunkDurationSeconds: 12.0,
-                    usesProcessTap: true
+                    usesProcessTap: true,
+                    launchLyricsAlignerWithPriors: launchWithPriors
                 )
             }
             return Dependencies(
@@ -645,7 +677,8 @@ final class AudioSyncManager {
                 hasScreenCaptureAccess: { CGPreflightScreenCaptureAccess() },
                 requestScreenCaptureAccess: { CGRequestScreenCaptureAccess() },
                 chunkDurationSeconds: 12.0,
-                usesProcessTap: false
+                usesProcessTap: false,
+                launchLyricsAlignerWithPriors: launchWithPriors
             )
         }
     }
@@ -676,6 +709,8 @@ final class AudioSyncManager {
     /// Lines aligned just below that on this play; they lock on a vocal onset.
     private var nearlyConfidentLineIDs: Set<Int> = []
     private var acceptedSessionLines: [Int: LyricLine] = [:]
+    private var priorUnlockedLines: [Int: LyricLine] = [:]
+    private var cachedChromaTemplates: [ChorusSelfSimilarity.CachedTemplate] = []
     private var activeTrackDuration: Double = 0
     private(set) var recognizedWords: [RecognizedAudioWord] = []
     /// Voice-band loudness of this play's captured audio, used to refine heard word timings.
@@ -878,7 +913,9 @@ final class AudioSyncManager {
         baseLines = rawLines
         clearSessionAlignment()
         chromaProfile = AudioChromaProfile()
+        cachedChromaTemplates = []
         anchoredLines = [:]
+        priorUnlockedLines = [:]
         activeTrackDuration = track.duration
         // Always start a fresh live envelope so WaveformTimingRefiner never mixes levels across plays;
         // `vocalEnvelope(for:)` falls back to `vocalEnvelopeCache` for timeline display until new frames arrive.
@@ -986,6 +1023,8 @@ final class AudioSyncManager {
                         cached.lines.filter { aligned.contains($0.id) && !locked.contains($0.id) }.map { ($0.id, $0) },
                         uniquingKeysWith: { _, latest in latest }
                     )
+                    priorUnlockedLines = acceptedSessionLines
+                    cachedChromaTemplates = cached.chromaTemplates ?? []
                     attemptedLineIDs = cached.settledLineIDs
                 } else {
                     priorHeardWords = cached.heardWords ?? []
@@ -1266,6 +1305,7 @@ final class AudioSyncManager {
         modelMayBeCached = true
         let generation = syncGeneration
         let launch = dependencies.launchLyricsAligner
+        let launchWithPriors = dependencies.launchLyricsAlignerWithPriors
         let launchSeparator = state.isolateVocals ? dependencies.launchVocalSeparator : nil
         discardBufferedAudio()
         chunkPlaybackRate = Self.sanitizedPlaybackRate(state.playbackRate)
@@ -1274,8 +1314,13 @@ final class AudioSyncManager {
         state.audioSyncStatus = .syncing(engine: .lyricsAlignment, alignedLines: anchoredLines.count, totalLines: lines.count)
 
         let anchors = anchoredLines.compactMapValues(Self.sungSpan)
+        let priorLines = priorUnlockedLines
         alignerStartupTask = Task { [weak self] in
-            let engine = await launch(lines, anchors)
+            let engine = if let launchWithPriors {
+                await launchWithPriors(lines, anchors, priorLines)
+            } else {
+                await launch(lines, anchors)
+            }
             var separator: VocalIsolating?
             if engine != nil, !Task.isCancelled, let launchSeparator {
                 separator = await launchSeparator()
@@ -1427,12 +1472,16 @@ final class AudioSyncManager {
     }
 
     private func appendFullMixEnvelope(_ audio: CapturedAudio, at start: Double, trackId: String) {
-        let rate = min(audio.sampleRate, Double(LyricsForcedAligner.sampleRate))
-        guard let mid = AudioResampler.resample(audio.samples, from: audio.sampleRate, to: rate) else { return }
-        let side = AudioResampler.resample(audio.side, from: audio.sampleRate, to: rate) ?? []
         let previousFrameCount = vocalEnvelope.totalFrameCount
         let previousEnd = vocalEnvelope.segments.last?.end
-        vocalEnvelope.append(mid: mid, side: side, sampleRate: rate, startTime: start, rate: chunkPlaybackRate, startsNewSpan: audio.startsNewSpan)
+        vocalEnvelope.append(
+            mid: audio.samples,
+            side: audio.side,
+            sampleRate: audio.sampleRate,
+            startTime: start,
+            rate: chunkPlaybackRate,
+            startsNewSpan: audio.startsNewSpan
+        )
         recordVocalEnvelopeChange(trackId: trackId, previousFrameCount: previousFrameCount, previousEnd: previousEnd)
     }
 
@@ -1507,6 +1556,16 @@ final class AudioSyncManager {
         let isFinal = reachesEnd && frameCount == audioSampleBuffer.count
         guard frameCount > 0, frameCount == targetFrames || frameCount == dropOffset || isFinal else { return }
 
+        let requestPlaybackRate = chunkPlaybackRate
+        let chunkEnd = chunkStart + Double(frameCount) / sampleRate * requestPlaybackRate
+        if !isFinal, let reporter = engine as? LineAttemptReporting, !reporter.needsAudio(from: chunkStart, to: chunkEnd) {
+            removeBufferedSamplePrefix(frameCount, sampleRate: sampleRate)
+            if frameCount != dropOffset, !captureSpanStarts.isEmpty { captureSpanStarts[0].followsDrop = false }
+            if isFinal { sentFinalChunk = true }
+            dispatchChunkIfReady(trackId: trackId, generation: generation)
+            return
+        }
+
         let rawChunk = Array(audioSampleBuffer.prefix(frameCount))
         let sideChunk = audioSideBuffer.count == audioSampleBuffer.count ? Array(audioSideBuffer.prefix(frameCount)) : []
         let spans = captureSpanStarts.prefix { $0.offset < frameCount }
@@ -1519,7 +1578,6 @@ final class AudioSyncManager {
         if frameCount != dropOffset, !captureSpanStarts.isEmpty { captureSpanStarts[0].followsDrop = false }
         if isFinal { sentFinalChunk = true }
 
-        let requestPlaybackRate = chunkPlaybackRate
         let resample = dependencies.resampleForRecognition
         // Run vocal isolation, pitch analysis, chroma extraction, normalization, Core ML inference,
         // and CTC Viterbi at `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on
@@ -1726,7 +1784,7 @@ final class AudioSyncManager {
             .subtracting(fresh.clampedRunawayLineIDs)
         let recovery = ChorusSelfSimilarity.recoverRepeatedLines(
             in: result.lines, lockedIDs: locked, protectedTargetIDs: protectedTargetIDs,
-            chroma: chromaProfile, medianOffset: result.medianOffset,
+            chroma: chromaProfile, cachedTemplates: cachedChromaTemplates, medianOffset: result.medianOffset,
             sourceTimestamps: Dictionary(uniqueKeysWithValues: baseLines.map { ($0.id, $0.timestamp) })
         )
         diagnostics.update { $0.chorusRecoveredCount = recovery.recoveredLineIDs.count }
@@ -2073,14 +2131,18 @@ final class AudioSyncManager {
     /// 300 ms of the sung start on songs it was not tuned on.
     nonisolated static let onsetLockRise: Float = 3
     private nonisolated static let harmonicityLockRise: Float = 0.35
+    nonisolated static let consensusStartTolerance = 0.15
+    nonisolated static let consensusEndTolerance = 0.25
 
-    /// A well-timed line locks when confident or when nearly confident and starting on a vocal onset.
+    /// A well-timed line locks when confident, or when nearly confident and either starting on a vocal onset
+    /// or agreeing closely with an earlier unlocked pass.
     nonisolated static func locks(
         _ line: LyricLine,
         confident: Set<Int>,
         nearlyConfident: Set<Int>,
         envelope: VocalEnvelope,
-        pitchContour: VocalPitchContour? = nil
+        pitchContour: VocalPitchContour? = nil,
+        priorAlignedLine: LyricLine? = nil
     ) -> Bool {
         let groups = LyricsAudioAligner.leadTokenGroups(of: line)
         guard !groups.joined().contains(where: { word in
@@ -2103,6 +2165,12 @@ final class AudioSyncManager {
         else { return false }
         if confident.contains(line.id) { return true }
         guard nearlyConfident.contains(line.id) else { return false }
+        if let priorAlignedLine,
+           let priorSpan = sungSpan(of: priorAlignedLine),
+           abs(first.start - priorSpan.lowerBound) <= consensusStartTolerance,
+           abs(last.end - priorSpan.upperBound) <= consensusEndTolerance {
+            return true
+        }
         let onsetEnd = first.start + 0.25
         if let pitchContour, let clarity = pitchContour.meanHarmonicity(from: first.start, to: onsetEnd) {
             if clarity < VocalPitchContour.unvoicedFloor,
@@ -2128,6 +2196,8 @@ final class AudioSyncManager {
         confidentLineIDs = []
         nearlyConfidentLineIDs = []
         acceptedSessionLines = [:]
+        priorUnlockedLines = [:]
+        cachedChromaTemplates = []
         cachedAlignedLineCount = 0
     }
 
@@ -2149,7 +2219,8 @@ final class AudioSyncManager {
             confident: confidentLineIDs,
             nearlyConfident: nearlyConfidentLineIDs,
             envelope: vocalEnvelope,
-            pitchContour: vocalPitchContour
+            pitchContour: vocalPitchContour,
+            priorAlignedLine: priorUnlockedLines[line.id]
         ) {
             lockedThisPlay[line.id] = line
             lockedNewLine = true
@@ -2228,6 +2299,17 @@ final class AudioSyncManager {
     private func persistAlignment(_ result: AudioAlignmentResult, engine: AudioSyncEngine, forceUpdateCount: Bool = false) {
         guard let trackId = activeTrackId else { return }
         let sourceCount = baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+        let templates = engine == .lyricsAlignment
+            ? ChorusSelfSimilarity.extractCachedTemplates(
+                in: result.lines,
+                lockedIDs: lockedLineIDs,
+                chroma: chromaProfile,
+                existing: cachedChromaTemplates
+            )
+            : []
+        if engine == .lyricsAlignment {
+            cachedChromaTemplates = templates
+        }
         let record = AudioSyncedLyricsRecord(
             trackId: trackId,
             engine: engine,
@@ -2239,7 +2321,8 @@ final class AudioSyncManager {
             heardWords: refinedHeardWords(),
             lockedLineIDs: engine == .lyricsAlignment ? lockedLineIDs.sorted() : nil,
             attemptedLineIDs: engine == .lyricsAlignment ? attemptedLineIDs.subtracting(lockedLineIDs).sorted() : nil,
-            lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil
+            lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil,
+            chromaTemplates: templates.isEmpty ? nil : templates
         )
         dependencies.cacheQueue.async { [cache] in
             cache.save(record)

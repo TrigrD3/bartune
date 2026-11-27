@@ -1,3 +1,4 @@
+import Accelerate
 import CoreML
 import Foundation
 
@@ -455,6 +456,13 @@ protocol LineAttemptReporting: AnyObject {
     var nearlyConfidentLineIDs: Set<Int> { get }
     /// Releases a provisional offset after a sustained run of attempted lines with no new locks.
     func discardStaleOffset(lockedLineIDs: Set<Int>) -> Bool
+    func needsAudio(from start: Double, to end: Double) -> Bool
+}
+
+extension LineAttemptReporting {
+    func needsAudio(from _: Double, to _: Double) -> Bool {
+        true
+    }
 }
 
 final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
@@ -466,6 +474,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let searchEnd: Double
         let words: [ForcedAlignmentText.Word]
         let wordIntervals: [ClosedRange<Double>]?
+        let priorWordIntervals: [ClosedRange<Double>]?
         /// Each word's syllables, empty for a word of one.
         let syllables: [[ForcedAlignmentText.Syllable]]
         /// Track-time limits from the nearest lines already aligned before and after this one.
@@ -518,6 +527,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     /// Onset minus LRC time of each anchor and confident line, across runs.
     private var lineOffsets: [Int: Double] = [:]
     private let maxOffsetDeviation = 1.25
+    static let maxBracketWindow = 24.0
     static let maxWordSpan = 3.5
     static let maxIntroStart = 10.0
 
@@ -535,10 +545,12 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
 
     /// `anchors` are lines aligned on an earlier play (line ID -> sung span in track time): they are not
     /// aligned again, and bound the lines between them.
+    /// `priorLines` are unlocked lines aligned on an earlier play: their word intervals guide replay without locking.
     init(
         lines: [LyricLine],
         model: CTCAcousticModel,
         anchors: [Int: ClosedRange<Double>] = [:],
+        priorLines: [Int: LyricLine] = [:],
         lineWindow: Double = 3.0,
         holdBack: Double = 2.0
     ) {
@@ -562,6 +574,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             // A distant row adds little context. Allow a plausible declared duration for the line before it.
             let estimatedDuration = max(8, Double(words.count) * 1.2, duration <= instrumentalGap ? duration : 0)
             let contextEnd = hasLongGap ? min(nextTime, line.timestamp + estimatedDuration) : nextTime
+            let priorWordIntervals = anchors[line.id] == nil
+                ? priorLines[line.id].flatMap { Self.wordIntervals(in: $0, matching: words) }
+                : nil
             prepared.append(PreparedLine(
                 id: line.id,
                 start: line.timestamp,
@@ -569,6 +584,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 searchEnd: endsAtBlank || hasLongGap ? contextEnd : max(contextEnd, line.timestamp + duration),
                 words: words,
                 wordIntervals: Self.wordIntervals(in: line, matching: words),
+                priorWordIntervals: priorWordIntervals,
                 syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
             ))
             spans.append(anchors[line.id])
@@ -648,6 +664,21 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         return Set(nearlyConfident.subtracting(confident).map { lines[$0].id })
     }
 
+    func needsAudio(from start: Double, to end: Double) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !anchoredIndices.isEmpty else { return true }
+        let contextLead = 12.0
+        let rightContext = Double(holdBackSamples) / Double(Self.sampleRate)
+        for index in lines.indices where !done.contains(index) && !skippedInRun.contains(index) {
+            let window = searchWindow(for: index)
+            if end >= window.start - contextLead && start <= window.end + rightContext {
+                return true
+            }
+        }
+        return false
+    }
+
     func discardStaleOffset(lockedLineIDs: Set<Int>) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -725,13 +756,20 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         if history.count > windowSize { history.removeFirst(history.count - windowSize) }
         runSamples += samples.count
 
-        var window = [Float](repeating: 0, count: windowSize - history.count) + history
-        let mean = window.reduce(0, +) / Float(windowSize)
-        let variance = window.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Float(windowSize)
-        let scale = 1 / (variance.squareRoot() + 1e-7)
-        for index in window.indices {
-            window[index] = (window[index] - mean) * scale
+        var window = [Float](repeating: 0, count: windowSize)
+        if !history.isEmpty {
+            let offset = windowSize - history.count
+            window.replaceSubrange(offset..<windowSize, with: history)
         }
+        let length = vDSP_Length(windowSize)
+        var mean: Float = 0
+        vDSP_meanv(window, 1, &mean, length)
+        var negMean = -mean
+        vDSP_vsadd(window, 1, &negMean, &window, 1, length)
+        var variance: Float = 0
+        vDSP_measqv(window, 1, &variance, length)
+        var scale = 1 / (variance.squareRoot() + 1e-7)
+        vDSP_vsmul(window, 1, &scale, &window, 1, length)
 
         let logProbs = try model.logProbabilities(window: window)
         let frameCount = model.frameCount
@@ -899,7 +937,10 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let high = min(highFrame, runFrame(atTrackTime: window.end))
             guard high >= low else { return nil }
             let lineRange = (low - lowFrame)...(high - lowFrame)
-            let wordRanges = usesWordPriors ? priorFrameRanges(line.wordIntervals, in: window, frames: low...high, from: lowFrame) : nil
+            let wordRanges = usesWordPriors
+                ? (priorFrameRanges(line.priorWordIntervals, offset: coarseShift == nil ? 0 : nil, in: window, frames: low...high, from: lowFrame)
+                    ?? priorFrameRanges(line.wordIntervals, offset: window.wordOffset, in: window, frames: low...high, from: lowFrame))
+                : nil
             pinningRanges.append(runFrame(atTrackTime: window.rawStart)...min(committedFrames - 1, runFrame(atTrackTime: window.rawEnd)))
             for (wordIndex, word) in line.words.enumerated() {
                 let range = wordRanges?[wordIndex] ?? lineRange
@@ -979,9 +1020,9 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     }
 
     private func priorFrameRanges(
-        _ intervals: [ClosedRange<Double>]?, in window: SearchWindow, frames: ClosedRange<Int>, from lowFrame: Int
+        _ intervals: [ClosedRange<Double>]?, offset: Double?, in window: SearchWindow, frames: ClosedRange<Int>, from lowFrame: Int
     ) -> [ClosedRange<Int>]? {
-        guard let intervals, let offset = window.wordOffset else { return nil }
+        guard let intervals, let offset else { return nil }
         let start = max(window.start, trackTime(ofRunFrame: frames.lowerBound))
         let end = min(window.end, trackTime(ofRunFrame: frames.upperBound))
         let padding = 1.0
@@ -1046,29 +1087,60 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
     }
 
-    private func offsetEstimate(before index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
+    private func offsetEstimate(around index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
         guard !offsets.isEmpty else { return (0, 0) }
-        let recent = Array(lines.indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
-        return (median(recent) ?? median(Array(offsets.values)) ?? 0, recent.count)
+        let before = Array(lines.indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
+        let after = Array(lines.indices[(index + 1)...].lazy.compactMap { offsets[$0] }.prefix(3))
+        let combined: [Double] = if !before.isEmpty, !after.isEmpty {
+            Array(before.prefix(2)) + Array(after.prefix(1))
+        } else if !before.isEmpty {
+            before
+        } else {
+            after
+        }
+        return (median(combined) ?? median(Array(offsets.values)) ?? 0, before.count)
     }
 
     private func searchWindow(for index: Int, coarseShift: Double? = nil) -> SearchWindow {
         let line = lines[index]
-        let (offset, priorCount) = offsetEstimate(before: index, using: lineOffsets)
+        let (offset, priorCount) = offsetEstimate(around: index, using: lineOffsets)
         // Keep the LRC window within reach until two earlier lines support the shift.
         let startShift = coarseShift ?? (priorCount < 2 ? min(0, offset) : offset)
         let endShift = coarseShift ?? (priorCount < 2 ? max(0, offset) : offset)
         let paddedStart = line.start + startShift - lineWindow
-        let rawStart = coarseShift != nil ? max(0, paddedStart) : (index == 0 && line.start <= Self.maxIntroStart ? 0 : paddedStart)
-        let rawEnd = line.searchEnd + endShift + lineWindow
+        var rawStart = coarseShift != nil ? max(0, paddedStart) : (index == 0 && line.start <= Self.maxIntroStart ? 0 : paddedStart)
+        var rawEnd = line.searchEnd + endShift + lineWindow
         let shiftedOnset = line.start + offset
+        var earliestOnset = min(line.start, shiftedOnset)
+        // Later anchors can widen the search on replay; an earlier match can establish a missed onset.
+        var latestOnset = coarseShift.map { line.start + $0 } ?? max(0, priorCount < 2 ? max(line.start, shiftedOnset) : shiftedOnset)
+        var readyAt = min(line.contextEnd + endShift + lineWindow, line.upperBound)
+
+        if coarseShift == nil {
+            if let priorFirst = line.priorWordIntervals?.first?.lowerBound,
+               let priorLast = line.priorWordIntervals?.last?.upperBound {
+                rawStart = min(rawStart, max(0, priorFirst - lineWindow))
+                rawEnd = max(rawEnd, priorLast + lineWindow)
+                earliestOnset = min(earliestOnset, priorFirst)
+                latestOnset = max(latestOnset, priorFirst)
+                readyAt = min(max(readyAt, priorLast + lineWindow), line.upperBound)
+            }
+            if line.lowerBound.isFinite, line.upperBound.isFinite,
+               line.upperBound > line.lowerBound,
+               line.upperBound - line.lowerBound <= Self.maxBracketWindow {
+                rawStart = min(rawStart, line.lowerBound)
+                rawEnd = max(rawEnd, line.upperBound)
+                earliestOnset = min(earliestOnset, line.lowerBound)
+                latestOnset = max(latestOnset, line.upperBound)
+                readyAt = line.upperBound
+            }
+        }
         return SearchWindow(
             start: max(rawStart, line.lowerBound),
             end: min(rawEnd, line.upperBound),
-            readyAt: min(line.contextEnd + endShift + lineWindow, line.upperBound),
-            earliestOnset: min(line.start, shiftedOnset),
-            // Later anchors can widen the search on replay; an earlier match can establish a missed onset.
-            latestOnset: coarseShift.map { line.start + $0 } ?? max(0, priorCount < 2 ? max(line.start, shiftedOnset) : shiftedOnset),
+            readyAt: readyAt,
+            earliestOnset: earliestOnset,
+            latestOnset: latestOnset,
             rawStart: rawStart,
             rawEnd: rawEnd,
             wordOffset: coarseShift == nil ? offset : nil
@@ -1113,7 +1185,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 accepted.confidentOffsets[line] = offset
                 offsets[line] = offset
             } else {
-                if offsets.count >= 4, abs(offset - offsetEstimate(before: line, using: offsets).offset) > maxOffsetDeviation {
+                if offsets.count >= 4, abs(offset - offsetEstimate(around: line, using: offsets).offset) > maxOffsetDeviation {
                     continue
                 }
                 if supportsLock {
@@ -1198,7 +1270,22 @@ final class CoreMLAcousticModel: CTCAcousticModel, @unchecked Sendable {
             }
         }
         switch output.dataType {
-        case .float32: copy(Float.self) { $0 }
+        case .float32:
+            let base = output.dataPointer.bindMemory(to: Float.self, capacity: frameCount * frameStride)
+            if vocabStride == 1, frameStride == vocabSize {
+                values.withUnsafeMutableBufferPointer { dst in
+                    dst.baseAddress?.update(from: base, count: frameCount * vocabSize)
+                }
+            } else if vocabStride == 1 {
+                values.withUnsafeMutableBufferPointer { dst in
+                    guard let dstBase = dst.baseAddress else { return }
+                    for frame in 0..<frameCount {
+                        dstBase.advanced(by: frame * vocabSize).update(from: base.advanced(by: frame * frameStride), count: vocabSize)
+                    }
+                }
+            } else {
+                copy(Float.self) { $0 }
+            }
         #if arch(arm64)
         // Float16 is unavailable on Intel macOS; x86_64 builds take the default path.
         case .float16: copy(Float16.self) { Float($0) }
@@ -1433,6 +1520,7 @@ enum LyricsAlignerModel {
     static func launch(
         lines: [LyricLine],
         anchors: [Int: ClosedRange<Double>] = [:],
+        priorLines: [Int: LyricLine] = [:],
         directory: URL = directory
     ) async -> AudioChunkTranscribing? {
         #if arch(arm64)
@@ -1450,7 +1538,7 @@ enum LyricsAlignerModel {
                     let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
                     return sharedModelCache.load(compiledURL: compiled, modificationDate: modDate) {
                         CoreMLAcousticModel(compiledModelURL: $0)
-                    }.map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors) }
+                    }.map { LyricsForcedAligner(lines: lines, model: $0, anchors: anchors, priorLines: priorLines) }
                 }
             }.value
         #else
