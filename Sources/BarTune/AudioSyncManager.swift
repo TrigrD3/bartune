@@ -1868,6 +1868,7 @@ final class AudioSyncManager {
         var prevEmittedTimestamp: Double?
         var prevLineEnd: Double = 0.0
         var prevBlankTimestamp: Double?
+        var previousWasMatched = false
         for idx in lines.indices {
             let line = lines[idx]
             if isNonEmpty(line) {
@@ -1878,68 +1879,69 @@ final class AudioSyncManager {
                         ?? (line.timestamp + 0.25)
                     prevLineEnd = max(line.timestamp + 0.25, end)
                     prevBlankTimestamp = nil
+                    previousWasMatched = true
                 } else {
                     let hasPrev = prevEmittedTimestamp != nil || prevBlankTimestamp != nil
+                    // A matched tail and any markers placed after it can yield to the source lyric.
+                    let blankFloor = previousWasMatched ? nil : prevBlankTimestamp
                     let preferredMin = max(
                         prevEmittedTimestamp.map { $0 + 0.25 } ?? 0,
-                        prevLineEnd,
-                        prevBlankTimestamp.map { $0 + 0.01 } ?? 0
+                        previousWasMatched ? 0 : prevLineEnd,
+                        blankFloor.map { $0 + 0.01 } ?? 0
                     )
                     let hardMin = max(
                         prevEmittedTimestamp.map { $0 + minLineGap } ?? 0,
-                        prevBlankTimestamp ?? 0
+                        blankFloor ?? 0
                     )
                     let nextMatchedIdx = nextMatchedAfter[idx]
                     let maxStart: Double? = nextMatchedIdx.map { nextIdx in
                         let remainingNonEmpty = nonEmptyPrefix[nextIdx] - nonEmptyPrefix[idx]
                         return max(0.0, lines[nextIdx].timestamp - Double(remainingNonEmpty) * minLineGap)
                     }
-                    let targetStart: Double?
+                    // Fresh fallback rows may have been pushed by timing that the merge replaced.
+                    let source = baseByID[line.id]
+                    let fallbackStart = source.map {
+                        LyricsAudioAligner.predictedFallbackStart(at: $0.timestamp, medianOffset: result.medianOffset)
+                    } ?? line.timestamp
+                    let targetStart: Double
                     if let upper = maxStart {
-                        if hasPrev {
-                            if hardMin <= upper {
-                                let lower = max(hardMin, min(preferredMin, upper))
-                                let clamped = min(upper, max(lower, line.timestamp))
-                                targetStart = clamped != line.timestamp ? clamped : nil
-                            } else if let nextIdx = nextMatchedIdx {
-                                let fallback = min(lines[nextIdx].timestamp, max(prevEmittedTimestamp ?? 0, upper))
-                                targetStart = fallback != line.timestamp ? fallback : nil
-                            } else {
-                                targetStart = nil
-                            }
-                        } else if line.timestamp > upper {
-                            targetStart = upper
+                        if !hasPrev {
+                            targetStart = min(upper, fallbackStart)
+                        } else if hardMin <= upper {
+                            let lower = max(hardMin, min(preferredMin, upper))
+                            targetStart = min(upper, max(lower, fallbackStart))
+                        } else if let nextIdx = nextMatchedIdx {
+                            targetStart = min(lines[nextIdx].timestamp, max(prevEmittedTimestamp ?? 0, upper))
                         } else {
-                            targetStart = nil
+                            targetStart = fallbackStart
                         }
-                    } else if hasPrev, line.timestamp < preferredMin {
-                        targetStart = preferredMin
                     } else {
-                        targetStart = nil
+                        targetStart = hasPrev ? max(preferredMin, fallbackStart) : fallbackStart
                     }
-                    if let targetStart {
-                        let shift = targetStart - line.timestamp
-                        let shiftedWords = line.words.map { word in
+                    let original = source ?? line
+                    if targetStart != line.timestamp || original != line {
+                        let shift = targetStart - original.timestamp
+                        let shiftedWords = original.words.map { word in
                             WordTimestamp(timestamp: max(0, word.timestamp + shift), duration: word.duration, text: word.text)
                         }
                         lines[idx] = LyricLine(
                             id: line.id,
                             timestamp: targetStart,
-                            duration: line.duration,
+                            duration: original.duration,
                             text: line.text,
                             words: shiftedWords
                         )
                     }
                     let placed = lines[idx]
-                    let hasCompressedBlankBefore = prevBlankTimestamp != nil && idx > 0
-                        && lines[idx - 1].timestamp < prevLineEnd
-                    if placed.timestamp < prevLineEnd || hasCompressedBlankBefore {
+                    let needsBlankReconciliation = prevBlankTimestamp.map { $0 < prevLineEnd || $0 >= placed.timestamp } ?? false
+                    if placed.timestamp < prevLineEnd || needsBlankReconciliation {
                         LyricsAudioAligner.reconcilePrecedingBoundary(in: &lines, before: idx, targetStart: placed.timestamp, ignoringStructuralTags: true)
                     }
                     prevEmittedTimestamp = placed.timestamp
                     let placedEnd = placed.timestamp + max(0.25, placed.duration ?? 0.25)
                     prevLineEnd = nextMatchedIdx.map { min(lines[$0].timestamp, placedEnd) } ?? placedEnd
                     prevBlankTimestamp = nil
+                    previousWasMatched = false
                 }
             } else {
                 let hasPrev = prevEmittedTimestamp != nil || prevBlankTimestamp != nil

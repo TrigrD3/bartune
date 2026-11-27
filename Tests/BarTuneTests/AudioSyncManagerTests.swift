@@ -3050,6 +3050,72 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testRestoredHeldTailYieldsToTrailingUnmatchedLyricsAcrossMarkers() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 8
+        state.isPlaying = false
+
+        let track = sampleTrack()
+        let rawLines = [
+            LyricLine(id: 0, timestamp: 5, text: "Opening"),
+            LyricLine(id: 1, timestamp: 8, text: "Found"),
+            LyricLine(id: 2, timestamp: 10, duration: 4, text: "Held"),
+            LyricLine(id: 3, timestamp: 11, text: ""),
+            LyricLine(id: 4, timestamp: 11.5, text: "[Outro]"),
+            LyricLine(id: 5, timestamp: 12, duration: 1, text: "Unheard", words: [
+                WordTimestamp(timestamp: 12.2, duration: 0.5, text: "Unheard"),
+            ]),
+            LyricLine(id: 6, timestamp: 14, text: "Ending"),
+        ]
+        state.setTrack(track, lyrics: rawLines)
+
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        var cachedLines = rawLines
+        cachedLines[0] = LyricLine(id: 0, timestamp: 5.4, duration: 0.4, text: "Opening", words: [
+            WordTimestamp(timestamp: 5.4, duration: 0.4, text: "Opening"),
+        ])
+        // Restore a held duration that is absent from the fresh word evidence.
+        cachedLines[2] = LyricLine(id: 2, timestamp: 10.4, duration: 4, text: "Held")
+        cachedLines[5] = LyricLine(id: 5, timestamp: 12, duration: 1, text: "Unheard")
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: track.id, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.4,
+            alignedLineCount: 2, sourceLineCount: 6, lines: cachedLines, lockedLineIDs: [0, 2]
+        ))
+
+        let capture = FakeAudioCapture()
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: makeDependencies(
+            capture: capture,
+            runChunk: { _ in
+                [RecognizedAudioWord(text: "found", startTime: 8.4, duration: 0.4, confidence: 0.95, sourceLineId: 1)]
+            },
+            chunkDurationSeconds: 1
+        ))
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: track, rawLines: rawLines)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        capture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
+        let updated = await waitUntil { (cache.load(trackId: track.id)?.alignedLineCount ?? 0) >= 3 }
+        XCTAssertTrue(updated)
+
+        let saved = try XCTUnwrap(cache.load(trackId: track.id))
+        XCTAssertTrue(saved.isReliable)
+        XCTAssertEqual(saved.lines, state.rawLyricLines)
+        XCTAssertEqual(saved.lines[2].timestamp, 10.4, accuracy: 0.001)
+        let heldEnd = saved.lines[2].timestamp + (saved.lines[2].duration ?? 0)
+        XCTAssertEqual(heldEnd, saved.lines[3].timestamp, accuracy: 0.001)
+        XCTAssertLessThan(saved.lines[3].timestamp, saved.lines[4].timestamp)
+        XCTAssertLessThan(saved.lines[4].timestamp, saved.lines[5].timestamp)
+        XCTAssertEqual(saved.lines[5].timestamp, 12.4, accuracy: 0.001)
+        XCTAssertEqual(saved.lines[5].duration, 1)
+        XCTAssertEqual(try XCTUnwrap(saved.lines[5].words.first?.timestamp), 12.6, accuracy: 0.001)
+        XCTAssertEqual(saved.lines[5].words.first?.duration, 0.5)
+        XCTAssertEqual(saved.lines[6].timestamp, 14.4, accuracy: 0.001)
+    }
+
+    @MainActor
     func testRestoringShiftedLockedLinePreservesDurationAndOrderAcrossStaleBlank() async throws {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
@@ -3592,7 +3658,7 @@ final class AudioSyncManagerTests: XCTestCase {
         }
 
         // Case 2: Cached lock restores A to 13..14 s, B is unmatched at 12 s, and C freshly matches at 13.5 s
-        // (valid room >= 0.30 s). B must fit inside [13.15, 13.35] and A's held tail must trim to B.
+        // B's source time precedes A, so B uses the preferred 0.25 s gap and A's held tail trims to B.
         do {
             let state = LyricsState(userDefaults: defaults)
             state.audioSyncEngine = .lyricsAlignment
@@ -3662,9 +3728,9 @@ final class AudioSyncManagerTests: XCTestCase {
             let saved = try XCTUnwrap(cache.load(trackId: track.id))
             XCTAssertTrue(saved.isReliable)
             XCTAssertEqual(saved.lines[1].timestamp, 13.0, accuracy: 0.01)
-            XCTAssertEqual(saved.lines[2].timestamp, 13.35, accuracy: 0.01)
+            XCTAssertEqual(saved.lines[2].timestamp, 13.25, accuracy: 0.01)
             XCTAssertEqual(saved.lines[3].timestamp, 13.5, accuracy: 0.01)
-            XCTAssertLessThanOrEqual(saved.lines[1].timestamp + (saved.lines[1].duration ?? 0), 13.36)
+            XCTAssertEqual(saved.lines[1].timestamp + (saved.lines[1].duration ?? 0), 13.25, accuracy: 0.01)
             manager.stop()
         }
     }

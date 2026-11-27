@@ -1617,6 +1617,29 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(trailingBlank.lines[1].timestamp, 11, accuracy: 0.001)
     }
 
+    func testHeldTailDoesNotDelayAnUnmatchedLineBetweenMatches() throws {
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "hold"),
+            LyricLine(id: 1, timestamp: 12, duration: 1, text: "unheard"),
+            LyricLine(id: 2, timestamp: 14.4, text: "again"),
+        ]
+        let heard = [
+            RecognizedAudioWord(text: "hold", startTime: 10.4, duration: 4, confidence: 0.95, sourceLineId: 0),
+            RecognizedAudioWord(text: "again", startTime: 14.8, duration: 0.3, confidence: 0.95, sourceLineId: 2),
+        ]
+
+        let result = LyricsAudioAligner.align(lines: lines, recognizedWords: heard, regroupsCJKWords: false)
+
+        XCTAssertEqual(result.matchedLineIDs, [0, 2])
+        XCTAssertTrue(result.clampedRunawayLineIDs.isEmpty)
+        XCTAssertEqual(result.lines[1].timestamp, 12.4, accuracy: 0.001)
+        XCTAssertEqual(result.lines[1].duration, 1)
+        XCTAssertEqual(result.lines[2].timestamp, 14.8, accuracy: 0.001)
+        XCTAssertEqual(result.lines[0].timestamp, 10.4, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(result.lines[0].duration), 2, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(result.lines[0].words.last?.duration), 2, accuracy: 0.001)
+    }
+
     func testRunawayOwnedTailCannotPushAnUnmatchedLinePastItsExpectedStart() {
         let lines = [
             LyricLine(id: 0, timestamp: 10, text: "hold"),
