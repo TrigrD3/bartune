@@ -1217,11 +1217,18 @@ final class AudioSyncManager {
         if let last,
            position <= Self.restartWindow * max(1, playbackRate),
            last.position - position > Self.seekTolerance,
-           !baseLines.isEmpty,
-           hasLowYieldLocks {
-            state.applyAudioSyncedLines(baseLines)
-            resyncCurrentTrack()
-            return
+           !baseLines.isEmpty {
+            if hasLowYieldLocks {
+                state.applyAudioSyncedLines(baseLines)
+                resyncCurrentTrack()
+                return
+            }
+            if isLiveSyncActive,
+               !lockedThisPlay.isEmpty,
+               Self.lyricsAlignmentProgress(lockedIDs: lockedLineIDs, settledIDs: attemptedLineIDs, lines: baseLines).isFinished {
+                resumeNextPassFromCache()
+                return
+            }
         }
         guard isLiveSyncActive else { return }
         if let expected = bufferedEndPosition(sampleRate: activeSampleRate) {
@@ -1245,6 +1252,20 @@ final class AudioSyncManager {
                 sentFinalChunk = false
             }
         }
+    }
+
+    private func resumeNextPassFromCache() {
+        guard let trackId = activeTrackId, !baseLines.isEmpty else { return }
+        let track = TrackInfo(
+            id: trackId,
+            title: "",
+            artist: "",
+            album: "",
+            duration: activeTrackDuration,
+            artworkURL: nil,
+            sourceBundleId: activeSourceBundleId
+        )
+        handleTrackLoaded(track: track, rawLines: baseLines, forceResync: false)
     }
 
     func resyncCurrentTrack() {
