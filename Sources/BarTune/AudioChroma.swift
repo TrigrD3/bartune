@@ -230,6 +230,32 @@ struct AudioChromaProfile: Sendable {
 }
 
 enum ChorusSelfSimilarity {
+    struct CachedTemplate: Equatable, Codable, Sendable {
+        let lineId: Int
+        let startTime: Double
+        let quantizedFrames: Data
+
+        init(lineId: Int, startTime: Double, frames: [Float]) {
+            self.lineId = lineId
+            self.startTime = startTime
+            quantizedFrames = Data(frames.map { UInt8((min(1, max(0, $0)) * 255).rounded()) })
+        }
+
+        var frames: [Float] {
+            quantizedFrames.map { Float($0) / 255.0 }
+        }
+
+        func remapped(lineId: Int) -> CachedTemplate {
+            CachedTemplate(lineId: lineId, startTime: startTime, quantizedFrames: quantizedFrames)
+        }
+
+        private init(lineId: Int, startTime: Double, quantizedFrames: Data) {
+            self.lineId = lineId
+            self.startTime = startTime
+            self.quantizedFrames = quantizedFrames
+        }
+    }
+
     struct Result {
         let lines: [LyricLine]
         let recoveredLineIDs: Set<Int>
@@ -248,11 +274,40 @@ enum ChorusSelfSimilarity {
     private static let peakNeighborhood = Double(AudioChromaProfile.peakNeighborhoodFrames) * AudioChromaProfile.frameSeconds
     private static let minPeakSeparationMargin = 0.04
 
+    static func extractCachedTemplates(
+        in lines: [LyricLine],
+        lockedIDs: Set<Int>,
+        chroma: AudioChromaProfile,
+        existing: [CachedTemplate] = []
+    ) -> [CachedTemplate] {
+        guard !lockedIDs.isEmpty else { return [] }
+        let tokens = lines.map { LyricsAudioAligner.tokenizeLine($0.text).map(\.normalized).filter { !$0.isEmpty } }
+        let repeated = Dictionary(grouping: lines.indices.filter {
+            tokens[$0].count >= 2 || (tokens[$0].first?.count ?? 0) >= 8
+        }) { tokens[$0].joined(separator: " ") }
+        let repeatedIndices = Set(repeated.values.filter { $0.count > 1 }.joined())
+        let existingByID = Dictionary(existing.map { ($0.lineId, $0) }, uniquingKeysWith: { _, latest in latest })
+
+        var result: [CachedTemplate] = []
+        for index in lines.indices where repeatedIndices.contains(index) && lockedIDs.contains(lines[index].id) {
+            let line = lines[index]
+            if let template = makeTemplate(line, chroma: chroma) {
+                result.append(CachedTemplate(lineId: line.id, startTime: template.startTime, frames: template.frames))
+            } else if let kept = existingByID[line.id],
+                      !kept.quantizedFrames.isEmpty,
+                      kept.quantizedFrames.count.isMultiple(of: AudioChromaProfile.pitchClasses) {
+                result.append(kept)
+            }
+        }
+        return result
+    }
+
     static func recoverRepeatedLines(
         in lines: [LyricLine],
         lockedIDs: Set<Int>,
         protectedTargetIDs: Set<Int> = [],
         chroma: AudioChromaProfile,
+        cachedTemplates: [CachedTemplate] = [],
         medianOffset: Double?,
         sourceTimestamps: [Int: Double] = [:]
     ) -> Result {
@@ -262,6 +317,7 @@ enum ChorusSelfSimilarity {
             return Result(lines: lines, recoveredLineIDs: [])
         }
 
+        let cachedByID = Dictionary(cachedTemplates.map { ($0.lineId, $0) }, uniquingKeysWith: { _, latest in latest })
         let tokens = lines.map { LyricsAudioAligner.tokenizeLine($0.text).map(\.normalized).filter { !$0.isEmpty } }
         let repeated = Dictionary(grouping: lines.indices.filter {
             tokens[$0].count >= 2 || (tokens[$0].first?.count ?? 0) >= 8
@@ -274,6 +330,7 @@ enum ChorusSelfSimilarity {
             let templates = indices.compactMap { index -> Template? in
                 guard lockedIDs.contains(lines[index].id) else { return nil }
                 return makeTemplate(lines[index], chroma: chroma)
+                    ?? cachedByID[lines[index].id].flatMap { makeTemplate(lines[index], cached: $0) }
             }
             guard !templates.isEmpty else { continue }
             for index in targets {
@@ -382,6 +439,20 @@ enum ChorusSelfSimilarity {
               )
         else { return nil }
         return Template(line: line, tail: lineEnd(line) - line.timestamp, frames: slice.frames, startTime: slice.startTime)
+    }
+
+    private static func makeTemplate(_ line: LyricLine, cached: CachedTemplate) -> Template? {
+        guard let firstWord = line.words.first, let lastWord = line.words.last,
+              firstWord.timestamp >= line.timestamp,
+              zip(line.words, line.words.dropFirst()).allSatisfy({ $0.timestamp <= $1.timestamp })
+        else { return nil }
+        let sungEnd = lastWord.timestamp + (lastWord.duration ?? 0)
+        let frames = cached.frames
+        guard sungEnd - firstWord.timestamp >= 1,
+              !frames.isEmpty,
+              frames.count.isMultiple(of: AudioChromaProfile.pitchClasses)
+        else { return nil }
+        return Template(line: line, tail: lineEnd(line) - line.timestamp, frames: frames, startTime: cached.startTime)
     }
 
     private static func match(

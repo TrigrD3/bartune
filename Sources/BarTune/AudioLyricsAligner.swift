@@ -146,6 +146,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let attemptedLineIDs: [Int]?
     /// Lyrics Alignment: how many lines were locked when the play that saved this record began.
     let lockedAtPlayStart: Int?
+    let chromaTemplates: [ChorusSelfSimilarity.CachedTemplate]?
 
     init(
         trackId: String,
@@ -158,7 +159,8 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         heardWords: [RecognizedAudioWord]? = nil,
         lockedLineIDs: [Int]? = nil,
         attemptedLineIDs: [Int]? = nil,
-        lockedAtPlayStart: Int? = nil
+        lockedAtPlayStart: Int? = nil,
+        chromaTemplates: [ChorusSelfSimilarity.CachedTemplate]? = nil
     ) {
         self.trackId = trackId
         self.engine = engine
@@ -171,6 +173,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         self.lockedLineIDs = lockedLineIDs
         self.attemptedLineIDs = attemptedLineIDs
         self.lockedAtPlayStart = lockedAtPlayStart
+        self.chromaTemplates = chromaTemplates
     }
 
     /// Evaluates whether a cached alignment is trustworthy enough to skip live re-syncing.
@@ -264,7 +267,10 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
             heardWords: remappedWords,
             lockedLineIDs: lockedLineIDs?.compactMap { idMap[$0] },
             attemptedLineIDs: attemptedLineIDs?.compactMap { idMap[$0] },
-            lockedAtPlayStart: lockedAtPlayStart
+            lockedAtPlayStart: lockedAtPlayStart,
+            chromaTemplates: chromaTemplates?.compactMap { template in
+                idMap[template.lineId].map { template.remapped(lineId: $0) }
+            }
         )
     }
 

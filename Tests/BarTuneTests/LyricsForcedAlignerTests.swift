@@ -1651,6 +1651,71 @@ final class LyricsForcedAlignerTests: XCTestCase {
         return LyricsForcedAligner(lines: lines, model: model)
     }
 
+    func testPriorUnlockedLineGuidesSearchBeyondRawLRCWindowAndFallsBackWhenOff() async throws {
+        // Raw LRC puts line 0 at 1.0 s, but Pass 1 heard it at 7.0 s (outside the ±3 s raw window).
+        // With `priorLines`, Pass 2 expands to cover 7.0 s and uses its word intervals directly.
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Window for chunk(start: 0, isFinal: true) covers [-12 s, 12 s]; track time t -> frame 600 + t * 50.
+        model.peaksForCall = [[950: 14, 951: 4]] // 7.00 s
+        let rawLine = LyricLine(id: 0, timestamp: 1.0, text: "ka")
+        let priorLine = LyricLine(
+            id: 0,
+            timestamp: 7.0,
+            duration: 0.2,
+            text: "ka",
+            words: [WordTimestamp(timestamp: 7.0, duration: 0.2, text: "ka")]
+        )
+        let aligner = LyricsForcedAligner(lines: [rawLine], model: model, priorLines: [0: priorLine], lineWindow: 3.0)
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+        XCTAssertEqual(words.map(\.sourceLineId), [0])
+        XCTAssertEqual(words.first?.startTime ?? 0, 7.0, accuracy: 0.02)
+    }
+
+    func testBracketBetweenLockedAnchorsSearchesFullGapWhenRawLRCIsOff() async throws {
+        // Anchors at id=0 (1.0...1.2) and id=2 (11.0...11.2) bracket id=1.
+        // Raw LRC puts id=1 at 2.0 s, but the actual vocal is at 9.5 s (> 3 s past raw LRC, still inside [1.2, 11.0]).
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Track time 9.5 s -> frame 600 + 475 = 1075.
+        model.peaksForCall = [[1075: 14, 1076: 4]]
+        let lines = [
+            LyricLine(id: 0, timestamp: 1.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 2.0, text: "ka"),
+            LyricLine(id: 2, timestamp: 11.0, text: "ka"),
+        ]
+        let aligner = LyricsForcedAligner(
+            lines: lines,
+            model: model,
+            anchors: [0: 1.0...1.2, 2: 11.0...11.2],
+            lineWindow: 3.0
+        )
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+        XCTAssertEqual(words.map(\.sourceLineId), [1])
+        XCTAssertEqual(words.first?.startTime ?? 0, 9.5, accuracy: 0.02)
+    }
+
+    func testNeedsAudioSkipsAlreadyLockedStretchesFarFromUnlockedLines() {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let lines = [
+            LyricLine(id: 0, timestamp: 10, text: "ka"),
+            LyricLine(id: 1, timestamp: 20, text: "ka"),
+            LyricLine(id: 2, timestamp: 80, text: "ka"),
+        ]
+        // Pass 1 (no anchors): always needs audio.
+        let pass1 = LyricsForcedAligner(lines: lines, model: model)
+        XCTAssertTrue(pass1.needsAudio(from: 0, to: 12))
+
+        // Pass 2: lines 0 and 1 are locked, only line 2 at 80 s is unlocked.
+        let pass2 = LyricsForcedAligner(lines: lines, model: model, anchors: [0: 10...12, 1: 20...22])
+        XCTAssertFalse(pass2.needsAudio(from: 0, to: 12), "chunk far before unlocked line should be skipped")
+        XCTAssertFalse(pass2.needsAudio(from: 12, to: 24), "chunk covering only locked lines should be skipped")
+        XCTAssertTrue(pass2.needsAudio(from: 66, to: 78), "leading context chunk before unlocked line must be scored")
+        XCTAssertTrue(pass2.needsAudio(from: 78, to: 90), "chunk covering unlocked line must be scored")
+        XCTAssertTrue(pass2.needsAudio(from: 89, to: 101), "chunk within hold-back after window end must be scored")
+        XCTAssertFalse(pass2.needsAudio(from: 95, to: 107), "chunk well past window end + hold-back should be skipped")
+    }
+
     private func chunk(start: Double, isFinal: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },

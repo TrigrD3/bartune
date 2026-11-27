@@ -310,6 +310,54 @@ final class AudioChromaTests: XCTestCase {
         }
     }
 
+    func testCachedChromaTemplateRecoversRepeatedChorusWithoutRehearingFirstChorus() throws {
+        let locked = LyricLine(id: 0, timestamp: 10, duration: 2, text: "Beautiful day comes again", words: [
+            WordTimestamp(timestamp: 10.1, duration: 0.5, text: "Beautiful "),
+            WordTimestamp(timestamp: 10.6, duration: 0.5, text: "day "),
+            WordTimestamp(timestamp: 11.1, duration: 0.5, text: "comes "),
+            WordTimestamp(timestamp: 11.6, duration: 0.4, text: "again"),
+        ])
+        let unique = LyricLine(id: 1, timestamp: 15, duration: 1, text: "Unique bridge line", words: [
+            WordTimestamp(timestamp: 15.0, duration: 1.0, text: "Unique bridge line"),
+        ])
+        let target = LyricLine(id: 2, timestamp: 20.4, text: locked.text)
+        let lines = [locked, unique, target]
+        let rate = ChromaTestAudio.sampleRate
+        let audio = ChromaTestAudio.repeatedPhrase(secondStart: 20.0)
+
+        // Pass 1 hears only Chorus 1 (0...16 s) and extracts compact cached templates.
+        var pass1Chroma = AudioChromaProfile()
+        pass1Chroma.append(samples: Array(audio[..<Int(16 * rate)]), sampleRate: rate, startTime: 0)
+        let templates = ChorusSelfSimilarity.extractCachedTemplates(in: lines, lockedIDs: [0, 1], chroma: pass1Chroma)
+        XCTAssertEqual(templates.map(\.lineId), [0], "only locked lines with repeated text should be cached")
+
+        // Round-trip through JSON Codable as AudioSyncedLyricsRecord does.
+        let encoded = try JSONEncoder().encode(templates)
+        let decoded = try JSONDecoder().decode([ChorusSelfSimilarity.CachedTemplate].self, from: encoded)
+        XCTAssertEqual(decoded, templates)
+
+        // Pass 2 only hears Chorus 2 (17...28 s): Chorus 1 is absent from live chroma,
+        // but cached templates still recover Chorus 2 accurately.
+        var pass2Chroma = AudioChromaProfile()
+        pass2Chroma.append(samples: Array(audio[Int(17 * rate)..<Int(28 * rate)]), sampleRate: rate, startTime: 17)
+        let withoutCache = ChorusSelfSimilarity.recoverRepeatedLines(
+            in: lines, lockedIDs: [0, 1], chroma: pass2Chroma, medianOffset: 0
+        )
+        XCTAssertTrue(withoutCache.recoveredLineIDs.isEmpty)
+
+        let withCache = ChorusSelfSimilarity.recoverRepeatedLines(
+            in: lines, lockedIDs: [0, 1], chroma: pass2Chroma, cachedTemplates: decoded, medianOffset: 0
+        )
+        XCTAssertEqual(withCache.recoveredLineIDs, [2])
+        XCTAssertEqual(withCache.lines[2].timestamp, 20.0, accuracy: 0.1)
+
+        // Re-extracting templates on Pass 2 preserves Chorus 1's cached template even though Pass 2 didn't hear it.
+        let preserved = ChorusSelfSimilarity.extractCachedTemplates(
+            in: lines, lockedIDs: [0, 1], chroma: pass2Chroma, existing: decoded
+        )
+        XCTAssertEqual(preserved, decoded)
+    }
+
     private func chordFrames(_ frequencies: [Double]) throws -> [Float] {
         let sampleRate = 8000.0
         let samples = (0..<24000).map { sample -> Float in
