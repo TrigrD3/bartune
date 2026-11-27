@@ -37,7 +37,7 @@ final class LyricsStateTests: XCTestCase {
         // At 2×, the word starts 0.1625 s before the sample without compensation.
         // A 0.4 s hardware delay moves its onset to 0.2375 s after the sample.
         let duringWord = sample.addingTimeInterval(0.25)
-        XCTAssertEqual(state.liveProgress(at: duringWord, font: font), 0.104, accuracy: 1e-5)
+        XCTAssertEqual(state.liveProgress(at: duringWord, font: font), 0.2, accuracy: 1e-5)
         XCTAssertFalse(state.liveIsWaitingForWord(at: duringWord))
         XCTAssertEqual(try XCTUnwrap(state.liveWordPop(at: duringWord, font: font)).strength, 0.3125, accuracy: 1e-5)
         XCTAssertEqual(state.currentPlaybackPosition(at: duringWord), 2.5, accuracy: 1e-5)

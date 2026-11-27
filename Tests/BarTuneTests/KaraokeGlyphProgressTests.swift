@@ -58,7 +58,7 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         XCTAssertEqual(after / before, 1, accuracy: 0.1)
     }
 
-    func testSweepStartsFromRestAfterAPause() {
+    func testSweepStartsImmediatelyAfterAPauseWithoutMovingBackwards() {
         let line = LyricLine(id: 0, timestamp: 10, text: "aaaa bbbb", words: [
             WordTimestamp(timestamp: 10, duration: 1, text: "aaaa "),
             WordTimestamp(timestamp: 13, duration: 1, text: "bbbb"),
@@ -67,7 +67,12 @@ final class KaraokeGlyphProgressTests: XCTestCase {
         let wordWidth = 4 / 9.0
 
         XCTAssertEqual(progress(line, at: 13), wordStart, accuracy: 0.0001)
-        XCTAssertLessThan(progress(line, at: 13.05) - wordStart, 0.02 * wordWidth, "a straight line would already be 5% in")
+        XCTAssertEqual(
+            progress(line, at: 13.05) - wordStart,
+            0.05 * wordWidth,
+            accuracy: 0.001,
+            "an isolated word after a pause should launch on the beat without ease-in lag"
+        )
         XCTAssertEqual(progress(line, at: 14), 1, accuracy: 0.0001)
 
         var previous = 0.0
@@ -77,6 +82,25 @@ final class KaraokeGlyphProgressTests: XCTestCase {
             XCTAssertLessThanOrEqual(value, 1)
             previous = value
         }
+    }
+
+    func testSweepRedistributesZeroDurationCrushedTrailingWordsSmoothly() {
+        let line = LyricLine(id: 0, timestamp: 30.0, duration: 1.0, text: "prove them wrong", words: [
+            WordTimestamp(timestamp: 30.0, duration: 1.0, text: "prove "),
+            WordTimestamp(timestamp: 31.0, duration: 0.0, text: "them "),
+            WordTimestamp(timestamp: 31.0, duration: 0.0, text: "wrong"),
+        ])
+        let mid = LyricsState.computeLineProgress(line: line, nextTimestamp: 31.0, position: 30.5)
+        XCTAssertEqual(mid, 0.5, accuracy: 0.05)
+        let end = LyricsState.computeLineProgress(line: line, nextTimestamp: 31.0, position: 31.0)
+        XCTAssertEqual(end, 1.0, accuracy: 0.0001)
+
+        let nilDurationLine = LyricLine(id: 1, timestamp: 10.0, duration: 4.0, text: "one two", words: [
+            WordTimestamp(timestamp: 10.0, duration: 1.0, text: "one "),
+            WordTimestamp(timestamp: 13.0, duration: nil, text: "two"),
+        ])
+        let duringPause = LyricsState.computeLineProgress(line: nilDurationLine, nextTimestamp: 14.0, position: 12.5)
+        XCTAssertEqual(duringPause, 4.0 / 7.0, accuracy: 0.0001, "missing duration must not collapse the preceding pause")
     }
 
     func testRomanizedWordsWithATrailingSpaceStillMeasure() throws {
