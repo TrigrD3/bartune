@@ -531,7 +531,9 @@ final class LiveProcessTapBackend: ProcessTapBackend, @unchecked Sendable {
             }
         }
 
-        private let lock = NSLock()
+        static let slotCount = 64
+
+        private let lock: os_unfair_lock_t
         private let slots: [Slot]
         private let maxBuffers: Int
         private let bytesPerBuffer: Int
@@ -550,11 +552,13 @@ final class LiveProcessTapBackend: ProcessTapBackend, @unchecked Sendable {
             onBuffer: @escaping @Sendable (ProcessTapAudioBuffer) -> Void
         ) {
             self.format = format
+            lock = .allocate(capacity: 1)
+            lock.initialize(to: os_unfair_lock())
             maxBuffers = (format.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0 ? Int(format.mChannelsPerFrame) : 1
             let byteCount = maxFrames * Int(format.mBytesPerFrame)
             let alignment = MemoryLayout<Float>.alignment
             bytesPerBuffer = (byteCount + alignment - 1) / alignment * alignment
-            slots = (0..<8).map { [maxBuffers, bytesPerBuffer] _ in
+            slots = (0..<Self.slotCount).map { [maxBuffers, bytesPerBuffer] _ in
                 Slot(bufferCount: maxBuffers, bytesPerBuffer: bytesPerBuffer)
             }
             self.onBuffer = onBuffer
@@ -565,17 +569,29 @@ final class LiveProcessTapBackend: ProcessTapBackend, @unchecked Sendable {
 
         deinit {
             ready.cancel()
+            lock.deinitialize(count: 1)
+            lock.deallocate()
+        }
+
+        private func tryAcquireLock() -> Bool {
+            for _ in 0..<8 where os_unfair_lock_trylock(lock) {
+                return true
+            }
+            return false
         }
 
         func enqueue(bufferList: UnsafePointer<AudioBufferList>, inputTime: UnsafePointer<AudioTimeStamp>) {
             let startsNewSpan = droppedBuffer
             droppedBuffer = true
             let buffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: bufferList))
-            guard !buffers.isEmpty, buffers.count <= maxBuffers, lock.try() else { return }
-            defer { lock.unlock() }
-            guard pendingCount < slots.count else { return }
+            guard !buffers.isEmpty, buffers.count <= maxBuffers, tryAcquireLock() else { return }
+            let slotIndex: Int? = pendingCount < slots.count
+                ? (readIndex + pendingCount) % slots.count
+                : nil
+            os_unfair_lock_unlock(lock)
+            guard let slotIndex else { return }
 
-            let slot = slots[(readIndex + pendingCount) % slots.count]
+            let slot = slots[slotIndex]
             slot.buffers.unsafeMutablePointer.pointee.mNumberBuffers = UInt32(buffers.count)
             for index in buffers.indices {
                 var buffer = buffers[index]
@@ -594,21 +610,29 @@ final class LiveProcessTapBackend: ProcessTapBackend, @unchecked Sendable {
                 ? AudioConvertHostTimeToNanos(inputTime.pointee.mHostTime)
                 : nil
             slot.startsNewSpan = startsNewSpan
-            droppedBuffer = false
+
+            guard tryAcquireLock() else { return }
             pendingCount += 1
+            os_unfair_lock_unlock(lock)
+            droppedBuffer = false
             ready.add(data: 1)
         }
 
         private func drain() {
-            while let slot = lock.withLock({ pendingCount > 0 ? slots[readIndex] : nil }) {
+            while true {
+                os_unfair_lock_lock(lock)
+                let slot = pendingCount > 0 ? slots[readIndex] : nil
+                os_unfair_lock_unlock(lock)
+                guard let slot else { break }
+
                 let channels = StereoAudioResampler.extractChannels(from: slot.buffers.unsafePointer, asbd: format)
                 let hostTimeNanos = slot.hostTimeNanos
                 let startsNewSpan = slot.startsNewSpan
                 // Keep the slot occupied until decoding has finished reading its bytes.
-                lock.withLock {
-                    readIndex = (readIndex + 1) % slots.count
-                    pendingCount -= 1
-                }
+                os_unfair_lock_lock(lock)
+                readIndex = (readIndex + 1) % slots.count
+                pendingCount -= 1
+                os_unfair_lock_unlock(lock)
                 onBuffer(ProcessTapAudioBuffer(channels: channels, hostTimeNanos: hostTimeNanos, startsNewSpan: startsNewSpan))
             }
         }
@@ -888,7 +912,7 @@ final class ProcessTapAudioCapture: AudioCaptureProviding, @unchecked Sendable {
     private let resources = HALResources()
     // HAL invokes the IOProc synchronously. Lifecycle calls must be free to wait for it.
     private let controlQueue = DispatchQueue(label: "com.arya.bartune.processtap.control", qos: .utility)
-    private let ioQueue = DispatchQueue(label: "com.arya.bartune.processtap.io", qos: .utility)
+    private let ioQueue = DispatchQueue(label: "com.arya.bartune.processtap.io", qos: .userInitiated)
     private let rebuildDebounceSeconds: Double
     private let excludedPID: pid_t
     private var processSnapshotRetryDelay: Double { max(rebuildDebounceSeconds, 0.2) }
