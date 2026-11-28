@@ -49,6 +49,154 @@ final class LyricsForcedAlignerTests: XCTestCase {
         ))
     }
 
+    func testViterbiWildcardAbsorbsAdLibsBetweenLeadingAndTrailingLines() throws {
+        let vocab = ForcedAlignmentText.vocabulary
+        let k = try XCTUnwrap(vocab["k"])
+        let a = try XCTUnwrap(vocab["a"])
+        let t = try XCTUnwrap(vocab["t"])
+        let o = try XCTUnwrap(vocab["o"])
+        let h = try XCTUnwrap(vocab["h"])
+        let y = try XCTUnwrap(vocab["y"])
+
+        // Leading "k o h" (0..2), line 0 "ka" (5..6), inter-line "o h a" (9..11),
+        // line 1 "ta" (15..16), trailing "y a h" (19..21).
+        let logProbs = emissions(frames: 24, peaks: [
+            0: k, 1: o, 2: h,
+            5: k, 6: a,
+            9: o, 10: h, 11: a,
+            15: t, 16: a,
+            19: y, 20: a, 21: h,
+        ])
+        let spans = CTCForcedAlignment.align(
+            logProbs: logProbs,
+            vocabSize: vocabSize,
+            tokens: [k, a, t, a],
+            wildcardPositions: [0, 2, 4]
+        )
+
+        XCTAssertEqual(spans?.map(\.firstFrame), [5, 6, 15, 16])
+        XCTAssertEqual(spans?.map(\.lastFrame), [5, 6, 15, 16])
+        for span in try XCTUnwrap(spans) {
+            XCTAssertEqual(span.logProbability, -0.01, accuracy: 0.001)
+        }
+    }
+
+    func testViterbiWildcardSkipsCleanlyForBackToBackLinesAndPreservesHeldVowels() throws {
+        let vocab = ForcedAlignmentText.vocabulary
+        let k = try XCTUnwrap(vocab["k"])
+        let a = try XCTUnwrap(vocab["a"])
+        let t = try XCTUnwrap(vocab["t"])
+
+        // Immediate back-to-back transition across line boundary (no blank or ad-lib frames).
+        let immediate = emissions(frames: 10, peaks: [3: k, 4: a, 5: t, 6: a])
+        let immediateSpans = CTCForcedAlignment.align(
+            logProbs: immediate,
+            vocabSize: vocabSize,
+            tokens: [k, a, t, a],
+            wildcardPositions: [0, 2, 4]
+        )
+        XCTAssertEqual(immediateSpans?.map(\.firstFrame), [3, 4, 5, 6])
+        XCTAssertEqual(immediateSpans?.map(\.lastFrame), [3, 4, 5, 6])
+
+        // Held vowel at the end of line 0 stays on the lyric token instead of exiting to wildcard.
+        let held = emissions(frames: 12, peaks: [2: k, 3: a, 4: a, 5: a, 8: t, 9: a])
+        let heldSpans = CTCForcedAlignment.align(
+            logProbs: held,
+            vocabSize: vocabSize,
+            tokens: [k, a, t, a],
+            wildcardPositions: [0, 2, 4]
+        )
+        XCTAssertEqual(heldSpans?.map(\.firstFrame), [2, 3, 8, 9])
+        XCTAssertEqual(heldSpans?.map(\.lastFrame), [2, 5, 8, 9])
+    }
+
+    func testEngineWildcardAbsorbsAdLibBetweenLinesWithoutStretchingWords() async throws {
+        let vocab = ForcedAlignmentText.vocabulary
+        let k = try XCTUnwrap(vocab["k"])
+        let a = try XCTUnwrap(vocab["a"])
+        let t = try XCTUnwrap(vocab["t"])
+        let o = try XCTUnwrap(vocab["o"])
+        let h = try XCTUnwrap(vocab["h"])
+        let y = try XCTUnwrap(vocab["y"])
+
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Track time t = (frame - 600) * 0.02 s.
+        // Leading ad-lib "k o h" at 4.00..4.06 s (frames 800..802),
+        // Line 0 "ka" at 5.00..5.04 s (frames 850..851),
+        // Inter-line ad-lib "o h a t" at 5.50..5.66 s (frames 875..882),
+        // Line 1 "ta" at 7.00..7.04 s (frames 950..951),
+        // Trailing ad-lib "y a h" at 8.00..8.06 s (frames 1000..1002).
+        let peaks: [Int: Int] = [
+            800: k, 801: o, 802: h,
+            850: k, 851: a,
+            875: o, 876: h, 877: o, 878: h, 879: a, 880: o, 881: h, 882: t,
+            950: t, 951: a,
+            1000: y, 1001: a, 1002: h,
+        ]
+        model.peaksForCall = [peaks]
+        let lines = [
+            LyricLine(id: 0, timestamp: 5.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 7.0, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(words.map(\.sourceLineId), [0, 1])
+        let first = try XCTUnwrap(words.first)
+        let second = try XCTUnwrap(words.last)
+        XCTAssertEqual(first.startTime, 5.0, accuracy: 0.01)
+        XCTAssertEqual(first.duration, 0.04, accuracy: 0.01)
+        XCTAssertEqual(second.startTime, 7.0, accuracy: 0.01)
+        XCTAssertEqual(second.duration, 0.04, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1])
+    }
+
+    func testEngineAlignsBackToBackLinesWithoutAdLibsWhenWildcardsAreEnabled() async throws {
+        let vocab = ForcedAlignmentText.vocabulary
+        let k = try XCTUnwrap(vocab["k"])
+        let a = try XCTUnwrap(vocab["a"])
+        let t = try XCTUnwrap(vocab["t"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Line 0 "ka" at 5.00..5.04 s (850..851), immediately followed by line 1 "ta" at 5.04..5.08 s (852..853).
+        model.peaksForCall = [[850: k, 851: a, 852: t, 853: a]]
+        let lines = [
+            LyricLine(id: 0, timestamp: 5.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 5.04, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(words.map(\.sourceLineId), [0, 1])
+        XCTAssertEqual(words.first?.startTime ?? 0, 5.0, accuracy: 0.01)
+        XCTAssertEqual(words.first?.duration ?? 0, 0.04, accuracy: 0.01)
+        XCTAssertEqual(words.last?.startTime ?? 0, 5.04, accuracy: 0.01)
+        XCTAssertEqual(words.last?.duration ?? 0, 0.04, accuracy: 0.01)
+        XCTAssertEqual(aligner.confidentLineIDs, [0, 1])
+    }
+
+    func testEngineWildcardAbsorbsAStrippedBackingVocalInsideALine() async throws {
+        let vocab = ForcedAlignmentText.vocabulary
+        let k = try XCTUnwrap(vocab["k"])
+        let a = try XCTUnwrap(vocab["a"])
+        let t = try XCTUnwrap(vocab["t"])
+        let o = try XCTUnwrap(vocab["o"])
+        let h = try XCTUnwrap(vocab["h"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // "ka" at 5.00 s (850..851), the stripped "(ooh)" sung as "o h o h" (853..856), "ta" at 5.20 s (860..861).
+        model.peaksForCall = [[850: k, 851: a, 853: o, 854: h, 855: o, 856: h, 860: t, 861: a]]
+        let aligner = LyricsForcedAligner(lines: [LyricLine(id: 0, timestamp: 5.0, text: "ka (ooh) ta")], model: model)
+
+        let words = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+
+        XCTAssertEqual(words.map(\.text), ["ka", "ta"])
+        XCTAssertEqual(words.first?.startTime ?? 0, 5.0, accuracy: 0.01)
+        XCTAssertEqual(words.first?.duration ?? 0, 0.04, accuracy: 0.01)
+        XCTAssertEqual(words.last?.startTime ?? 0, 5.2, accuracy: 0.01)
+        XCTAssertEqual(words.last?.duration ?? 0, 0.04, accuracy: 0.01)
+    }
+
     func testRomanizedWordsKeepLyricTokensAndDropUnreadableOnes() {
         let words = ForcedAlignmentText.words(for: "駄目駄目", script: .japanese)
         XCTAssertEqual(words.map(\.display).joined(), "駄目駄目")
@@ -109,6 +257,15 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(parenthesized.map(\.display), ["(Ooh", "yeah)", "(oh!)"])
         XCTAssertEqual(parenthesized.map(\.reading), ["ooh", "yeah", "oh"])
         XCTAssertEqual(ForcedAlignmentText.words(for: "sing (out", script: .latin).map(\.reading), ["sing", "out"])
+    }
+
+    func testOnlyStrippedBackingVocalsMarkAGapInsideALine() {
+        let backing = ForcedAlignmentText.words(for: "(ooh) I'm on (yeah (oh) yeah) my way!", script: .latin)
+        XCTAssertEqual(backing.map(\.followsBackingVocal), [false, false, true, false])
+        let punctuation = ForcedAlignmentText.words(for: "hello - world", script: .latin)
+        XCTAssertEqual(punctuation.map(\.display), ["hello", "world"])
+        XCTAssertEqual(punctuation.map(\.followsBackingVocal), [false, false])
+        XCTAssertEqual(ForcedAlignmentText.words(for: "駄目、駄目", script: .japanese).map(\.followsBackingVocal), [false, false])
     }
 
     func testEnglishWordsAreNormalizedInRomanizedLyrics() {
