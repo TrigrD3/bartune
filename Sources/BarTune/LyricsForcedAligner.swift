@@ -559,6 +559,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let contextEnd: Double
         let searchEnd: Double
         let words: [ForcedAlignmentText.Word]
+        let normalizedWords: [String]
         let wordIntervals: [ClosedRange<Double>]?
         let priorWordIntervals: [ClosedRange<Double>]?
         /// Each word's syllables, empty for a word of one.
@@ -597,6 +598,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private let anchoredIndices: Set<Int>
     private var confident = Set<Int>()
     private var nearlyConfident = Set<Int>()
+    /// Word intervals relative to the locked line's aligned start, keyed by `lines` index.
+    private var lockedRelativeWordIntervals: [Int: [ClosedRange<Double>]] = [:]
 
     // The current run of contiguous audio; a seek or rate change starts a new one.
     private var skippedInRun = Set<Int>()
@@ -651,6 +654,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         let instrumentalGap = 12.0
         var prepared: [PreparedLine] = []
         var spans: [ClosedRange<Double>?] = []
+        var anchoredWordIntervals: [[ClosedRange<Double>]?] = []
         for (index, line) in alignmentRows.enumerated() {
             let words = ForcedAlignmentText.words(for: line.text, script: script)
             guard !words.isEmpty else { continue }
@@ -662,8 +666,12 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             // A distant row adds little context. Allow a plausible declared duration for the line before it.
             let estimatedDuration = max(8, Double(words.count) * 1.2, duration <= instrumentalGap ? duration : 0)
             let contextEnd = hasLongGap ? min(nextTime, line.timestamp + estimatedDuration) : nextTime
+            let wordIntervals = Self.wordIntervals(in: line, matching: words)
             let priorWordIntervals = anchors[line.id] == nil
                 ? priorLines[line.id].flatMap { Self.wordIntervals(in: $0, matching: words) }
+                : nil
+            let anchoredIntervals = anchors[line.id] != nil
+                ? (priorLines[line.id].flatMap { Self.wordIntervals(in: $0, matching: words) } ?? wordIntervals)
                 : nil
             prepared.append(PreparedLine(
                 id: line.id,
@@ -671,20 +679,28 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 contextEnd: contextEnd,
                 searchEnd: endsAtBlank || hasLongGap ? contextEnd : max(contextEnd, line.timestamp + duration),
                 words: words,
-                wordIntervals: Self.wordIntervals(in: line, matching: words),
+                normalizedWords: LyricsAudioAligner.tokenizeLine(line.text).map(\.normalized).filter { !$0.isEmpty },
+                wordIntervals: wordIntervals,
                 priorWordIntervals: priorWordIntervals,
                 syllables: words.map { ForcedAlignmentText.syllables(of: $0, script: script, latinRules: latinRules) }
             ))
             spans.append(anchors[line.id])
+            anchoredWordIntervals.append(anchoredIntervals)
         }
         var anchored = Set<Int>()
         var offsets: [Int: Double] = [:]
+        var lockedIntervals: [Int: [ClosedRange<Double>]] = [:]
         var lowerBound = -Double.infinity
         for index in prepared.indices {
             if let span = spans[index] {
                 anchored.insert(index)
                 offsets[index] = span.lowerBound - prepared[index].start
                 lowerBound = span.upperBound
+                if Self.isRepeatableLine(prepared[index].normalizedWords),
+                   let intervals = anchoredWordIntervals[index],
+                   let relative = Self.relativeWordIntervals(from: intervals, expectedCount: prepared[index].words.count) {
+                    lockedIntervals[index] = relative
+                }
             } else {
                 prepared[index].lowerBound = lowerBound
             }
@@ -701,6 +717,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         anchoredIndices = anchored
         done = anchored
         lineOffsets = offsets
+        lockedRelativeWordIntervals = lockedIntervals
     }
 
     private static func wordIntervals(in line: LyricLine, matching words: [ForcedAlignmentText.Word]) -> [ClosedRange<Double>]? {
@@ -786,6 +803,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         doneAtRunStart.removeAll()
         lineOffsets.removeAll()
         confident.removeAll()
+        lockedRelativeWordIntervals.removeAll()
         nearlyConfident.removeAll()
         alignedUntilFrame = 0
         return true
@@ -1054,8 +1072,10 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
             let high = min(highFrame, runFrame(atTrackTime: window.end))
             guard high >= low else { return nil }
             let lineRange = (low - lowFrame)...(high - lowFrame)
+            let priors = line.priorWordIntervals
+                ?? (line.wordIntervals == nil ? repeatPriorWordIntervals(for: index, window: window) : nil)
             let wordRanges = usesWordPriors
-                ? (priorFrameRanges(line.priorWordIntervals, offset: coarseShift == nil ? 0 : nil, in: window, frames: low...high, from: lowFrame)
+                ? (priorFrameRanges(priors, offset: coarseShift == nil ? 0 : nil, in: window, frames: low...high, from: lowFrame)
                     ?? priorFrameRanges(line.wordIntervals, offset: window.wordOffset, in: window, frames: low...high, from: lowFrame))
                 : nil
             pinningRanges.append(runFrame(atTrackTime: window.rawStart)...min(committedFrames - 1, runFrame(atTrackTime: window.rawEnd)))
@@ -1161,10 +1181,72 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         return ranges
     }
 
+    private static func isRepeatableLine(_ normalizedWords: [String]) -> Bool {
+        normalizedWords.count >= 2 || (normalizedWords.first?.count ?? 0) >= 8
+    }
+
+    private func repeatPriorWordIntervals(for index: Int, window: SearchWindow) -> [ClosedRange<Double>]? {
+        guard let localOffset = window.wordOffset else { return nil }
+        let line = lines[index]
+        let matchingLock = lockedRelativeWordIntervals.keys
+            .filter { candidate in
+                guard candidate != index,
+                      confident.contains(candidate) || anchoredIndices.contains(candidate),
+                      lines[candidate].words.count == line.words.count,
+                      lines[candidate].normalizedWords == line.normalizedWords
+                else { return false }
+                return true
+            }
+            .min { lhs, rhs in
+                let lhsDistance = abs(lhs - index)
+                let rhsDistance = abs(rhs - index)
+                return lhsDistance != rhsDistance ? lhsDistance < rhsDistance : lhs < rhs
+            }
+
+        guard let lockedIndex = matchingLock,
+              let relativeIntervals = lockedRelativeWordIntervals[lockedIndex]
+        else { return nil }
+
+        let expectedStart = line.start + localOffset
+        return relativeIntervals.map { (expectedStart + $0.lowerBound)...(expectedStart + $0.upperBound) }
+    }
+
+    private func recordLockedWordIntervals(from alignment: Alignment) {
+        guard !alignment.confidentOffsets.isEmpty, !alignment.words.isEmpty else { return }
+        let wordsByLineID = Dictionary(grouping: alignment.words, by: \.sourceLineId)
+        for index in alignment.confidentOffsets.keys {
+            let line = lines[index]
+            guard Self.isRepeatableLine(line.normalizedWords),
+                  !line.words.isEmpty,
+                  let lineWords = wordsByLineID[line.id],
+                  lineWords.allSatisfy({ $0.duration >= 0 }),
+                  let intervals = Self.relativeWordIntervals(
+                      from: lineWords.map { $0.startTime...($0.startTime + $0.duration) },
+                      expectedCount: line.words.count
+                  )
+            else { continue }
+            lockedRelativeWordIntervals[index] = intervals
+        }
+    }
+
+    private static func relativeWordIntervals(
+        from intervals: [ClosedRange<Double>], expectedCount: Int
+    ) -> [ClosedRange<Double>]? {
+        guard !intervals.isEmpty,
+              intervals.count == expectedCount,
+              let firstStart = intervals.first?.lowerBound,
+              firstStart.isFinite,
+              intervals.allSatisfy({ $0.lowerBound.isFinite && $0.upperBound.isFinite && $0.lowerBound <= $0.upperBound }),
+              !zip(intervals, intervals.dropFirst()).contains(where: { $0.lowerBound > $1.lowerBound })
+        else { return nil }
+        return intervals.map { ($0.lowerBound - firstStart)...($0.upperBound - firstStart) }
+    }
+
     private func commit(_ alignment: Alignment) -> [RecognizedAudioWord] {
         confident.formUnion(alignment.confidentOffsets.keys)
         lineOffsets.merge(alignment.confidentOffsets) { _, offset in offset }
         nearlyConfident.formUnion(alignment.nearlyConfident)
+        recordLockedWordIntervals(from: alignment)
         if let last = alignment.words.last {
             alignedUntilFrame = runFrame(atTrackTime: last.startTime + last.duration)
         }
