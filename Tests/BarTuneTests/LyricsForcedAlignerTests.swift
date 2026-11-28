@@ -2048,6 +2048,124 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(refined[1].endTime, 3.54, accuracy: 0.01)
     }
 
+    private func alignTargetWithAnchoredOffsets(
+        _ offsets: [Double],
+        strongDecoyTime: Double? = nil,
+        targetPeakTime: Double
+    ) async throws -> [RecognizedAudioWord] {
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        let chunkStart = 34.0
+        var peaks: [Int: Int] = [:]
+        var weakFrames: Set<Int> = []
+        let targetFrame = 600 + Int(((targetPeakTime - chunkStart) * 50).rounded())
+        peaks[targetFrame] = 14
+        peaks[targetFrame + 1] = 4
+        if let decoyTime = strongDecoyTime {
+            let decoyFrame = 600 + Int(((decoyTime - chunkStart) * 50).rounded())
+            peaks[decoyFrame] = 14
+            peaks[decoyFrame + 1] = 4
+            weakFrames.formUnion([targetFrame, targetFrame + 1])
+            model.weakLogProbability = -1
+        }
+        model.peaksForCall = [peaks]
+        model.weakFrames = weakFrames
+
+        var lines: [LyricLine] = []
+        var anchors: [Int: ClosedRange<Double>] = [:]
+        for (index, offset) in offsets.enumerated() {
+            let timestamp = 10.0 + Double(index * 5)
+            lines.append(LyricLine(id: index, timestamp: timestamp, text: "ka"))
+            anchors[index] = (timestamp + offset)...(timestamp + offset + 0.2)
+        }
+        let targetID = offsets.count
+        lines.append(LyricLine(id: targetID, timestamp: 40.0, text: "ka"))
+        lines.append(LyricLine(id: targetID + 1, timestamp: 40.5, text: " "))
+
+        let aligner = LyricsForcedAligner(lines: lines, model: model, anchors: anchors)
+        return try await aligner.transcribe(chunk(start: chunkStart, isFinal: true))
+    }
+
+    func testSearchWindowKeepsFullThreeSecondsWithFewerThanFourLocks() async throws {
+        // 3 locked offsets with tight MAD = 0.05 s and median = 1.0 s -> still uses full ±3.0 s window.
+        let words = try await alignTargetWithAnchoredOffsets(
+            [0.95, 1.00, 1.05],
+            targetPeakTime: 38.2 // 40.0 + 1.0 - 2.8 s (outside ±1.5 s, inside ±3.0 s)
+        )
+        XCTAssertEqual(words.map(\.sourceLineId), [3])
+        XCTAssertEqual(words.first?.startTime ?? 0, 38.2, accuracy: 0.02)
+    }
+
+    func testSearchWindowNarrowsToOneSecondWhenFourLocksAreTightlyClustered() async throws {
+        // 4 locked offsets [0.95, 0.95, 1.05, 1.05]: median = 1.0 s, MAD = 0.05 s -> clamp(0.15, 1.0, 3.0) = 1.0 s.
+        // Local offset around line 4 is 1.0 s (center = 41.0 s), so ±1.0 s covers [40.0, 42.5].
+        // A strong decoy at 39.5 s (-1.5 s) falls outside ±1.0 s; the weaker target at 40.2 s (-0.8 s) wins.
+        let words = try await alignTargetWithAnchoredOffsets(
+            [0.95, 0.95, 1.05, 1.05],
+            strongDecoyTime: 39.5,
+            targetPeakTime: 40.2
+        )
+        XCTAssertEqual(words.map(\.sourceLineId), [4])
+        XCTAssertEqual(words.first?.startTime ?? 0, 40.2, accuracy: 0.02)
+    }
+
+    func testSearchWindowUsesThreeTimesMADForModeratelySpreadLocks() async throws {
+        // 4 locked offsets [0.5, 1.5, 0.5, 1.5]: median = 1.0 s, MAD = 0.5 s -> clamp(1.5, 1.0, 3.0) = 1.5 s.
+        // Local offset around line 4 (last 3: [1.5, 0.5, 1.5]) is 1.5 s (center = 41.5 s), so ±1.5 s covers [40.0, 43.5].
+        // A strong decoy at 39.5 s (-2.0 s) falls outside ±1.5 s; the weaker target at 40.2 s (-1.3 s) wins.
+        let words = try await alignTargetWithAnchoredOffsets(
+            [0.5, 1.5, 0.5, 1.5],
+            strongDecoyTime: 39.5,
+            targetPeakTime: 40.2
+        )
+        XCTAssertEqual(words.map(\.sourceLineId), [4])
+        XCTAssertEqual(words.first?.startTime ?? 0, 40.2, accuracy: 0.02)
+    }
+
+    func testIntroAndAnchorBracketRulesStayIntactWhenSearchWindowNarrows() async throws {
+        // Intro rule: line 0 at 6.0 s (<= maxIntroStart) keeps rawStart = 0 even with 4 tight later locks (MAD = 0.05 s).
+        let introModel = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        introModel.peaksForCall = [[650: 14, 651: 4]] // 1.0 s in chunk(start: 0)
+        let introLines = [
+            LyricLine(id: 0, timestamp: 6.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 20.0, text: "ka"),
+            LyricLine(id: 2, timestamp: 25.0, text: "ka"),
+            LyricLine(id: 3, timestamp: 30.0, text: "ka"),
+            LyricLine(id: 4, timestamp: 35.0, text: "ka"),
+        ]
+        let introAnchors: [Int: ClosedRange<Double>] = [
+            1: 20.95...21.15,
+            2: 25.95...26.15,
+            3: 31.05...31.25,
+            4: 36.05...36.25,
+        ]
+        let introAligner = LyricsForcedAligner(lines: introLines, model: introModel, anchors: introAnchors)
+        let introWords = try await introAligner.transcribe(chunk(start: 0, isFinal: true))
+        XCTAssertEqual(introWords.map(\.sourceLineId), [0])
+        XCTAssertEqual(introWords.first?.startTime ?? 0, 1.0, accuracy: 0.02)
+
+        // Anchor bracket rule: 4 tight anchors (MAD = 0.05 s) still widen a bracketed line to lowerBound...upperBound.
+        let bracketModel = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // chunk(start: 10) -> track 19.5 s is frame 600 + 9.5 * 50 = 1075.
+        bracketModel.peaksForCall = [[1075: 14, 1076: 4]]
+        let bracketLines = [
+            LyricLine(id: 0, timestamp: 2.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 5.0, text: "ka"),
+            LyricLine(id: 2, timestamp: 10.0, text: "ka"),
+            LyricLine(id: 3, timestamp: 12.0, text: "ka"),
+            LyricLine(id: 4, timestamp: 22.0, text: "ka"),
+        ]
+        let bracketAnchors: [Int: ClosedRange<Double>] = [
+            0: 1.95...2.15,
+            1: 4.95...5.15,
+            2: 10.05...10.25,
+            4: 22.05...22.25,
+        ]
+        let bracketAligner = LyricsForcedAligner(lines: bracketLines, model: bracketModel, anchors: bracketAnchors)
+        let bracketWords = try await bracketAligner.transcribe(chunk(start: 10, isFinal: true))
+        XCTAssertEqual(bracketWords.map(\.sourceLineId), [3])
+        XCTAssertEqual(bracketWords.first?.startTime ?? 0, 19.5, accuracy: 0.02)
+    }
+
     private func chunk(start: Double, isFinal: Bool = false, startsNewSpan: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },
