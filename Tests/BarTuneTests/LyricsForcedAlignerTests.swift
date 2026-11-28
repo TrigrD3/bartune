@@ -1633,7 +1633,7 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: models.path), [LyricsAlignerModel.packageName])
     }
 
-    func testModelInstallPublishesTheCompiledArtifactWithItsSourcePackage() throws {
+    func testModelInstallPublishesCompiledModelWithoutKeepingSourcePackage() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
         let archive = try makeModelArchive(in: root)
@@ -1642,15 +1642,69 @@ final class LyricsForcedAlignerTests: XCTestCase {
         let package = models.appendingPathComponent(LyricsAlignerModel.packageName)
         let compiled = models.appendingPathComponent(LyricsAlignerModel.compiledName)
 
+        // Pre-populate a legacy .mlpackage to confirm install removes redundant source packages too.
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data("legacy".utf8).write(to: package.appendingPathComponent("Manifest.json"))
+
         try LyricsAlignerModel.install(archive: archive, expectedSHA256: digest, into: models, compile: { source, output in
             let manifest = try String(contentsOf: source.appendingPathComponent("Manifest.json"), encoding: .utf8)
-            XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
             try Data("compiled \(manifest)".utf8).write(to: output)
         })
 
-        XCTAssertEqual(try String(contentsOf: package.appendingPathComponent("Manifest.json"), encoding: .utf8), "weights")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
         XCTAssertEqual(try String(contentsOf: compiled, encoding: .utf8), "compiled weights")
-        XCTAssertEqual(try Set(FileManager.default.contentsOfDirectory(atPath: models.path)), Set([package.lastPathComponent, compiled.lastPathComponent]))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: models.path), [compiled.lastPathComponent])
+        XCTAssertTrue(LyricsAlignerModel.isInstalled(in: models))
+    }
+
+    func testPrepareCompiledModelCompilesAndRemovesRedundantPackage() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let models = root.appendingPathComponent("Models")
+        let package = models.appendingPathComponent(LyricsAlignerModel.packageName)
+        let compiled = models.appendingPathComponent(LyricsAlignerModel.compiledName)
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data("weights".utf8).write(to: package.appendingPathComponent("Manifest.json"))
+
+        // If compilation fails, the source package must remain intact for a retry.
+        XCTAssertNil(LyricsAlignerModel.prepareCompiledModel(in: models, compile: { _ in
+            throw CocoaError(.fileWriteNoPermission)
+        }))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: package.path))
+
+        let prepared = LyricsAlignerModel.prepareCompiledModel(in: models, compile: { _ in
+            let tempCompiled = root.appendingPathComponent("temp-\(UUID().uuidString).mlmodelc")
+            try FileManager.default.createDirectory(at: tempCompiled, withIntermediateDirectories: true)
+            try Data("compiled-weights".utf8).write(to: tempCompiled.appendingPathComponent("weights.bin"))
+            return tempCompiled
+        })
+
+        XCTAssertEqual(prepared?.standardizedFileURL, compiled.standardizedFileURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: compiled.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
+        XCTAssertTrue(LyricsAlignerModel.isInstalled(in: models))
+    }
+
+    func testLegacyPackageIsCleanedUpWhenCompiledModelAlreadyExists() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let models = root.appendingPathComponent("Models")
+        let package = models.appendingPathComponent(LyricsAlignerModel.packageName)
+        let compiled = models.appendingPathComponent(LyricsAlignerModel.compiledName)
+        try FileManager.default.createDirectory(at: package, withIntermediateDirectories: true)
+        try Data("legacy-package-bytes".utf8).write(to: package.appendingPathComponent("Manifest.json"))
+        try FileManager.default.createDirectory(at: compiled, withIntermediateDirectories: true)
+        try Data("compiled-bytes".utf8).write(to: compiled.appendingPathComponent("weights.bin"))
+
+        let prepared = LyricsAlignerModel.prepareCompiledModel(in: models, compile: { _ in
+            XCTFail("must not recompile when compiled model already exists")
+            throw CocoaError(.fileNoSuchFile)
+        })
+
+        XCTAssertEqual(prepared?.standardizedFileURL, compiled.standardizedFileURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: package.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: compiled.path))
+        XCTAssertTrue(LyricsAlignerModel.isInstalled(in: models))
     }
 
     func testModelInstallRestoresExistingArtifactsWhenPreparationOrSwapFails() throws {
@@ -1670,9 +1724,6 @@ final class LyricsForcedAlignerTests: XCTestCase {
         try Data("previous compiled model".utf8).write(to: oldWeights)
 
         let backupFailure = FailingModelMoveFileManager { source, _ in source.path == compiled.path }
-        let replacementFailure = FailingModelMoveFileManager { source, destination in
-            destination.path == package.path && source.deletingLastPathComponent().lastPathComponent.hasPrefix(".staging-")
-        }
         let compiledReplacementFailure = FailingModelMoveFileManager { source, destination in
             destination.path == compiled.path && source.deletingLastPathComponent().lastPathComponent.hasPrefix(".staging-")
         }
@@ -1686,7 +1737,6 @@ final class LyricsForcedAlignerTests: XCTestCase {
         let failureCases: [(FileManager, (URL, URL) throws -> Void)] = [
             (.default, failCompilation),
             (backupFailure, compile),
-            (replacementFailure, compile),
             (compiledReplacementFailure, compile),
         ]
         for (fileManager, prepare) in failureCases {

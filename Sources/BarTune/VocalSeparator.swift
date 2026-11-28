@@ -447,6 +447,7 @@ enum VocalSeparatorModel {
             into: directory,
             packageName: packageName,
             compiledName: compiledName,
+            keepPackage: true,
             lock: modelFilesLock,
             onInstalled: releaseCachedModel,
             compile: compile
