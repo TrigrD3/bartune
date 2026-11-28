@@ -160,6 +160,17 @@ struct KaraokeLineView: View {
             : 0
     }
 
+    static func sweepFrameInterval(lowCPUMode: Bool) -> TimeInterval {
+        lowCPUMode ? (1.0 / 8.0) : (1.0 / 20.0)
+    }
+
+    static func activeWordPop(_ pop: LyricsState.WordPop?) -> LyricsState.WordPop? {
+        guard let pop, pop.strength > 0.001, pop.end > pop.start else {
+            return nil
+        }
+        return pop
+    }
+
     var body: some View {
         GeometryReader { container in
             let availableWidth = container.size.width
@@ -170,7 +181,7 @@ struct KaraokeLineView: View {
                 availableWidth: availableWidth
             )
 
-            let frameInterval = lowCPUMode ? (1.0 / 8.0) : (1.0 / 30.0)
+            let frameInterval = Self.sweepFrameInterval(lowCPUMode: lowCPUMode)
             TimelineView(.animation(minimumInterval: frameInterval, paused: timelinePaused)) { timeline in
                 let renderDate = isPlaying ? timeline.date.addingTimeInterval(frameInterval) : timeline.date
                 let progress = Self.scrollProgress(
@@ -186,11 +197,12 @@ struct KaraokeLineView: View {
                     trailingInset: typingCaretEnabled && karaokeEnabled ? Self.caretWidth : 0
                 )
 
-                let pop = wordPopEnabled && karaokeEnabled
+                let rawPop = (wordPopEnabled && karaokeEnabled)
                     ? measureFont.flatMap { state.liveWordPop(at: renderDate, font: $0) }
                     : nil
+                let pop = Self.activeWordPop(rawPop)
                 Group {
-                    if let pop, pop.strength > 0.001 {
+                    if let pop {
                         let strength = CGFloat(pop.strength)
                         ZStack(alignment: .leading) {
                             sweptText(progress: progress)
@@ -231,7 +243,7 @@ struct KaraokeLineView: View {
                 StaticLyricText(text: text, font: font, color: unsungColor)
                     .equatable()
 
-                let sungLayer = StaticLyricText(text: text, font: font, color: sungColor)
+                StaticLyricText(text: text, font: font, color: sungColor)
                     .equatable()
                     .mask {
                         let feather = Self.sweepFeather(progress: progress, textWidth: textWidth)
@@ -246,19 +258,11 @@ struct KaraokeLineView: View {
                             endPoint: .trailing
                         )
                     }
-                if glowEnabled {
-                    sungLayer.shadow(color: sungColor.opacity(0.55), radius: 4)
-                } else {
-                    sungLayer
-                }
+                    .modifier(KaraokeGlowModifier(enabled: glowEnabled, color: sungColor))
             } else {
-                let plainLayer = StaticLyricText(text: text, font: font, color: sungColor)
+                StaticLyricText(text: text, font: font, color: sungColor)
                     .equatable()
-                if glowEnabled {
-                    plainLayer.shadow(color: sungColor.opacity(0.55), radius: 4)
-                } else {
-                    plainLayer
-                }
+                    .modifier(KaraokeGlowModifier(enabled: glowEnabled, color: sungColor))
             }
         }
     }
@@ -281,6 +285,21 @@ struct KaraokeLineView: View {
                 .onAppear { textWidth = textGeo.size.width }
                 .onChange(of: text) { _ in textWidth = textGeo.size.width }
                 .onChange(of: textGeo.size.width) { newWidth in textWidth = newWidth }
+        }
+    }
+}
+
+private struct KaraokeGlowModifier: ViewModifier {
+    let enabled: Bool
+    let color: Color
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content
+                .compositingGroup()
+                .shadow(color: color.opacity(0.55), radius: 4)
+        } else {
+            content
         }
     }
 }
