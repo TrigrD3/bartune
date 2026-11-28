@@ -45,11 +45,23 @@ struct CachedSongSummary: Identifiable, Equatable, Sendable {
 struct LyricsDiskCache: Sendable {
     static let limitDefaultsKey = "bartune.lyricsCacheLimit"
     static let defaultMaxEntries = 1000
+    private static let translationSuffix = ".tr.json"
+    private static let migrationMarker = ".tr-migrated"
+
+    struct Snapshot: Equatable, Sendable {
+        let count: Int
+        let bytes: Int64
+        let entries: [CachedSongSummary]
+    }
 
     let directory: URL
     /// Maximum cached songs (`0` means unlimited).
     let maxEntries: Int
     let audioSyncCache: AudioSyncedLyricsCache?
+
+    private struct TrackIdHeader: Decodable {
+        let trackId: String?
+    }
 
     private struct ScannedDiskEntry {
         let url: URL
@@ -94,11 +106,22 @@ struct LyricsDiskCache: Sendable {
     }
 
     private func fileURL(for trackId: String) -> URL {
-        directory.appendingPathComponent("\(Self.cacheKey(for: trackId)).json")
+        let key = Self.cacheKey(for: trackId)
+        if LyricsTranslator.sourceTrackId(fromCacheKey: trackId) != nil {
+            return directory.appendingPathComponent("\(key)\(Self.translationSuffix)")
+        }
+        return directory.appendingPathComponent("\(key).json")
     }
 
     func fileURL(forCacheKey cacheKey: String) -> URL {
         directory.appendingPathComponent("\(cacheKey).json")
+    }
+
+    private static func readTrackId(at url: URL) -> String? {
+        guard let data = try? Data(contentsOf: url),
+              let header = try? JSONDecoder().decode(TrackIdHeader.self, from: data)
+        else { return nil }
+        return header.trackId
     }
 
     private static func decodeEntry(from data: Data) -> CachedLyricsEntry? {
@@ -112,7 +135,16 @@ struct LyricsDiskCache: Sendable {
     }
 
     func loadEntry(trackId: String) -> CachedLyricsEntry? {
-        let url = fileURL(for: trackId)
+        let primaryURL = fileURL(for: trackId)
+        let url: URL
+        if FileManager.default.fileExists(atPath: primaryURL.path) {
+            url = primaryURL
+        } else if LyricsTranslator.sourceTrackId(fromCacheKey: trackId) != nil {
+            // Fall back to legacy `.json` translation filenames written by older versions.
+            url = fileURL(forCacheKey: Self.cacheKey(for: trackId))
+        } else {
+            return nil
+        }
         guard let data = try? Data(contentsOf: url),
               let entry = Self.decodeEntry(from: data)
         else { return nil }
@@ -177,7 +209,10 @@ struct LyricsDiskCache: Sendable {
 
         var scanned: [ScannedDiskEntry] = []
         for file in files where file.pathExtension == "json" {
-            let key = file.deletingPathExtension().lastPathComponent
+            let fileName = file.lastPathComponent
+            let key = fileName.hasSuffix(Self.translationSuffix)
+                ? String(fileName.dropLast(Self.translationSuffix.count))
+                : file.deletingPathExtension().lastPathComponent
             guard let data = try? Data(contentsOf: file),
                   let entry = Self.decodeEntry(from: data)
             else { continue }
@@ -201,8 +236,11 @@ struct LyricsDiskCache: Sendable {
         return scanned
     }
 
-    func listEntries(audioSyncCache: AudioSyncedLyricsCache = .default) -> [CachedSongSummary] {
-        scanEntries()
+    private static func summaries(
+        from scanned: [ScannedDiskEntry],
+        audioSyncCache: AudioSyncedLyricsCache
+    ) -> [CachedSongSummary] {
+        scanned
             .filter { $0.sourceTrackId == nil }
             .map { item in
                 let entry = item.entry
@@ -228,6 +266,32 @@ struct LyricsDiskCache: Sendable {
             .sorted { $0.modifiedAt > $1.modifiedAt }
     }
 
+    private static func stats(from scanned: [ScannedDiskEntry]) -> (count: Int, bytes: Int64) {
+        var primaryCount = 0
+        var totalBytes: Int64 = 0
+        for item in scanned {
+            if item.sourceTrackId == nil {
+                primaryCount += 1
+            }
+            totalBytes += item.sizeBytes
+        }
+        return (primaryCount, totalBytes)
+    }
+
+    func snapshot(audioSyncCache: AudioSyncedLyricsCache = .default) -> Snapshot {
+        let scanned = scanEntries()
+        let stats = Self.stats(from: scanned)
+        return Snapshot(
+            count: stats.count,
+            bytes: stats.bytes,
+            entries: Self.summaries(from: scanned, audioSyncCache: audioSyncCache)
+        )
+    }
+
+    func listEntries(audioSyncCache: AudioSyncedLyricsCache = .default) -> [CachedSongSummary] {
+        Self.summaries(from: scanEntries(), audioSyncCache: audioSyncCache)
+    }
+
     func clear() {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
@@ -238,54 +302,93 @@ struct LyricsDiskCache: Sendable {
 
     func removeTranslations(forTrackId trackId: String) {
         let fm = FileManager.default
-        for item in scanEntries() where item.sourceTrackId == trackId {
-            try? fm.removeItem(at: item.url)
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return }
+        for file in files where file.pathExtension == "json" {
+            if let key = Self.readTrackId(at: file),
+               LyricsTranslator.sourceTrackId(fromCacheKey: key) == trackId {
+                try? fm.removeItem(at: file)
+            }
         }
     }
 
     func stats() -> (count: Int, bytes: Int64) {
-        var primaryCount = 0
-        var totalBytes: Int64 = 0
-        for item in scanEntries() {
-            if item.sourceTrackId == nil {
-                primaryCount += 1
+        Self.stats(from: scanEntries())
+    }
+
+    /// Renames legacy `.json` translations to `.tr.json` and drops undecodable payloads, once per directory,
+    /// so `prune` can classify files by name alone.
+    private func migrateLegacyFilesIfNeeded() {
+        let fm = FileManager.default
+        let marker = directory.appendingPathComponent(Self.migrationMarker)
+        guard !fm.fileExists(atPath: marker.path),
+              let files = try? fm.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
+        else { return }
+        for file in files where file.pathExtension == "json" && !file.lastPathComponent.hasSuffix(Self.translationSuffix) {
+            guard let data = try? Data(contentsOf: file), let entry = Self.decodeEntry(from: data) else {
+                try? fm.removeItem(at: file)
+                continue
             }
-            totalBytes += item.sizeBytes
+            guard let trackId = entry.trackId, LyricsTranslator.sourceTrackId(fromCacheKey: trackId) != nil else { continue }
+            let target = fileURL(for: trackId)
+            if fm.fileExists(atPath: target.path) {
+                try? fm.removeItem(at: file)
+            } else {
+                try? fm.moveItem(at: file, to: target)
+            }
         }
-        return (primaryCount, totalBytes)
+        fm.createFile(atPath: marker.path, contents: nil)
     }
 
     func prune(to limit: Int) {
         guard limit > 0 else { return }
-        // Skip decoding every file when even counting translations stays within the limit.
-        let fileCount = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
-            .filter { $0.hasSuffix(".json") }.count ?? 0
-        guard fileCount > limit else { return }
-        let entries = scanEntries()
-        var primary: [ScannedDiskEntry] = []
-        var translationsByTrackId: [String: [URL]] = [:]
+        migrateLegacyFilesIfNeeded()
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
 
-        for item in entries {
-            if let sourceTrackId = item.sourceTrackId {
-                translationsByTrackId[sourceTrackId, default: []].append(item.url)
+        var primary: [(url: URL, cacheKey: String, modifiedAt: Date)] = []
+        var translationURLs: [URL] = []
+
+        for file in files where file.pathExtension == "json" {
+            if file.lastPathComponent.hasSuffix(Self.translationSuffix) {
+                translationURLs.append(file)
             } else {
-                primary.append(item)
+                let values = try? file.resourceValues(forKeys: [.contentModificationDateKey])
+                let modifiedAt = values?.contentModificationDate ?? .distantPast
+                let cacheKey = file.deletingPathExtension().lastPathComponent
+                primary.append((url: file, cacheKey: cacheKey, modifiedAt: modifiedAt))
             }
         }
 
         guard primary.count > limit else { return }
-        let sorted = primary.sorted { $0.fileModifiedAt < $1.fileModifiedAt }
+        let sorted = primary.sorted { $0.modifiedAt < $1.modifiedAt }
         let excess = sorted.count - limit
-        let fm = FileManager.default
+        var evictedTrackIds: Set<String> = []
         for item in sorted.prefix(excess) {
+            if !translationURLs.isEmpty, let trackId = Self.readTrackId(at: item.url) {
+                evictedTrackIds.insert(trackId)
+            }
             try? fm.removeItem(at: item.url)
             audioSyncCache?.removeByCacheKey(item.cacheKey)
-            if let trackId = item.entry.trackId {
-                for translationURL in translationsByTrackId[trackId] ?? [] {
+        }
+
+        if !evictedTrackIds.isEmpty {
+            for translationURL in translationURLs {
+                if let key = Self.readTrackId(at: translationURL),
+                   let sourceTrackId = LyricsTranslator.sourceTrackId(fromCacheKey: key),
+                   evictedTrackIds.contains(sourceTrackId) {
                     try? fm.removeItem(at: translationURL)
                 }
             }
         }
+        audioSyncCache?.prune(to: limit)
     }
 }
 

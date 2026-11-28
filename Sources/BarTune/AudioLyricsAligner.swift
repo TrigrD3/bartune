@@ -387,13 +387,30 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
 }
 
 struct AudioSyncedLyricsCache: Sendable {
+    static let defaultMaxEntries = LyricsDiskCache.defaultMaxEntries
+    private static let mtimeTouchThreshold: TimeInterval = 3600
+
     let directory: URL
+    /// Maximum cached audio-sync records (`0` means unlimited).
+    let maxEntries: Int
+
+    private struct EngineHeader: Decodable {
+        let engine: String?
+    }
 
     static var `default`: AudioSyncedLyricsCache {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? FileManager.default.temporaryDirectory
         let dir = base.appendingPathComponent("com.arya.BarTune/audio-sync", isDirectory: true)
-        return AudioSyncedLyricsCache(directory: dir)
+        return AudioSyncedLyricsCache(
+            directory: dir,
+            maxEntries: LyricsDiskCache.configuredMaxEntries()
+        )
+    }
+
+    init(directory: URL, maxEntries: Int = defaultMaxEntries) {
+        self.directory = directory
+        self.maxEntries = max(0, maxEntries)
     }
 
     static func cacheKey(forTrackId trackId: String) -> String {
@@ -405,7 +422,7 @@ struct AudioSyncedLyricsCache: Sendable {
     }
 
     func load(trackId: String) -> AudioSyncedLyricsRecord? {
-        let url = fileURL(for: trackId)
+        var url = fileURL(for: trackId)
         guard let data = try? Data(contentsOf: url) else { return nil }
         // A record that no longer decodes (e.g. from the removed Apple Speech engine) is dropped so the song syncs fresh.
         guard let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: data) else {
@@ -413,16 +430,24 @@ struct AudioSyncedLyricsCache: Sendable {
             return nil
         }
         guard !record.lines.isEmpty else { return nil }
-        try? FileManager.default.setAttributes([.modificationDate: Date()], ofItemAtPath: url.path)
+        let now = Date()
+        url.removeCachedResourceValue(forKey: .contentModificationDateKey)
+        let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+        if now.timeIntervalSince(modifiedAt) >= Self.mtimeTouchThreshold {
+            var values = URLResourceValues()
+            values.contentModificationDate = now
+            try? url.setResourceValues(values)
+        }
         return record
     }
 
-    func save(_ record: AudioSyncedLyricsRecord) {
+    func save(_ record: AudioSyncedLyricsRecord, maxEntriesOverride: Int? = nil) {
         guard !record.lines.isEmpty else { return }
         let fm = FileManager.default
         try? fm.createDirectory(at: directory, withIntermediateDirectories: true)
         guard let data = try? JSONEncoder().encode(record) else { return }
         try? data.write(to: fileURL(for: record.trackId), options: .atomic)
+        prune(to: maxEntriesOverride ?? maxEntries)
     }
 
     func remove(trackId: String) {
@@ -438,12 +463,37 @@ struct AudioSyncedLyricsCache: Sendable {
     }
 
     func syncEngine(forCacheKey cacheKey: String) -> AudioSyncEngine? {
-        let url = directory.appendingPathComponent("\(cacheKey).json")
+        let url = fileURL(forCacheKey: cacheKey)
         guard let data = try? Data(contentsOf: url),
-              let record = try? JSONDecoder().decode(AudioSyncedLyricsRecord.self, from: data),
-              !record.lines.isEmpty
+              let header = try? JSONDecoder().decode(EngineHeader.self, from: data),
+              let rawEngine = header.engine
         else { return nil }
-        return record.engine
+        return AudioSyncEngine(rawValue: rawEngine)
+    }
+
+    func prune(to limit: Int) {
+        guard limit > 0 else { return }
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        let entries = files.filter { $0.pathExtension == "json" }
+        guard entries.count > limit else { return }
+
+        let sorted = entries
+            .map { url -> (url: URL, modifiedAt: Date) in
+                let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate ?? .distantPast
+                return (url: url, modifiedAt: modifiedAt)
+            }
+            .sorted { $0.modifiedAt < $1.modifiedAt }
+
+        let excess = sorted.count - limit
+        for item in sorted.prefix(excess) {
+            try? fm.removeItem(at: item.url)
+        }
     }
 
     func clear() {

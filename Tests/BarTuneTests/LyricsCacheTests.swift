@@ -799,6 +799,109 @@ final class LyricsCacheTests: XCTestCase {
 
         XCTAssertEqual(model.snapshot.cachedSongCount, 2)
     }
+
+    func testSnapshotMatchesStatsAndListEntries() {
+        let lyricsDir = tempDir.appendingPathComponent("lyrics", isDirectory: true)
+        let syncDir = tempDir.appendingPathComponent("sync", isDirectory: true)
+        let syncCache = AudioSyncedLyricsCache(directory: syncDir)
+        let cache = LyricsDiskCache(directory: lyricsDir, maxEntries: 100, audioSyncCache: syncCache)
+
+        let linesA = [LyricLine(id: 0, timestamp: 1.0, text: "First line")]
+        let linesB = [LyricLine(id: 0, timestamp: 2.0, text: "Second line")]
+        cache.save(trackId: "spotify:track:a", lines: linesA, title: "Song A", artist: "Artist A")
+        cache.save(
+            trackId: LyricsTranslator.cacheKey(trackId: "spotify:track:a", targetLanguage: .english, lines: linesA),
+            lines: [LyricLine(id: 0, timestamp: 1.0, text: "First line en")]
+        )
+        cache.save(trackId: "spotify:track:b", lines: linesB, title: "Song B", artist: "Artist B")
+        syncCache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "spotify:track:a",
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0.1,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: linesA
+            )
+        )
+
+        let combined = cache.snapshot(audioSyncCache: syncCache)
+        let stats = cache.stats()
+        let entries = cache.listEntries(audioSyncCache: syncCache)
+
+        XCTAssertEqual(combined.count, stats.count)
+        XCTAssertEqual(combined.bytes, stats.bytes)
+        XCTAssertEqual(combined.entries, entries)
+
+        let offlineSnapshot = OfflineCacheSnapshot.load(lyricsCache: cache, syncCache: syncCache)
+        XCTAssertEqual(offlineSnapshot.cachedSongCount, stats.count)
+        XCTAssertEqual(offlineSnapshot.cachedBytes, stats.bytes)
+        XCTAssertEqual(offlineSnapshot.syncedSongCount, 1)
+        XCTAssertEqual(offlineSnapshot.songs, entries)
+    }
+
+    func testPruneIgnoresTranslations() {
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 2)
+        let lines1 = [LyricLine(id: 0, timestamp: 1.0, text: "One")]
+        let lines2 = [LyricLine(id: 0, timestamp: 2.0, text: "Two")]
+
+        cache.save(trackId: "track-1", lines: lines1, title: "One", artist: "Artist")
+        Thread.sleep(forTimeInterval: 0.02)
+        cache.save(trackId: "track-2", lines: lines2, title: "Two", artist: "Artist")
+
+        // Multiple translation files must not push primary entries over the cap.
+        for language in [TranslationLanguage.english, .japanese, .spanish] {
+            let trKey = LyricsTranslator.cacheKey(trackId: "track-1", targetLanguage: language, lines: lines1)
+            cache.save(trackId: trKey, lines: [LyricLine(id: 0, timestamp: 1.0, text: "Translated \(language.rawValue)")])
+        }
+
+        XCTAssertEqual(cache.stats().count, 2)
+        XCTAssertNotNil(cache.load(trackId: "track-1"))
+        XCTAssertNotNil(cache.load(trackId: "track-2"))
+    }
+
+    func testPruneMigratesLegacyTranslationsAndDropsUnreadablePayloads() throws {
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let cache = LyricsDiskCache(directory: tempDir, maxEntries: 2)
+        let lines1 = [LyricLine(id: 0, timestamp: 1.0, text: "One")]
+        let lines2 = [LyricLine(id: 0, timestamp: 2.0, text: "Two")]
+        let newest = Date().addingTimeInterval(60)
+
+        // Older versions saved translations as `<key>.json`; newest mtimes make them evict songs if counted as songs.
+        var legacyKeys: [String] = []
+        for language in [TranslationLanguage.english, .japanese] {
+            let trKey = LyricsTranslator.cacheKey(trackId: "track-1", targetLanguage: language, lines: lines1)
+            legacyKeys.append(trKey)
+            let entry = CachedLyricsEntry(
+                trackId: trKey,
+                title: nil,
+                artist: nil,
+                cachedAt: Date(),
+                lines: [LyricLine(id: 0, timestamp: 1.0, text: "Translated \(language.rawValue)")]
+            )
+            let url = cache.fileURL(forCacheKey: LyricsDiskCache.cacheKey(for: trKey))
+            try JSONEncoder().encode(entry).write(to: url)
+            try FileManager.default.setAttributes([.modificationDate: newest], ofItemAtPath: url.path)
+        }
+        let corruptURL = cache.fileURL(forCacheKey: "corrupt-entry")
+        try Data("not valid json".utf8).write(to: corruptURL)
+        try FileManager.default.setAttributes([.modificationDate: newest], ofItemAtPath: corruptURL.path)
+
+        cache.save(trackId: "track-1", lines: lines1, title: "One", artist: "Artist")
+        Thread.sleep(forTimeInterval: 0.02)
+        cache.save(trackId: "track-2", lines: lines2, title: "Two", artist: "Artist")
+
+        XCTAssertNotNil(cache.load(trackId: "track-1"), "Legacy translations and corrupt files must not take song slots")
+        XCTAssertNotNil(cache.load(trackId: "track-2"))
+        XCTAssertEqual(cache.stats().count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: corruptURL.path))
+        for trKey in legacyKeys {
+            let legacyURL = cache.fileURL(forCacheKey: LyricsDiskCache.cacheKey(for: trKey))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: legacyURL.path))
+            XCTAssertNotNil(cache.load(trackId: trKey), "Migrated translation should stay loadable")
+        }
+    }
 }
 
 private final class LockedCalls: @unchecked Sendable {
