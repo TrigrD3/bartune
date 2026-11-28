@@ -67,7 +67,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         overlayController = OverlayWindowController(state: state)
         settingsController = SettingsWindowController(
             state: state,
-            cacheRemover: OfflineCacheRemover(fetcher: lyricsFetcher, translator: lyricsTranslator),
+            cacheRemover: OfflineCacheRemover(
+                fetcher: lyricsFetcher,
+                translator: lyricsTranslator,
+                beforeAudioSyncRemoval: { [audioSyncManager] cacheKey in
+                    await audioSyncManager.cancelPendingTailFinalizations(cacheKey: cacheKey)
+                }
+            ),
             appUpdater: appUpdater,
             diagnostics: audioSyncManager.diagnostics,
             onOpenLyricTimingEditor: { [weak self] in
@@ -366,7 +372,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             fetchTask?.cancel()
             translateTask?.cancel()
             colorTask?.cancel()
-            audioSyncManager.stop()
+            audioSyncManager.handleTrackChanged()
             state.audioSyncStatus = .idle
             state.setTrack(track, lyrics: [])
 
@@ -471,7 +477,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch action {
         case let .useDefault(lines), let .useCustom(lines):
             state.setTrack(track, lyrics: lines)
-            stopAudioSync(skippedBy: action)
+            // The previous track's tail finalizer may still be saving, so end only the live session.
+            audioSyncManager.stopLiveSession()
+            state.audioSyncStatus = action.skippedSyncStatus(audioSyncEngine: state.audioSyncEngine) ?? .idle
             state.refreshActiveLineForCurrentPosition()
         case let .useAutomatic(lines):
             state.setTrack(track, lyrics: lines)

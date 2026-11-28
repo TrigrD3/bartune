@@ -320,9 +320,12 @@ struct OfflineCacheRemover: Sendable {
     let translator: LyricsTranslator
     var lyricsCache: LyricsDiskCache = .default
     var syncCache: AudioSyncedLyricsCache = .default
+    /// Runs before audio-sync records are deleted (all when nil) so a pending save cannot restore them.
+    var beforeAudioSyncRemoval: @Sendable (_ cacheKey: String?) async -> Void = { _ in }
 
     func remove(_ song: CachedSongSummary) async {
         lyricsCache.removeByCacheKey(song.cacheKey)
+        await beforeAudioSyncRemoval(song.cacheKey)
         syncCache.removeByCacheKey(song.cacheKey)
         if let trackId = song.trackId {
             lyricsCache.removeTranslations(forTrackId: trackId)
@@ -333,13 +336,15 @@ struct OfflineCacheRemover: Sendable {
 
     func removeAll() async {
         lyricsCache.clear()
+        await beforeAudioSyncRemoval(nil)
         syncCache.clear()
         await fetcher.invalidateMemoryCache(trackId: nil)
         await translator.clearCache()
     }
 
     /// Deletes only audio-sync timings; fetched lyrics and translations stay for offline plays.
-    func removeAllAudioSync() {
+    func removeAllAudioSync() async {
+        await beforeAudioSyncRemoval(nil)
         syncCache.clear()
     }
 }

@@ -146,6 +146,8 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
     let attemptedLineIDs: [Int]?
     /// Lyrics Alignment: how many lines were locked when the play that saved this record began.
     let lockedAtPlayStart: Int?
+    /// Lyrics Alignment: lines newly locked during the play that saved this record.
+    let newlyLockedLineIDs: [Int]?
     let chromaTemplates: [ChorusSelfSimilarity.CachedTemplate]?
 
     init(
@@ -160,6 +162,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         lockedLineIDs: [Int]? = nil,
         attemptedLineIDs: [Int]? = nil,
         lockedAtPlayStart: Int? = nil,
+        newlyLockedLineIDs: [Int]? = nil,
         chromaTemplates: [ChorusSelfSimilarity.CachedTemplate]? = nil
     ) {
         self.trackId = trackId
@@ -173,6 +176,7 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
         self.lockedLineIDs = lockedLineIDs
         self.attemptedLineIDs = attemptedLineIDs
         self.lockedAtPlayStart = lockedAtPlayStart
+        self.newlyLockedLineIDs = newlyLockedLineIDs
         self.chromaTemplates = chromaTemplates
     }
 
@@ -268,16 +272,57 @@ struct AudioSyncedLyricsRecord: Equatable, Codable, Sendable {
             lockedLineIDs: lockedLineIDs?.compactMap { idMap[$0] },
             attemptedLineIDs: attemptedLineIDs?.compactMap { idMap[$0] },
             lockedAtPlayStart: lockedAtPlayStart,
+            newlyLockedLineIDs: newlyLockedLineIDs?.compactMap { idMap[$0] },
             chromaTemplates: chromaTemplates?.compactMap { template in
                 idMap[template.lineId].map { template.remapped(lineId: $0) }
             }
         )
     }
 
-    /// Lyrics Alignment: attempted lines that stay settled because the play that heard them locked nothing new.
+    /// Settlement rule: a newly locked line reopens attempted lines up to this many non-empty lines away on each side.
+    static let lockReopenRadius = 3
+
+    /// Attempted lines that stay settled after a play.
+    /// Reopens every attempted line when the play established the first anchors on the track,
+    /// and otherwise only reopens lines within `lockReopenRadius` non-empty lines of a newly locked line.
+    static func settledLineIDs(
+        attemptedIDs: Set<Int>,
+        newlyLockedIDs: Set<Int>,
+        hadPriorAnchors: Bool,
+        in lines: [LyricLine]
+    ) -> Set<Int> {
+        guard !attemptedIDs.isEmpty else { return [] }
+        guard !newlyLockedIDs.isEmpty else { return attemptedIDs }
+        guard hadPriorAnchors else { return [] }
+        let nonEmptyIDs = lines
+            .filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .map(\.id)
+        guard !nonEmptyIDs.isEmpty else { return [] }
+        var reopened: Set<Int> = []
+        for (index, id) in nonEmptyIDs.enumerated() where newlyLockedIDs.contains(id) {
+            let low = max(0, index - lockReopenRadius)
+            let high = min(nonEmptyIDs.count - 1, index + lockReopenRadius)
+            for neighbor in low...high {
+                reopened.insert(nonEmptyIDs[neighbor])
+            }
+        }
+        return attemptedIDs.subtracting(reopened)
+    }
+
+    /// Lyrics Alignment: attempted lines that stay settled after the play that saved this record.
     var settledLineIDs: Set<Int> {
-        guard let lockedAtPlayStart, lockedAtPlayStart == (lockedLineIDs ?? []).count else { return [] }
-        return Set(attemptedLineIDs ?? [])
+        guard let lockedAtPlayStart else { return [] }
+        let attempted = Set(attemptedLineIDs ?? [])
+        if let newlyLockedLineIDs {
+            return Self.settledLineIDs(
+                attemptedIDs: attempted,
+                newlyLockedIDs: Set(newlyLockedLineIDs),
+                hadPriorAnchors: lockedAtPlayStart > 0,
+                in: lines
+            )
+        }
+        guard lockedAtPlayStart == (lockedLineIDs ?? []).count else { return [] }
+        return attempted
     }
 
     var hasLowYieldLocks: Bool {
@@ -351,10 +396,12 @@ struct AudioSyncedLyricsCache: Sendable {
         return AudioSyncedLyricsCache(directory: dir)
     }
 
+    static func cacheKey(forTrackId trackId: String) -> String {
+        SHA256.hash(data: Data(trackId.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
     private func fileURL(for trackId: String) -> URL {
-        let digest = SHA256.hash(data: Data(trackId.utf8))
-        let hex = digest.map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent("\(hex).json")
+        fileURL(forCacheKey: Self.cacheKey(forTrackId: trackId))
     }
 
     func load(trackId: String) -> AudioSyncedLyricsRecord? {
