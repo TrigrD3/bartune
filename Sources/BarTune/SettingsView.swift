@@ -193,6 +193,12 @@ struct SettingsView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel(
+                    SettingsAccessibility.sidebarVersionLabel(
+                        version: updater.currentVersion.sidebarLabel,
+                        hasAvailableUpdate: updater.hasAvailableUpdate
+                    )
+                )
             }
             .frame(width: 168)
 
@@ -238,11 +244,13 @@ struct SettingsView: View {
                         HStack {
                             Text("Spotlight Width")
                             Spacer()
-                            Text("\(Int(state.spotlightWidth)) pt")
+                            Text(SettingsAccessibility.pointsValue(state.spotlightWidth))
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
                         Slider(value: $state.spotlightWidth, in: 36...180, step: 4)
+                            .accessibilityLabel(SettingsAccessibility.spotlightWidthLabel)
+                            .accessibilityValue(SettingsAccessibility.pointsValue(state.spotlightWidth))
                     }
                 }
             }
@@ -354,22 +362,26 @@ struct SettingsView: View {
                     HStack {
                         Text("Background Opacity")
                         Spacer()
-                        Text("\(Int(state.backgroundOpacity * 100))%")
+                        Text(SettingsAccessibility.percentageValue(state.backgroundOpacity))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $state.backgroundOpacity, in: 0.70...1.0, step: 0.02)
+                        .accessibilityLabel(SettingsAccessibility.backgroundOpacityLabel)
+                        .accessibilityValue(SettingsAccessibility.percentageValue(state.backgroundOpacity))
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Bar Corner Radius")
                         Spacer()
-                        Text("\(Int(state.barCornerRadius)) pt")
+                        Text(SettingsAccessibility.pointsValue(state.barCornerRadius))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $state.barCornerRadius, in: 0...12, step: 1)
+                        .accessibilityLabel(SettingsAccessibility.barCornerRadiusLabel)
+                        .accessibilityValue(SettingsAccessibility.pointsValue(state.barCornerRadius))
                 }
             }
 
@@ -391,11 +403,13 @@ struct SettingsView: View {
                     HStack {
                         Text("Font Size")
                         Spacer()
-                        Text(String(format: "%.1f pt", state.fontSize))
+                        Text(SettingsAccessibility.decimalPointsValue(state.fontSize))
                             .monospacedDigit()
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $state.fontSize, in: 11...15, step: 0.5)
+                        .accessibilityLabel(SettingsAccessibility.fontSizeLabel)
+                        .accessibilityValue(SettingsAccessibility.decimalPointsValue(state.fontSize))
                 }
 
                 Toggle("Karaoke Sweep Highlight", isOn: $state.karaokeAnimationEnabled)
@@ -418,11 +432,13 @@ struct SettingsView: View {
                         HStack {
                             Text("Speed")
                             Spacer()
-                            Text(String(format: "%.2f s", state.lineTransitionDuration))
+                            Text(SettingsAccessibility.secondsValue(state.lineTransitionDuration))
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
                         Slider(value: $state.lineTransitionDuration, in: LyricsState.lineTransitionDurationRange, step: 0.05)
+                            .accessibilityLabel(SettingsAccessibility.lineTransitionSpeedLabel)
+                            .accessibilityValue(SettingsAccessibility.secondsValue(state.lineTransitionDuration))
                     }
                     Toggle("Start Early", isOn: $state.lineTransitionStartsEarly)
                         .help("Show the next line one transition early, so it is in place when the singing starts.")
@@ -465,11 +481,13 @@ struct SettingsView: View {
                         HStack {
                             Text("Visualizer Width")
                             Spacer()
-                            Text("\(Int(state.visualizerWidth)) pt")
+                            Text(SettingsAccessibility.pointsValue(state.visualizerWidth))
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
                         Slider(value: $state.visualizerWidth, in: 12...44, step: 2)
+                            .accessibilityLabel(SettingsAccessibility.visualizerWidthLabel)
+                            .accessibilityValue(SettingsAccessibility.pointsValue(state.visualizerWidth))
                     }
                 }
 
@@ -629,12 +647,13 @@ struct SettingsView: View {
                 HStack {
                     Text("Timing Offset")
                     Spacer()
-                    let sign = state.offsetSeconds > 0 ? "+" : ""
-                    Text(String(format: "%@%.2fs", sign, state.offsetSeconds))
+                    Text(SettingsAccessibility.timingOffsetValue(state.offsetSeconds))
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                     Stepper("", value: $state.offsetSeconds, in: -5.0...5.0, step: 0.05)
                         .labelsHidden()
+                        .accessibilityLabel(SettingsAccessibility.timingOffsetLabel)
+                        .accessibilityValue(SettingsAccessibility.timingOffsetValue(state.offsetSeconds))
                     Button("Reset") {
                         state.offsetSeconds = 0.0
                     }
@@ -855,6 +874,7 @@ struct SettingsView: View {
                                     }
                                     .buttonStyle(.borderless)
                                     .help("Inspect cached file & lyrics")
+                                    .accessibilityLabel(SettingsAccessibility.inspectCachedSongLabel(title: song.title))
 
                                     Button {
                                         revealCachedSongInFinder(song)
@@ -864,6 +884,7 @@ struct SettingsView: View {
                                     }
                                     .buttonStyle(.borderless)
                                     .help("Reveal file in Finder")
+                                    .accessibilityLabel(SettingsAccessibility.revealCachedSongLabel(title: song.title))
 
                                     Button(role: .destructive) {
                                         songPendingDeletion = song
@@ -873,6 +894,7 @@ struct SettingsView: View {
                                     }
                                     .buttonStyle(.borderless)
                                     .help("Remove from cache")
+                                    .accessibilityLabel(SettingsAccessibility.deleteCachedSongLabel(title: song.title))
                                 }
                                 .padding(.vertical, 2)
                                 Divider()
@@ -1946,5 +1968,60 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         window?.contentViewController = nil
         window = nil
+    }
+}
+
+/// Pure VoiceOver label and value formatters for Settings controls so SwiftUI views and unit tests share one source of truth.
+enum SettingsAccessibility {
+    static let updateAvailableLabel = "Update available"
+    static let spotlightWidthLabel = "Spotlight Width"
+    static let backgroundOpacityLabel = "Background Opacity"
+    static let barCornerRadiusLabel = "Bar Corner Radius"
+    static let fontSizeLabel = "Font Size"
+    static let lineTransitionSpeedLabel = "Line Transition Speed"
+    static let visualizerWidthLabel = "Visualizer Width"
+    static let timingOffsetLabel = "Timing Offset"
+
+    static func sidebarVersionLabel(version: String, hasAvailableUpdate: Bool) -> String {
+        hasAvailableUpdate ? "\(version), \(updateAvailableLabel)" : version
+    }
+
+    static func pointsValue(_ value: Double) -> String {
+        "\(Int(value.rounded())) pt"
+    }
+
+    static func decimalPointsValue(_ value: Double) -> String {
+        String(format: "%.1f pt", value)
+    }
+
+    static func percentageValue(_ fraction: Double) -> String {
+        "\(Int((fraction * 100).rounded()))%"
+    }
+
+    static func secondsValue(_ seconds: Double) -> String {
+        String(format: "%.2f s", seconds)
+    }
+
+    static func timingOffsetValue(_ seconds: Double) -> String {
+        let normalized = abs(seconds) < 0.005 ? 0.0 : seconds
+        let sign = normalized > 0 ? "+" : ""
+        return String(format: "%@%.2fs", sign, normalized)
+    }
+
+    static func inspectCachedSongLabel(title: String) -> String {
+        normalizedTitle(title).map { "Inspect lyrics for \($0)" } ?? "Inspect cached lyrics"
+    }
+
+    static func revealCachedSongLabel(title: String) -> String {
+        normalizedTitle(title).map { "Reveal \($0) in Finder" } ?? "Reveal cached file in Finder"
+    }
+
+    static func deleteCachedSongLabel(title: String) -> String {
+        normalizedTitle(title).map { "Delete cached lyrics for \($0)" } ?? "Delete cached lyrics"
+    }
+
+    private static func normalizedTitle(_ title: String) -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
