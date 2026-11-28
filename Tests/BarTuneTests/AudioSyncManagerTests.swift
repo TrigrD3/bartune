@@ -4522,6 +4522,233 @@ final class AudioSyncManagerTests: XCTestCase {
         )
     }
 
+    func testNearlyConfidentLineLocksByLrcOffsetAgreement() {
+        let flatEnvelope = VocalEnvelope()
+        func line(id: Int = 3, start: Double) -> LyricLine {
+            LyricLine(
+                id: id,
+                timestamp: start,
+                duration: 1.5,
+                text: "Hello world",
+                words: [
+                    WordTimestamp(timestamp: start, duration: 0.7, text: "Hello "),
+                    WordTimestamp(timestamp: start + 0.7, duration: 0.8, text: "world"),
+                ]
+            )
+        }
+
+        let sourceStart = 20.0
+        let twoNeighbors = (offset: 0.75, neighborCount: 2)
+        let oneNeighbor = (offset: 0.75, neighborCount: 1)
+
+        // Exact agreement (20.75) and within 0.30 s (20.50, 21.00) lock with >= 2 locked neighbours.
+        XCTAssertTrue(
+            AudioSyncManager.locks(
+                line(start: 20.75), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "nearly-confident line matching offset-corrected LRC timestamp should lock"
+        )
+        XCTAssertTrue(
+            AudioSyncManager.locks(
+                line(start: 21.00), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "nearly-confident line within 0.30 s should lock"
+        )
+        XCTAssertTrue(
+            AudioSyncManager.locks(
+                line(start: 20.50), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "nearly-confident line within -0.30 s should lock"
+        )
+
+        // Fewer than 2 locked neighbours must not lock via timestamp agreement.
+        XCTAssertFalse(
+            AudioSyncManager.locks(
+                line(start: 20.75), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: oneNeighbor
+            ),
+            "fewer than 2 locked neighbours must not lock via timestamp agreement"
+        )
+
+        // Deviation > 0.30 s must not lock via timestamp agreement.
+        XCTAssertFalse(
+            AudioSyncManager.locks(
+                line(start: 21.06), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "deviation > 0.30 s late must not lock via timestamp agreement"
+        )
+        XCTAssertFalse(
+            AudioSyncManager.locks(
+                line(start: 20.44), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "deviation > 0.30 s early must not lock via timestamp agreement"
+        )
+
+        // Hard harmonicity veto still prevents locking when the onset is clearly unvoiced.
+        var unvoicedPitch = VocalPitchContour()
+        unvoicedPitch.merge(.init(
+            start: 20.0,
+            step: 0.01,
+            f0Hz: [Float](repeating: 0, count: 150),
+            harmonicity: [Float](repeating: 0.1, count: 150)
+        ))
+        XCTAssertFalse(
+            AudioSyncManager.locks(
+                line(start: 20.75), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                pitchContour: unvoicedPitch, sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "hard harmonicity veto must override LRC timestamp agreement"
+        )
+
+        // Steady voiced singing (no harmonicity rise, no envelope rise) still locks via LRC agreement.
+        var steadyVoicedPitch = VocalPitchContour()
+        steadyVoicedPitch.merge(.init(
+            start: 20.0,
+            step: 0.01,
+            f0Hz: [Float](repeating: 440, count: 150),
+            harmonicity: [Float](repeating: 0.85, count: 150)
+        ))
+        XCTAssertTrue(
+            AudioSyncManager.locks(
+                line(start: 20.75), confident: [], nearlyConfident: [3], envelope: flatEnvelope,
+                pitchContour: steadyVoicedPitch, sourceTimestamp: sourceStart, localOffset: twoNeighbors
+            ),
+            "steady voiced singing matching offset-corrected LRC timestamp should lock"
+        )
+    }
+
+    func testNewlyLockedLinesRequiresTwoLockedNeighborsForLrcAgreement() {
+        let baseLines = [
+            LyricLine(id: 0, timestamp: 10.0, text: "Alpha beta"),
+            LyricLine(id: 1, timestamp: 15.0, text: "Gamma delta"),
+            LyricLine(id: 2, timestamp: 20.0, text: "Epsilon zeta"),
+            LyricLine(id: 3, timestamp: 25.0, text: "Eta theta"),
+        ]
+        func aligned(id: Int, start: Double, text: String) -> LyricLine {
+            let parts = text.split(separator: " ")
+            return LyricLine(
+                id: id,
+                timestamp: start,
+                duration: 1.0,
+                text: text,
+                words: [
+                    WordTimestamp(timestamp: start, duration: 0.4, text: "\(parts[0]) "),
+                    WordTimestamp(timestamp: start + 0.5, duration: 0.5, text: String(parts[1])),
+                ]
+            )
+        }
+        let flatEnvelope = VocalEnvelope()
+
+        // Line 0 is nearly confident (before confident lines 1 and 2); line 3 is > 0.30 s away from 25.75.
+        let candidates = [
+            aligned(id: 0, start: 10.70, text: "Alpha beta"),
+            aligned(id: 1, start: 15.70, text: "Gamma delta"),
+            aligned(id: 2, start: 20.80, text: "Epsilon zeta"),
+            aligned(id: 3, start: 26.10, text: "Eta theta"),
+        ]
+        let locked = AudioSyncManager.newlyLockedLines(
+            in: candidates,
+            eligibleIDs: [0, 1, 2, 3],
+            context: AudioSyncManager.LockContext(
+                baseLines: baseLines,
+                existingLocked: [:],
+                confident: [1, 2],
+                nearlyConfident: [0, 3],
+                envelope: flatEnvelope
+            )
+        )
+        XCTAssertEqual(Set(locked.keys), [0, 1, 2])
+
+        // Only 1 confident neighbour (line 1) is not enough for nearlyConfident line 0.
+        let withOneNeighbor = AudioSyncManager.newlyLockedLines(
+            in: Array(candidates.prefix(2)),
+            eligibleIDs: [0, 1],
+            context: AudioSyncManager.LockContext(
+                baseLines: baseLines,
+                existingLocked: [:],
+                confident: [1],
+                nearlyConfident: [0],
+                envelope: flatEnvelope
+            )
+        )
+        XCTAssertEqual(Set(withOneNeighbor.keys), [1])
+    }
+
+    func testNewlyLockedLinesDoNotChainLrcAgreementLocks() {
+        let baseLines = (0..<5).map { LyricLine(id: $0, timestamp: Double($0) * 5, text: "Alpha beta") }
+        func aligned(id: Int, offset: Double) -> LyricLine {
+            let start = Double(id) * 5 + offset
+            return LyricLine(
+                id: id,
+                timestamp: start,
+                duration: 1.0,
+                text: "Alpha beta",
+                words: [
+                    WordTimestamp(timestamp: start, duration: 0.4, text: "Alpha "),
+                    WordTimestamp(timestamp: start + 0.5, duration: 0.5, text: "beta"),
+                ]
+            )
+        }
+        // Locked lines 0 (+0.2 s) and 4 (+1.2 s) put the local offset at +0.7 s for lines 1–3. Line 1 agrees;
+        // lines 2 and 3 agree only with an estimate that counts line 1's (and then line 2's) agreement lock.
+        let locked = AudioSyncManager.newlyLockedLines(
+            in: [aligned(id: 1, offset: 0.9), aligned(id: 2, offset: 1.15), aligned(id: 3, offset: 1.35)],
+            eligibleIDs: [1, 2, 3],
+            context: AudioSyncManager.LockContext(
+                baseLines: baseLines,
+                existingLocked: [0: aligned(id: 0, offset: 0.2), 4: aligned(id: 4, offset: 1.2)],
+                confident: [],
+                nearlyConfident: [1, 2, 3],
+                envelope: VocalEnvelope()
+            )
+        )
+        XCTAssertEqual(Set(locked.keys), [1])
+    }
+
+    @MainActor
+    func testLyricsAlignmentLocksNearlyConfidentLineViaLrcAgreementWithTwoLockedNeighbors() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        state.isPlaying = false
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let words = [
+            RecognizedAudioWord(text: "Alpha", startTime: 10.7, duration: 0.3, confidence: 0.5),
+            RecognizedAudioWord(text: "beta", startTime: 11.1, duration: 0.3, confidence: 0.5),
+            RecognizedAudioWord(text: "Gamma", startTime: 15.7, duration: 0.3, confidence: 0.5),
+            RecognizedAudioWord(text: "delta", startTime: 16.1, duration: 0.3, confidence: 0.5),
+            RecognizedAudioWord(text: "Epsilon", startTime: 20.8, duration: 0.3, confidence: 0.1),
+            RecognizedAudioWord(text: "zeta", startTime: 21.2, duration: 0.3, confidence: 0.1),
+        ]
+        let fakeCapture = FakeAudioCapture()
+        var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(confident: [0, 1], nearlyConfident: [2]) { _ in words }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        let started = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount > 0 }
+        XCTAssertTrue(started)
+
+        // Emit steady audio with no vocal onset rise at 20.8 s.
+        let rate = 16000
+        let steady = (0..<(12 * rate)).map { index in Float(0.25) * sin(2 * Float.pi * 440 * Float(index) / Float(rate)) }
+        for second in 0..<12 {
+            fakeCapture.emit(samples: Array(steady[(second * rate)..<((second + 1) * rate)]), sampleRate: Double(rate))
+        }
+        let locked = await waitUntil(timeout: 5) {
+            cache.load(trackId: self.sampleTrack().id)?.lockedLineIDs?.sorted() == [0, 1, 2]
+        }
+        XCTAssertTrue(locked, "nearly-confident line 2 should lock via local LRC offset agreement with lines 0 and 1")
+    }
+
     @MainActor
     func testReplayPassesPriorUnlockedLinesToAligner() async {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
