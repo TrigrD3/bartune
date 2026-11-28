@@ -611,11 +611,14 @@ final class AudioSyncManagerTests: XCTestCase {
     private func nearlyConfidentLineResult(
         soundStart: Double,
         percussive: Bool = false,
+        breathy: Bool = false,
         wideTone: Bool = false,
-        tailNoiseStart: Double? = nil
+        tailNoiseStart: Double? = nil,
+        isolateVocals: Bool = false
     ) async throws -> (locks: [Int], voicedPercent: Float?, pitchFrames: Int, onsetRise: Float?, trimmed: Int, lastWordEnd: Double?, report: String) {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = isolateVocals
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         state.isPlaying = false
@@ -625,6 +628,9 @@ final class AudioSyncManagerTests: XCTestCase {
         }
         let fakeCapture = FakeAudioCapture()
         var deps = makeDependencies(capture: fakeCapture, chunkDurationSeconds: 7.0)
+        if isolateVocals {
+            deps.launchVocalSeparator = { RightChannelVocalSeparator() }
+        }
         deps.launchLyricsAligner = { _, _ in
             FakeChunkEngine(confident: [], nearlyConfident: [1]) { _ in
                 XCTAssertFalse(Thread.isMainThread)
@@ -642,17 +648,26 @@ final class AudioSyncManagerTests: XCTestCase {
         let audio = (0..<(7 * rate)).map { index -> Float in
             let time = 10.0 + Double(index) / Double(rate)
             let amplitude: Float = time >= soundStart ? 0.5 : 0.005
-            if percussive || (tailNoiseStart.map { time >= $0 } ?? false) {
+            let tone = amplitude * sin(2 * Float.pi * 440 * Float(index) / Float(rate))
+            if percussive || breathy || (tailNoiseStart.map { time >= $0 } ?? false) {
                 noiseState = noiseState &* 1_664_525 &+ 1_013_904_223
-                return amplitude * (Float(noiseState >> 8) / Float(1 << 23) - 1)
+                let noise = amplitude * (Float(noiseState >> 8) / Float(1 << 23) - 1)
+                return breathy ? 0.2 * tone + 0.8 * noise : noise
             }
-            return amplitude * sin(2 * Float.pi * 440 * Float(index) / Float(rate))
+            return tone
         }
         for second in 0..<7 {
             let samples = Array(audio[(second * rate)..<((second + 1) * rate)])
-            fakeCapture.emit(samples: samples, sampleRate: Double(rate), side: wideTone ? samples : [])
+            let side: [Float] = if wideTone {
+                samples
+            } else if isolateVocals {
+                [Float](repeating: 0, count: samples.count)
+            } else {
+                []
+            }
+            fakeCapture.emit(samples: samples, sampleRate: Double(rate), side: side)
         }
-        let processed = await waitUntil(timeout: 5) {
+        let processed = await waitForVocalIsolationChunk {
             cache.load(trackId: self.sampleTrack().id) != nil && manager.diagnostics.snapshot?.voicedFramePercent != nil
         }
         XCTAssertTrue(processed)
@@ -691,6 +706,22 @@ final class AudioSyncManagerTests: XCTestCase {
     }
 
     @MainActor
+    func testFullMixBreathyOnsetLocksNearlyConfidentLine() async throws {
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7, breathy: true)
+        XCTAssertGreaterThan(result.onsetRise ?? 0, AudioSyncManager.onsetLockRise)
+        XCTAssertEqual(try XCTUnwrap(result.voicedPercent), 0, accuracy: 0.001)
+        XCTAssertEqual(result.locks, [1])
+    }
+
+    @MainActor
+    func testSeparatedVocalsBreathyOnsetDoesNotLockNearlyConfidentLine() async throws {
+        let result = try await nearlyConfidentLineResult(soundStart: 15.7, breathy: true, isolateVocals: true)
+        XCTAssertGreaterThan(result.onsetRise ?? 0, AudioSyncManager.onsetLockRise)
+        XCTAssertGreaterThan(result.pitchFrames, 0)
+        XCTAssertEqual(result.locks, [])
+    }
+
+    @MainActor
     func testBackgroundPitchSuppressesWideStereoTone() async throws {
         let result = try await nearlyConfidentLineResult(soundStart: 15.7, wideTone: true)
         XCTAssertGreaterThan(result.onsetRise ?? 0, AudioSyncManager.onsetLockRise)
@@ -723,8 +754,20 @@ final class AudioSyncManagerTests: XCTestCase {
             WordTimestamp(timestamp: 1, duration: 0.35, text: "Gamma "),
             WordTimestamp(timestamp: 1.4, duration: 0.4, text: "delta"),
         ])
+        var fullMixPitch = VocalPitchContour()
+        fullMixPitch.merge(.init(start: 0, step: 0.01, f0Hz: [Float](repeating: 0, count: 200), harmonicity: [Float](repeating: 0.1, count: 200)))
+        XCTAssertTrue(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: envelope, pitchContour: fullMixPitch))
+        fullMixPitch = VocalPitchContour()
+        fullMixPitch.merge(.init(start: 0, step: 0.01, f0Hz: [Float](repeating: 0, count: 200), harmonicity: [Float](repeating: 0.01, count: 200)))
+        XCTAssertFalse(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: envelope, pitchContour: fullMixPitch))
+
         var pitch = VocalPitchContour()
-        pitch.merge(.init(start: 0, step: 0.01, f0Hz: [Float](repeating: 0, count: 200), harmonicity: [Float](repeating: 0.1, count: 200)))
+        pitch.merge(.init(
+            start: 0, step: 0.01,
+            f0Hz: [Float](repeating: 0, count: 200),
+            harmonicity: [Float](repeating: 0.1, count: 200),
+            fromSeparatedVocals: true
+        ))
         XCTAssertFalse(AudioSyncManager.locks(line, confident: [], nearlyConfident: [1], envelope: envelope, pitchContour: pitch))
 
         XCTAssertTrue(AudioSyncManager.locks(line, confident: [1], nearlyConfident: [], envelope: envelope, pitchContour: pitch))

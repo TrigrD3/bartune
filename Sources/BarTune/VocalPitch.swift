@@ -8,6 +8,16 @@ struct VocalPitchContour: Sendable {
         let step: Double
         var f0Hz: [Float]
         var harmonicity: [Float]
+        /// Per frame: whether it came from separated vocals rather than the full mix.
+        var separatedVocals: [Bool]
+
+        init(start: Double, step: Double, f0Hz: [Float], harmonicity: [Float], fromSeparatedVocals: Bool = false) {
+            self.start = start
+            self.step = step
+            self.f0Hz = f0Hz
+            self.harmonicity = harmonicity
+            separatedVocals = [Bool](repeating: fromSeparatedVocals, count: harmonicity.count)
+        }
 
         var end: Double { start + Double(harmonicity.count) * step }
 
@@ -16,9 +26,13 @@ struct VocalPitchContour: Sendable {
         }
 
         func frames(from start: Double, to end: Double) -> ArraySlice<Float> {
+            harmonicity[frameRange(from: start, to: end)]
+        }
+
+        func frameRange(from start: Double, to end: Double) -> ClosedRange<Int> {
             let low = max(0, min(frame(at: start), harmonicity.count - 1))
             let high = max(low, min(frame(at: end), harmonicity.count - 1))
-            return harmonicity[low...high]
+            return low...high
         }
     }
 
@@ -26,6 +40,8 @@ struct VocalPitchContour: Sendable {
     static let maxFrames = 120_000
     static let voicedThreshold: Float = 0.7
     static let unvoicedFloor: Float = 0.25
+    /// Breathy vocals under instruments stay above this on the full mix; noise and side-panned tones stay near zero.
+    static let fullMixUnvoicedFloor: Float = 0.05
 
     private(set) var segments: [Segment] = []
     private var frameCount = 0
@@ -43,6 +59,7 @@ struct VocalPitchContour: Sendable {
            abs(segments[last].end - segment.start) <= 0.05 {
             segments[last].f0Hz.append(contentsOf: segment.f0Hz)
             segments[last].harmonicity.append(contentsOf: segment.harmonicity)
+            segments[last].separatedVocals.append(contentsOf: segment.separatedVocals)
         } else {
             segments.append(segment)
         }
@@ -57,6 +74,7 @@ struct VocalPitchContour: Sendable {
             } else {
                 segments[0].f0Hz.removeFirst(excess)
                 segments[0].harmonicity.removeFirst(excess)
+                segments[0].separatedVocals.removeFirst(excess)
                 segments[0].start += Double(excess) * segments[0].step
             }
         }
@@ -68,6 +86,11 @@ struct VocalPitchContour: Sendable {
 
     func segment(covering range: ClosedRange<Double>) -> Segment? {
         segments.last { $0.start <= range.lowerBound + 1e-8 && range.upperBound <= $0.end + 1e-8 }
+    }
+
+    func isSeparatedVocals(from start: Double, to end: Double) -> Bool {
+        guard start <= end, let segment = segment(covering: start...end) else { return false }
+        return segment.separatedVocals[segment.frameRange(from: start, to: end)].allSatisfy { $0 }
     }
 
     func meanHarmonicity(from start: Double, to end: Double) -> Float? {
@@ -91,7 +114,13 @@ struct VocalPitchContour: Sendable {
     }
 
     /// Estimates F0 on 16 kHz samples. All spectra and lag buffers are reused for the entire chunk.
-    static func analyze(mid: [Float], side: [Float] = [], start: Double, rate: Double) -> Segment? {
+    static func analyze(
+        mid: [Float],
+        side: [Float] = [],
+        start: Double,
+        rate: Double,
+        fromSeparatedVocals: Bool = false
+    ) -> Segment? {
         let hop = 160
         let count = mid.count / hop
         guard mid.count >= YIN.windowSize,
@@ -104,6 +133,7 @@ struct VocalPitchContour: Sendable {
         var segment = Segment(start: start, step: Double(hop) / Double(sampleRate) * rate, f0Hz: [], harmonicity: [])
         segment.f0Hz.reserveCapacity(count)
         segment.harmonicity.reserveCapacity(count)
+        segment.separatedVocals = [Bool](repeating: fromSeparatedVocals, count: count)
 
         signal.withUnsafeBufferPointer { buffer in
             // Two split-complex spectra and the cumulative mean normalized differences.

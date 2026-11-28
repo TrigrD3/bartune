@@ -1694,15 +1694,12 @@ final class AudioSyncManager {
                 }
             }
             guard !Task.isCancelled else { return nil }
-            let pitch: VocalPitchContour.Segment? = if audio.vocalSeparationSeconds != nil, audio.sampleRate == VocalPitchContour.sampleRate {
-                VocalPitchContour.analyze(mid: audio.samples, side: [], start: chunkStart, rate: requestPlaybackRate)
-            } else if Int(sampleRate) == VocalPitchContour.sampleRate {
-                VocalPitchContour.analyze(mid: rawChunk, side: sideChunk, start: chunkStart, rate: requestPlaybackRate)
-            } else if audio.sampleRate == VocalPitchContour.sampleRate {
-                VocalPitchContour.analyze(mid: audio.samples, side: [], start: chunkStart, rate: requestPlaybackRate)
-            } else {
-                nil
-            }
+            let pitch = Self.analyzePitch(
+                raw: (rawChunk, sideChunk, sampleRate),
+                recognitionAudio: audio,
+                start: chunkStart,
+                rate: requestPlaybackRate
+            )
             guard !Task.isCancelled else { return nil }
             var chroma = AudioChromaProfile()
             for index in spans.indices {
@@ -1811,6 +1808,27 @@ final class AudioSyncManager {
         guard sampleRate > target else { return (mid, Int(sampleRate), nil) }
         guard let samples = resample(mid, sampleRate, target), !samples.isEmpty else { return nil }
         return (samples, Int(target), nil)
+    }
+
+    private nonisolated static func analyzePitch(
+        raw: (mid: [Float], side: [Float], sampleRate: Double),
+        recognitionAudio: (samples: [Float], sampleRate: Int, vocalSeparationSeconds: Double?),
+        start: Double,
+        rate: Double
+    ) -> VocalPitchContour.Segment? {
+        if recognitionAudio.vocalSeparationSeconds != nil,
+           recognitionAudio.sampleRate == VocalPitchContour.sampleRate {
+            return VocalPitchContour.analyze(
+                mid: recognitionAudio.samples, side: [], start: start, rate: rate, fromSeparatedVocals: true
+            )
+        }
+        if Int(raw.sampleRate) == VocalPitchContour.sampleRate {
+            return VocalPitchContour.analyze(mid: raw.mid, side: raw.side, start: start, rate: rate)
+        }
+        if recognitionAudio.sampleRate == VocalPitchContour.sampleRate {
+            return VocalPitchContour.analyze(mid: recognitionAudio.samples, side: [], start: start, rate: rate)
+        }
+        return nil
     }
 
     /// Track position at `capturedAt`, given the position `now` and the rate the track is playing at (0 when paused).
@@ -2296,7 +2314,10 @@ final class AudioSyncManager {
         }
         let onsetEnd = first.start + 0.25
         if let pitchContour, let clarity = pitchContour.meanHarmonicity(from: first.start, to: onsetEnd) {
-            if clarity < VocalPitchContour.unvoicedFloor,
+            // Breathy vocals masked by instruments keep full-mix harmonicity low, so the full mix vetoes only near-zero clarity.
+            let floor = pitchContour.isSeparatedVocals(from: first.start, to: onsetEnd)
+                ? VocalPitchContour.unvoicedFloor : VocalPitchContour.fullMixUnvoicedFloor
+            if clarity < floor,
                let peak = pitchContour.maxHarmonicity(from: first.start, to: onsetEnd),
                peak < VocalPitchContour.voicedThreshold {
                 return false
@@ -2547,16 +2568,12 @@ final class AudioSyncManager {
                 ) else { break }
                 guard !Task.isCancelled else { return }
 
-                let pitch: VocalPitchContour.Segment? = if audio.vocalSeparationSeconds != nil,
-                    audio.sampleRate == VocalPitchContour.sampleRate {
-                    VocalPitchContour.analyze(mid: audio.samples, side: [], start: piece.startTime, rate: playbackRate)
-                } else if Int(sampleRate) == VocalPitchContour.sampleRate {
-                    VocalPitchContour.analyze(mid: segMid, side: segSide, start: piece.startTime, rate: playbackRate)
-                } else if audio.sampleRate == VocalPitchContour.sampleRate {
-                    VocalPitchContour.analyze(mid: audio.samples, side: [], start: piece.startTime, rate: playbackRate)
-                } else {
-                    nil
-                }
+                let pitch = Self.analyzePitch(
+                    raw: (segMid, segSide, sampleRate),
+                    recognitionAudio: audio,
+                    start: piece.startTime,
+                    rate: playbackRate
+                )
                 if let pitch {
                     vocalPitchContour.merge(pitch)
                 }

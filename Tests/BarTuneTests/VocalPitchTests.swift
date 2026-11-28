@@ -36,6 +36,7 @@ final class VocalPitchTests: XCTestCase {
         contour.merge(segment(start: 8, count: 50, clarity: 0))
         let merged = try XCTUnwrap(contour.segment(covering: 5.4...5.7))
         XCTAssertEqual(merged.harmonicity.count, 100)
+        XCTAssertFalse(contour.isSeparatedVocals(from: 5.4, to: 5.7))
         XCTAssertNil(contour.segment(covering: 5.9...8.1))
         XCTAssertNil(contour.harmonicityRise(at: 8.1))
         XCTAssertEqual(try XCTUnwrap(contour.harmonicityRise(at: 5.5)), 0.9, accuracy: 0.001)
@@ -45,6 +46,16 @@ final class VocalPitchTests: XCTestCase {
 
         contour.merge(segment(start: 5.5, count: 50, clarity: 0))
         XCTAssertEqual(contour.maxHarmonicity(from: 5.6, to: 5.8), 0)
+
+        var mixed = VocalPitchContour()
+        mixed.merge(segment(start: 0, count: 50, clarity: 0.1, fromSeparatedVocals: false))
+        mixed.merge(segment(start: 0.5, count: 50, clarity: 0.1, fromSeparatedVocals: true))
+        XCTAssertEqual(mixed.segments.count, 1)
+        XCTAssertFalse(mixed.isSeparatedVocals(from: 0.1, to: 0.3))
+        XCTAssertTrue(mixed.isSeparatedVocals(from: 0.6, to: 0.8))
+        // A window straddling a fallback chunk boundary is still evaluated, as full mix.
+        XCTAssertFalse(mixed.isSeparatedVocals(from: 0.4, to: 0.6))
+        XCTAssertEqual(try XCTUnwrap(mixed.meanHarmonicity(from: 0.4, to: 0.6)), 0.1, accuracy: 0.001)
     }
 
     func testCapacityDropsOnlyOldestFrames() throws {
@@ -123,12 +134,13 @@ final class VocalPitchTests: XCTestCase {
         XCTAssertEqual(result.stats.dropped, 1)
     }
 
-    private func segment(start: Double, count: Int, clarity: Float) -> VocalPitchContour.Segment {
+    private func segment(start: Double, count: Int, clarity: Float, fromSeparatedVocals: Bool = false) -> VocalPitchContour.Segment {
         VocalPitchContour.Segment(
             start: start,
             step: 0.01,
             f0Hz: [Float](repeating: clarity > 0 ? 220 : 0, count: count),
-            harmonicity: [Float](repeating: clarity, count: count)
+            harmonicity: [Float](repeating: clarity, count: count),
+            fromSeparatedVocals: fromSeparatedVocals
         )
     }
 
