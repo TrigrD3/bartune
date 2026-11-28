@@ -2,11 +2,30 @@ import CryptoKit
 import Foundation
 
 struct CachedLyricsEntry: Codable, Equatable, Sendable {
+    static let currentCacheVersion = 1
+
     let trackId: String?
     let title: String?
     let artist: String?
     let cachedAt: Date?
+    let cacheVersion: Int?
     let lines: [LyricLine]
+
+    init(
+        trackId: String?,
+        title: String?,
+        artist: String?,
+        cachedAt: Date?,
+        cacheVersion: Int? = nil,
+        lines: [LyricLine]
+    ) {
+        self.trackId = trackId
+        self.title = title
+        self.artist = artist
+        self.cachedAt = cachedAt
+        self.cacheVersion = cacheVersion
+        self.lines = lines
+    }
 }
 
 struct CachedSongSummary: Identifiable, Equatable, Sendable {
@@ -110,6 +129,7 @@ struct LyricsDiskCache: Sendable {
         lines: [LyricLine],
         title: String? = nil,
         artist: String? = nil,
+        cacheVersion: Int? = CachedLyricsEntry.currentCacheVersion,
         maxEntriesOverride: Int? = nil
     ) {
         guard !lines.isEmpty else { return }
@@ -120,6 +140,7 @@ struct LyricsDiskCache: Sendable {
             title: title,
             artist: artist,
             cachedAt: Date(),
+            cacheVersion: cacheVersion,
             lines: lines
         )
         guard let data = try? JSONEncoder().encode(entry) else { return }
@@ -663,8 +684,12 @@ actor LyricsFetcher {
         }
 
         var diskFallback: [LyricLine]?
+        var needsYRCUpgrade = false
         if let diskEntry = diskCache.loadEntry(trackId: track.id) {
-            if !AnnotatedLyrics.isAnnotated(diskEntry.lines) {
+            let isAnnotated = AnnotatedLyrics.isAnnotated(diskEntry.lines)
+            needsYRCUpgrade = diskEntry.lines.allSatisfy(\.words.isEmpty)
+                && (diskEntry.cacheVersion ?? 0) < CachedLyricsEntry.currentCacheVersion
+            if !isAnnotated, !needsYRCUpgrade {
                 // Upgrade legacy cache files with track title/artist metadata on next play.
                 if diskEntry.title == nil || diskEntry.trackId == nil {
                     diskCache.save(
@@ -672,6 +697,7 @@ actor LyricsFetcher {
                         lines: diskEntry.lines,
                         title: track.title,
                         artist: track.artist,
+                        cacheVersion: diskEntry.cacheVersion,
                         maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
                     )
                 }
@@ -711,14 +737,20 @@ actor LyricsFetcher {
                 try Task.checkCancellation()
                 found = accept(netEase.lrc)
             }
-            if let lines = found ?? (annotatedFallback ?? diskFallback).map(AnnotatedLyrics.clean) {
-                if found != nil || !transientFailure {
+            let fallback = annotatedFallback.map(AnnotatedLyrics.clean)
+                ?? diskFallback.map { AnnotatedLyrics.isAnnotated($0) ? AnnotatedLyrics.clean($0) : $0 }
+            if let lines = found ?? fallback {
+                let isUnresolvedUpgradeFailure = needsYRCUpgrade
+                    && transientFailure
+                    && (found?.allSatisfy(\.words.isEmpty) ?? true)
+                if !isUnresolvedUpgradeFailure, found != nil || !transientFailure {
                     cache[track.id] = lines
                     diskCache.save(
                         trackId: track.id,
                         lines: lines,
                         title: track.title,
                         artist: track.artist,
+                        cacheVersion: CachedLyricsEntry.currentCacheVersion,
                         maxEntriesOverride: LyricsDiskCache.configuredMaxEntries()
                     )
                 }
@@ -775,6 +807,7 @@ actor LyricsFetcher {
 
         var searchReq = URLRequest(url: searchURL)
         searchReq.timeoutInterval = 5
+        searchReq.httpShouldHandleCookies = false
         searchReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
         do {
@@ -796,11 +829,12 @@ actor LyricsFetcher {
                 return (nil, nil)
             }
 
-            guard let lyricURL = URL(string: "https://music.163.com/api/song/lyric?id=\(song.id)&lv=1&yv=1") else {
+            guard let lyricURL = URL(string: "https://music.163.com/api/song/lyric/v1?id=\(song.id)&lv=1&yv=1") else {
                 return (nil, nil)
             }
             var lyricReq = URLRequest(url: lyricURL)
             lyricReq.timeoutInterval = 5
+            lyricReq.httpShouldHandleCookies = false
             lyricReq.setValue("BarTune/0.2 (macOS)", forHTTPHeaderField: "User-Agent")
 
             guard let lyricData = try await send(lyricReq, transientFailure: &transientFailure) else {
