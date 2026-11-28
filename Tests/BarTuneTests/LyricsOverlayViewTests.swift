@@ -87,4 +87,22 @@ final class LyricsOverlayViewTests: XCTestCase {
             )
         )
     }
+
+    func testSweepFrameIntervalRunsAt20FpsInHighPrecisionAnd8FpsInLowCPU() {
+        XCTAssertEqual(KaraokeLineView.sweepFrameInterval(lowCPUMode: false), 1.0 / 20.0, accuracy: 0.0001)
+        XCTAssertEqual(KaraokeLineView.sweepFrameInterval(lowCPUMode: true), 1.0 / 8.0, accuracy: 0.0001)
+    }
+
+    func testActiveWordPopSkipsZeroStrengthAndZeroSpan() {
+        let active = LyricsState.WordPop(start: 0.2, end: 0.6, strength: 0.5)
+        let zeroStrength = LyricsState.WordPop(start: 0.2, end: 0.6, strength: 0.0)
+        let nearZeroStrength = LyricsState.WordPop(start: 0.2, end: 0.6, strength: 0.0005)
+        let zeroSpan = LyricsState.WordPop(start: 0.4, end: 0.4, strength: 0.8)
+
+        XCTAssertEqual(KaraokeLineView.activeWordPop(active), active)
+        XCTAssertNil(KaraokeLineView.activeWordPop(zeroStrength))
+        XCTAssertNil(KaraokeLineView.activeWordPop(nearZeroStrength))
+        XCTAssertNil(KaraokeLineView.activeWordPop(zeroSpan))
+        XCTAssertNil(KaraokeLineView.activeWordPop(nil))
+    }
 }

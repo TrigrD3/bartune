@@ -616,13 +616,13 @@ struct SettingsView: View {
             Section("Performance & Sync") {
                 Picker("Karaoke Precision", selection: $state.lowCPUMode) {
                     Text("Low CPU (Standard)").tag(true)
-                    Text("High Precision (30fps)").tag(false)
+                    Text("High Precision (20fps)").tag(false)
                 }
                 .pickerStyle(.segmented)
 
                 Text(state.lowCPUMode
                      ? "Lightweight karaoke sweep for lower CPU usage (event-driven sync is always active)."
-                     : "30fps karaoke sweep for smoother word-by-word highlighting.")
+                     : "20fps karaoke sweep for smoother word-by-word highlighting.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
