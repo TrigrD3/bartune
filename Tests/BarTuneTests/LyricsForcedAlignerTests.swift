@@ -2009,6 +2009,45 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertFalse(pass2.needsAudio(from: 95, to: 107), "chunk well past window end + hold-back should be skipped")
     }
 
+    func testShortCTCWordFollowedByTrailingBlanksExtendsThroughHeldNoteOnCompressedMix() async throws {
+        let k = try XCTUnwrap(ForcedAlignmentText.vocabulary["k"])
+        let a = try XCTUnwrap(ForcedAlignmentText.vocabulary["a"])
+        let t = try XCTUnwrap(ForcedAlignmentText.vocabulary["t"])
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 1200)
+        // Window starts at -12 s (0.02 s/frame): "ka" peaks at 2.00..2.04 s (frames 700..701) followed by
+        // trailing blank frames during the held note; "ta" peaks at 3.50..3.54 s (frames 775..776).
+        model.peaksForCall = [[700: k, 701: a, 775: t, 776: a]]
+        let lines = [
+            LyricLine(id: 0, timestamp: 2.0, text: "ka"),
+            LyricLine(id: 1, timestamp: 3.5, text: "ta"),
+        ]
+        let aligner = LyricsForcedAligner(lines: lines, model: model)
+        let heard = try await aligner.transcribe(chunk(start: 0, isFinal: true))
+        XCTAssertEqual(heard.map(\.text), ["ka", "ta"])
+        XCTAssertEqual(heard[0].duration, 0.04, accuracy: 0.001)
+
+        // Compressed mix (< 15 dB dynamic range): 0.08 floor, 0.6 onset at 2.00..2.04 s, 0.22 held note
+        // until 3.20 s, 0.08 quiet gap until 3.50 s, and 0.5 for "ta" at 3.50..3.54 s.
+        let sampleRate = 16000.0
+        func tone(_ seconds: Double, amplitude: Float) -> [Float] {
+            (0..<Int(seconds * sampleRate)).map { amplitude * sin(2 * .pi * 440 * Float($0) / Float(sampleRate)) }
+        }
+        var envelope = VocalEnvelope()
+        let samples = tone(2.0, amplitude: 0.08)
+            + tone(0.04, amplitude: 0.6)
+            + tone(1.16, amplitude: 0.22)
+            + tone(0.30, amplitude: 0.08)
+            + tone(0.04, amplitude: 0.5)
+            + tone(2.46, amplitude: 0.08)
+        envelope.append(mid: samples, side: [], sampleRate: sampleRate, startTime: 0, rate: 1)
+
+        let refined = WaveformTimingRefiner.refine(heard, envelope: envelope, timingError: 0.06).words
+        XCTAssertEqual(refined.count, 2)
+        XCTAssertEqual(refined[0].endTime, 3.20, accuracy: 0.04)
+        XCTAssertLessThan(refined[0].endTime, refined[1].startTime)
+        XCTAssertEqual(refined[1].endTime, 3.54, accuracy: 0.01)
+    }
+
     private func chunk(start: Double, isFinal: Bool = false, startsNewSpan: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },

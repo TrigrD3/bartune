@@ -346,9 +346,14 @@ enum WaveformTimingRefiner {
     /// A word whose loudest frame is this close to the song's quietest frames was heard in silence.
     static let silenceMargin: Float = 6
     /// Gating needs this much range between the quiet and loud frames, so a song with no quiet parts keeps every word.
+    /// Below it, down to `minimumContrast`, held notes still stop at a floor margin scaled to the range.
     static let minimumDynamicRange: Float = 15
+    private static let minimumContrast: Float = 6
+    private static let compressedFloorMarginShare: Float = 0.35
     /// A held note continues while the level stays within this many dB of where it starts.
     static let sustainDrop: Float = 8
+    /// A held vowel right after a short word's loud attack can be up to this many dB softer.
+    private static let maxAttackToHoldDrop: Float = 12
     /// Seconds around a word's end whose peak is the held note's level: the final vowel starts there,
     /// and a louder earlier syllable must not end its hold.
     static let holdReach = 0.1
@@ -370,10 +375,12 @@ enum WaveformTimingRefiner {
     ) -> (words: [RecognizedAudioWord], stats: Stats) {
         var stats = Stats()
         let floor = envelope.percentile(0.1)
-        let gateLevel: Float? = {
-            guard let floor, let loud = envelope.percentile(0.9), loud - floor >= minimumDynamicRange else { return nil }
-            return floor + silenceMargin
-        }()
+        let range = floor.flatMap { floor in envelope.percentile(0.9).map { $0 - floor } }
+        let holdFloor = floor.flatMap { floor in range.flatMap { floorGateLevel(floor: floor, range: $0) } }
+        let isDynamic = (range ?? 0) >= minimumDynamicRange
+        let gateLevel = isDynamic ? holdFloor : nil
+        // Compressed mixes keep every word but still stop held notes at the backing floor.
+        let sustainFloor = isDynamic ? nil : holdFloor
 
         // Pass 1: drop words heard in silence.
         var refined: [RecognizedAudioWord] = []
@@ -399,16 +406,31 @@ enum WaveformTimingRefiner {
         for index in refined.indices {
             let word = refined[index]
             let end = word.startTime + word.duration
-            guard let segment = envelope.segment(covering: word.startTime...end),
-                  let peak = maxLevel(in: segment, from: max(word.startTime, end - holdReach), to: end + holdReach),
-                  peak >= minimumSignalLevel
-            else { continue }
+            guard let segment = envelope.segment(covering: word.startTime...end) else { continue }
             let nextStart = index + 1 < refined.count ? refined[index + 1].startTime : .infinity
             let limit = min(nextStart - minimumGap, end + maxExtension, segment.end)
             guard limit > end else { continue }
+
+            guard let combinedPeak = maxLevel(in: segment, from: max(word.startTime, end - holdReach), to: end + holdReach),
+                  combinedPeak >= minimumSignalLevel
+            else { continue }
+            let wordPeak = maxLevel(in: segment, from: max(word.startTime, end - holdReach), to: end)
+            let tailPeak = maxLevel(in: segment, from: end, to: min(limit, end + holdReach))
+
+            let peak: Float = if word.duration < holdReach, let wordPeak, let tailPeak,
+                                 tailPeak >= (holdFloor ?? minimumSignalLevel),
+                                 tailPeak >= wordPeak - maxAttackToHoldDrop {
+                // Short CTC words often end right after a loud onset/consonant while the held vowel continues.
+                tailPeak
+            } else {
+                combinedPeak
+            }
+            guard peak >= (sustainFloor ?? minimumSignalLevel) else { continue }
+
+            let sustainThreshold = max(peak - sustainDrop, sustainFloor ?? minimumSignalLevel)
             var frame = segment.frame(at: end)
             let lastFrame = min(segment.levels.count - 1, segment.frame(at: limit) - 1)
-            while frame <= lastFrame, frame >= 0, segment.levels[frame] >= peak - sustainDrop {
+            while frame <= lastFrame, frame >= 0, segment.levels[frame] >= sustainThreshold {
                 frame += 1
             }
             var sustainEnd = min(limit, segment.time(ofFrame: frame))
@@ -443,6 +465,14 @@ enum WaveformTimingRefiner {
             }
         }
         return (refined, stats)
+    }
+
+    private static func floorGateLevel(floor: Float, range: Float) -> Float? {
+        if range >= minimumDynamicRange {
+            return floor + silenceMargin
+        }
+        guard range >= minimumContrast else { return nil }
+        return floor + min(silenceMargin, range * compressedFloorMarginShare)
     }
 
     private static func isSilent(_ word: RecognizedAudioWord, peak: Float, floor: Float, clarity: Float?) -> Bool {
