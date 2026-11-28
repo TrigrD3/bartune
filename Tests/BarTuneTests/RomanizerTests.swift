@@ -81,4 +81,27 @@ final class JapaneseWordRomanizerTests: XCTestCase {
     func testLatinWordsPassThrough() {
         XCTAssertEqual(JapaneseRomanizer.romanizeWords(["hello ", "world"]), ["hello ", "world"])
     }
+
+    func testAlignmentRomanizationMapsParticlesWoAndHeWithoutChangingDisplay() {
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["空", "へ"], forAlignment: true), ["sora", "e"])
+        XCTAssertEqual(
+            JapaneseRomanizer.romanizeWords(["君", "を", "愛し", "てる"], forAlignment: true),
+            ["kimi", "o", "aishi", "teru"]
+        )
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["海", "へ", "行く"], forAlignment: true), ["umi", "e", "iku"])
+
+        // Non-particle へ inside words must keep its consonant.
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["部屋", "へ"], forAlignment: true), ["heya", "e"])
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["平和", "を"], forAlignment: true), ["heiwa", "o"])
+
+        // Display romanization preserves the existing を -> wo and へ -> he convention.
+        XCTAssertEqual(JapaneseRomanizer.romanizeWords(["空", "へ"]), ["sora", "he"])
+        XCTAssertEqual(
+            JapaneseRomanizer.romanizeWords(["君", "を", "愛し", "てる"]),
+            ["kimi", "wo", "aishi", "teru"]
+        )
+        XCTAssertEqual(JapaneseRomanizer.romanizeLine("空へ"), "sora he")
+        XCTAssertEqual(JapaneseRomanizer.romanizeLine("君を愛してる"), "kimi wo aishi teru")
+        XCTAssertEqual(JapaneseRomanizer.romanizeWordSpans(["海", "へ", "行く"]).map(\.text), ["umi", "he", "iku"])
+    }
 }

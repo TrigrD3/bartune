@@ -166,7 +166,7 @@ enum ForcedAlignmentText {
         let leadIndices = lead.indices.filter { !lead[$0].isEmpty }
         let spoken = leadIndices.map { lead[$0] }
         let readings: [String] = switch script {
-        case .japanese: JapaneseRomanizer.romanizeWords(spoken)
+        case .japanese: JapaneseRomanizer.romanizeWords(spoken, forAlignment: true)
         case .korean: spoken.map(KoreanRomanizer.romanizeLine)
         case .chinese: spoken.map(ChineseRomanizer.romanizeLine)
         case .latin: spoken
