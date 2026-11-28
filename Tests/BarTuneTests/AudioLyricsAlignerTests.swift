@@ -521,6 +521,57 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(syncingBadge?.isAnimating, true)
     }
 
+    func testSettledLineIDsOnlyReopensLinesNearNewlyLockedAnchors() {
+        let lines = (0..<10).map { LyricLine(id: $0, timestamp: Double($0) * 5 + 5, text: "Line \($0)") }
+
+        // Prior anchors existed: locking line 5 only reopens unlocked neighbors within ±3 (lines 3 and 7).
+        let scoped = AudioSyncedLyricsRecord(
+            trackId: "track:scoped",
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 5,
+            sourceLineCount: 10,
+            lines: lines,
+            lockedLineIDs: [2, 4, 5, 6, 8],
+            attemptedLineIDs: [0, 1, 3, 7, 9],
+            lockedAtPlayStart: 4,
+            newlyLockedLineIDs: [5]
+        )
+        XCTAssertEqual(scoped.settledLineIDs, [0, 1, 9])
+
+        // First play that established initial anchors (lockedAtPlayStart == 0) still reopens everything.
+        let initialPass = AudioSyncedLyricsRecord(
+            trackId: "track:initial",
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 1,
+            sourceLineCount: 10,
+            lines: lines,
+            lockedLineIDs: [5],
+            attemptedLineIDs: [0, 1, 9],
+            lockedAtPlayStart: 0,
+            newlyLockedLineIDs: [5]
+        )
+        XCTAssertTrue(initialPass.settledLineIDs.isEmpty)
+
+        // Legacy records without `newlyLockedLineIDs` keep the original whole-track check.
+        let legacyGrew = AudioSyncedLyricsRecord(
+            trackId: "track:legacy",
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.2,
+            alignedLineCount: 5,
+            sourceLineCount: 10,
+            lines: lines,
+            lockedLineIDs: [2, 4, 5, 6, 8],
+            attemptedLineIDs: [0, 1, 9],
+            lockedAtPlayStart: 4
+        )
+        XCTAssertTrue(legacyGrew.settledLineIDs.isEmpty)
+    }
+
     @MainActor
     func testLyricsStatePersistsShowSyncBadgeSetting() throws {
         let suiteName = "bartune.test.syncbadge.\(UUID().uuidString)"

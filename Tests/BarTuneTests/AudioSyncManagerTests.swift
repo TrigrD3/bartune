@@ -4644,6 +4644,736 @@ final class AudioSyncManagerTests: XCTestCase {
         manager.stop()
     }
 
+    @MainActor
+    func testNewLockFarFromSettledLinesAllowsSongToSettleWithoutAnotherFullPlay() async {
+        let track = sampleTrack()
+        let source = tenLines()
+        let aligned = alignedTenLines()
+        // Lines 0 and 2...8 are already locked; line 1 is already settled; line 9 is still unseen.
+        let initialLocked = [0, 2, 3, 4, 5, 6, 7, 8]
+        let cachedLines = source.enumerated().map { idx, line in
+            initialLocked.contains(idx) ? aligned[idx] : line
+        }
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: track.id,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0,
+            alignedLineCount: initialLocked.count,
+            sourceLineCount: source.count,
+            lines: cachedLines,
+            lockedLineIDs: initialLocked,
+            attemptedLineIDs: [1],
+            lockedAtPlayStart: initialLocked.count,
+            newlyLockedLineIDs: []
+        ))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = aligned[9].timestamp
+        state.playbackAnchorDate = Date()
+        let launches = LockedBox<Int>(0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            launches.withLock { $0 += 1 }
+            let tokens = source[9].text.split(separator: " ").map(String.init)
+            let words = tokens.enumerated().map { idx, token in
+                RecognizedAudioWord(
+                    text: token,
+                    startTime: aligned[9].timestamp + Double(idx) * 0.3,
+                    duration: 0.25,
+                    confidence: 0.95,
+                    sourceLineId: 9
+                )
+            }
+            return FakeChunkEngine(attempted: [9], confident: [9]) { _ in words }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: track, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Locking line 9 is 8 lines away from settled line 1, so line 1 stays settled and the track finishes.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let settled = await waitUntil { state.audioSyncStatus == .settled(engine: .lyricsAlignment, lockedLines: 9, totalLines: 10) }
+        XCTAssertTrue(settled, "status \(state.audioSyncStatus)")
+        XCTAssertFalse(manager.isLiveSyncActive)
+
+        manager.handleTrackLoaded(track: track, rawLines: source)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(state.audioSyncStatus, .settled(engine: .lyricsAlignment, lockedLines: 9, totalLines: 10))
+        XCTAssertEqual(launches.withLock { $0 }, 1, "reloading must not start another pass when distant lines stayed settled")
+    }
+
+    @MainActor
+    func testTrackSwitchFlushesBufferedTailAudioAndPersistsAttempts() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-song", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let saved = [
+            LyricLine(id: 0, timestamp: 10.7, text: "Alpha beta", words: [WordTimestamp(timestamp: 10.7, duration: 0.7, text: "Alpha beta")]),
+            LyricLine(id: 1, timestamp: 15.7, text: "Gamma delta", words: [WordTimestamp(timestamp: 15.7, duration: 0.7, text: "Gamma delta")]),
+            source[2],
+        ]
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: trackA.id,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.7,
+            alignedLineCount: 2,
+            sourceLineCount: 3,
+            lines: saved,
+            lockedLineIDs: [0, 1],
+            attemptedLineIDs: [],
+            lockedAtPlayStart: 2,
+            newlyLockedLineIDs: []
+        ))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 172.0
+        state.playbackAnchorDate = Date()
+        let seenFinalRequests = LockedBox<[Bool]>([])
+        let launches = LockedBox<Int>(0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            launches.withLock { $0 += 1 }
+            return FakeChunkEngine(attempted: [2], confident: []) { request in
+                seenFinalRequests.withLock { $0.append(request.isFinal) }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Emit 1 s of tail audio (below the 12 s chunk threshold and outside the 1 s trackEndMargin).
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(buffered)
+        XCTAssertTrue(seenFinalRequests.withLock { $0.isEmpty }, "tail stays buffered until track switch")
+
+        // Switching to track B must flush track A's buffered tail as a final chunk and persist line 2 as attempted.
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(seenFinalRequests.withLock { $0 }, [true])
+        let persisted = cache.load(trackId: trackA.id)
+        XCTAssertEqual(persisted?.attemptedLineIDs, [2])
+
+        // Reloading track A sees the settled tail and skips capture.
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(state.audioSyncStatus, .settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3))
+        XCTAssertEqual(launches.withLock { $0 }, 1)
+    }
+
+    @MainActor
+    func testTrackSwitchLetsInFlightFinalChunkFinishAndPersist() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-in-flight", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let saved = [
+            LyricLine(id: 0, timestamp: 10.7, text: "Alpha beta", words: [WordTimestamp(timestamp: 10.7, duration: 0.7, text: "Alpha beta")]),
+            LyricLine(id: 1, timestamp: 15.7, text: "Gamma delta", words: [WordTimestamp(timestamp: 15.7, duration: 0.7, text: "Gamma delta")]),
+            source[2],
+        ]
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: trackA.id,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.7,
+            alignedLineCount: 2,
+            sourceLineCount: 3,
+            lines: saved,
+            lockedLineIDs: [0, 1],
+            attemptedLineIDs: [],
+            lockedAtPlayStart: 2,
+            newlyLockedLineIDs: []
+        ))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 178.5
+        state.playbackAnchorDate = Date()
+        let chunkStarted = LockedBox(false)
+        let allowFinish = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(attempted: [2], confident: []) { _ in
+                chunkStarted.withLock { $0 = true }
+                XCTAssertEqual(allowFinish.wait(timeout: .now() + 5), .success)
+                return Self.words(for: source[2], at: 20.7)
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Trigger the final chunk near the track's end, then switch tracks while it is still in flight.
+        capture.emit(samples: [Float](repeating: 0.1, count: 70), sampleRate: 100)
+        let enteredChunk = await waitUntil { chunkStarted.withLock { $0 } }
+        XCTAssertTrue(enteredChunk)
+
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        allowFinish.signal()
+
+        // Reloading track A awaits the detached finalizer and immediately loads the settled record.
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(state.audioSyncStatus, .settled(engine: .lyricsAlignment, lockedLines: 2, totalLines: 3))
+        let persisted = cache.load(trackId: trackA.id)
+        XCTAssertEqual(persisted?.attemptedLineIDs, [2])
+        // The words the in-flight chunk heard reach the saved record, not just the reporter's attempts.
+        XCTAssertEqual(persisted?.lines[2].timestamp ?? 0, 20.7, accuracy: 0.01)
+        XCTAssertFalse(persisted?.lines[2].words.isEmpty ?? true)
+    }
+
+    @MainActor
+    func testZeroMatchTrackPersistsSettledAttempts() async {
+        let track = sampleTrack()
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+        let launches = LockedBox<Int>(0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            launches.withLock { $0 += 1 }
+            return FakeChunkEngine(attempted: [0, 1, 2], confident: []) { _ in [] }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: track, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let settled = await waitUntil { state.audioSyncStatus == .settled(engine: .lyricsAlignment, lockedLines: 0, totalLines: 3) }
+        XCTAssertTrue(settled)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(cache.load(trackId: track.id)?.attemptedLineIDs, [0, 1, 2])
+
+        manager.handleTrackLoaded(track: track, rawLines: source)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(state.audioSyncStatus, .settled(engine: .lyricsAlignment, lockedLines: 0, totalLines: 3))
+        XCTAssertEqual(launches.withLock { $0 }, 1)
+    }
+
+    @MainActor
+    func testPlaybackUpdateTrackSwitchFlushesOutgoingTail() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-playback", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 172.0
+        state.playbackAnchorDate = Date()
+        let seenFinalRequests = LockedBox<[Bool]>([])
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(attempted: [2], confident: []) { request in
+                seenFinalRequests.withLock { $0.append(request.isFinal) }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+        let delegate = AppDelegate(state: state, spotifyMonitor: SpotifyMonitor(), lyricsFetcher: fetcher, audioSyncManager: manager)
+        defer {
+            delegate.stopPlaybackMonitoring()
+            manager.stop()
+        }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(buffered)
+
+        // The player reports the next track: the outgoing tail must still be finalized.
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: trackB, position: 0))
+        await delegate.waitForPendingFetch()
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(seenFinalRequests.withLock { $0 }, [true])
+        XCTAssertEqual(cache.load(trackId: trackA.id)?.attemptedLineIDs, [2])
+    }
+
+    @MainActor
+    func testAutomaticTeardownOfNextTrackKeepsOutgoingFinalizerRunning() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-fails", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 100.0
+        state.playbackAnchorDate = Date()
+        let tailEntered = LockedBox(false)
+        let allowTail = DispatchSemaphore(value: 0)
+        let launches = LockedBox<Int>(0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            let launch = launches.withLock { $0 += 1; return $0 }
+            if launch == 1 {
+                return FakeChunkEngine(attempted: [2], confident: []) { _ in
+                    tailEntered.withLock { $0 = true }
+                    XCTAssertEqual(allowTail.wait(timeout: .now() + 5), .success)
+                    return []
+                }
+            }
+            return FakeChunkEngine { _ in throw FakeChunkEngineError.exited }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let startedA = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(startedA)
+        capture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 50 }
+        XCTAssertTrue(buffered)
+
+        manager.handleTrackLoaded(track: trackB, rawLines: source)
+        let enteredTail = await waitUntil { tailEntered.withLock { $0 } }
+        XCTAssertTrue(enteredTail)
+        let startedB = await waitUntil { manager.isLiveSyncActive && capture.startCount == 2 }
+        XCTAssertTrue(startedB)
+
+        // Track B's chunk fails, which tears down its session while track A's tail is still finishing.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let failed = await waitUntil {
+            if case .unavailable = state.audioSyncStatus { return true }
+            return false
+        }
+        XCTAssertTrue(failed, "status \(state.audioSyncStatus)")
+        allowTail.signal()
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(cache.load(trackId: trackA.id)?.attemptedLineIDs, [2])
+    }
+
+    @MainActor
+    func testTrackSwitchFinishesRunHeldBackByCompletedChunk() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-held", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 19.0
+        state.playbackAnchorDate = Date()
+        let engine = FakeChunkEngine(confident: [2], finishRun: { Self.words(for: source[2], at: 20.7) }, transcribe: { _ in [] })
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in engine }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // A whole non-final chunk completes, leaving nothing buffered or in flight but held-back audio.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let chunked = await waitUntil { engine.callLog == ["chunk"] && !manager.isChunkProcessing && manager.bufferedSampleCount == 0 }
+        XCTAssertTrue(chunked, "calls \(engine.callLog)")
+
+        manager.handleTrackChanged()
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(engine.callLog, ["chunk", "finishRun"])
+        let persisted = cache.load(trackId: trackA.id)
+        XCTAssertEqual(persisted?.lockedLineIDs, [0, 1, 2])
+        XCTAssertEqual(persisted?.lines[2].timestamp ?? 0, 20.7, accuracy: 0.01)
+    }
+
+    @MainActor
+    func testTrackSwitchFinishesHeldRunBeforeTailAfterADrop() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-drop", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 100.0
+        state.playbackAnchorDate = Date()
+        let engine = FakeChunkEngine(confident: [], finishRun: { [] }, transcribe: { _ in [] })
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in engine }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100, startsNewSpan: true)
+        let preDropSent = await waitUntil { engine.callLog == ["chunk"] && !manager.isChunkProcessing && manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(preDropSent, "calls \(engine.callLog), buffered \(manager.bufferedSampleCount)")
+
+        // The tail after the drop starts a new run, so the held audio before it must be finished first.
+        manager.handleTrackChanged()
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(engine.callLog, ["chunk", "finishRunBeforeGap", "final"])
+    }
+
+    func testTailRequestsSplitALongSpanIntoLiveSizedRequests() {
+        let requests = AudioSyncManager.tailRequests(
+            sampleCount: 250, spans: [(0, 100.0, false)], sampleRate: 100, rate: 1, chunkFrames: 100
+        )
+        XCTAssertEqual(requests.map(\.range), [0..<100, 100..<200, 200..<250])
+        XCTAssertEqual(requests.map { ($0.startTime * 1000).rounded() }, [100_000, 101_000, 102_000])
+        XCTAssertEqual(requests.map(\.isFinal), [false, false, true])
+        XCTAssertEqual(requests.map(\.startsNewSpan), [false, false, false])
+    }
+
+    func testTailRequestsKeepEachCaptureSpansChromaTimeAndStartRunsOnlyAtDrops() {
+        // A timestamped delivery 0.2 s late starts the second span without a drop; the third follows a drop.
+        let spans = [(offset: 0, time: 50.0, followsDrop: false), (60, 50.8, false), (150, 60.0, true)]
+        let requests = AudioSyncManager.tailRequests(sampleCount: 200, spans: spans, sampleRate: 100, rate: 1, chunkFrames: 100)
+
+        XCTAssertEqual(requests.map(\.range), [0..<100, 100..<150, 150..<200])
+        XCTAssertEqual(requests.map { ($0.startTime * 1000).rounded() }, [50000, 51200, 60000])
+        XCTAssertEqual(requests.map(\.startsNewSpan), [false, false, true])
+        XCTAssertEqual(requests.map(\.isFinal), [false, false, true])
+        XCTAssertEqual(requests.map { $0.chromaSpans.map(\.range) }, [[0..<60, 60..<100], [100..<150], [150..<200]])
+        XCTAssertEqual(
+            requests.map { $0.chromaSpans.map { ($0.time * 1000).rounded() } },
+            [[50000, 50800], [51200], [60000]]
+        )
+    }
+
+    @MainActor
+    func testTrackSwitchSendsALongBufferedTailInLiveSizedRequests() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-long-tail", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 100.0
+        state.playbackAnchorDate = Date()
+        let seen = LockedBox<[(count: Int, start: Double, isFinal: Bool)]>([])
+        let allowFirst = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(attempted: [2], confident: []) { request in
+                let isFirst = seen.withLock { requests in
+                    requests.append((request.samples.count, request.chunkStartTime, request.isFinal))
+                    return requests.count == 1
+                }
+                if isFirst { XCTAssertEqual(allowFirst.wait(timeout: .now() + 5), .success) }
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Two chunks' worth of audio builds up behind the in-flight chunk.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let inFlight = await waitUntil { seen.withLock { $0.count } == 1 }
+        XCTAssertTrue(inFlight)
+        capture.emit(samples: [Float](repeating: 0.1, count: 200), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 200 }
+        XCTAssertTrue(buffered)
+
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        allowFirst.signal()
+        await manager.flushCacheOperations()
+
+        let requests = seen.withLock { $0 }
+        XCTAssertEqual(requests.map(\.isFinal), [false, false, true])
+        guard requests.count == 3 else { return }
+        XCTAssertEqual(requests[1].count, requests[2].count)
+        XCTAssertEqual(requests[2].start - requests[1].start, 1.0, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testDeletingATracksAudioSyncCancelsOnlyItsPendingFinalizer() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-kept", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let trackC = TrackInfo(id: "spotify:track:third", title: "Third", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+        cache.save(twoLockedRecord(trackId: trackB.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 172.0
+        state.playbackAnchorDate = Date()
+        let entered = LockedBox(0)
+        let engines = LockedBox<[FakeChunkEngine]>([])
+        let allowTails = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            let engine = FakeChunkEngine(attempted: [2], confident: []) { _ in
+                entered.withLock { $0 += 1 }
+                XCTAssertEqual(allowTails.wait(timeout: .now() + 5), .success)
+                return []
+            }
+            engines.withLock { $0.append(engine) }
+            return engine
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+
+        // Leave both track A's and track B's tails finalizing in the background.
+        for (index, track) in [trackA, trackB].enumerated() {
+            manager.handleTrackLoaded(track: track, rawLines: source)
+            let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == index + 1 }
+            XCTAssertTrue(started)
+            capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+            let buffered = await waitUntil { manager.bufferedSampleCount == 100 }
+            XCTAssertTrue(buffered)
+        }
+        manager.handleTrackLoaded(track: trackC, rawLines: [])
+        let bothFinalizing = await waitUntil { entered.withLock { $0 } == 2 }
+        XCTAssertTrue(bothFinalizing)
+
+        // Settings removes track A's record while its finalizer is still running.
+        await manager.cancelPendingTailFinalizations(cacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: trackA.id))
+        cache.remove(trackId: trackA.id)
+        allowTails.signal()
+        allowTails.signal()
+        let finished = await waitUntil { engines.withLock { $0.map(\.shutdownCount) } == [1, 1] }
+        XCTAssertTrue(finished)
+        await manager.flushCacheOperations()
+
+        XCTAssertNil(cache.load(trackId: trackA.id), "a cancelled finalizer must not restore the deleted record")
+        XCTAssertEqual(cache.load(trackId: trackB.id)?.attemptedLineIDs, [2], "other tracks keep finalizing")
+    }
+
+    @MainActor
+    func testCustomLyricsOnNextTrackKeepOutgoingFinalizerRunning() async throws {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-custom", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+        let customStore = CustomLyricsStore(directory: tempDir.appendingPathComponent("custom", isDirectory: true))
+        try customStore.save(CustomLyricsRecord(
+            trackId: trackB.id, title: trackB.title, artist: trackB.artist, savedAt: Date(),
+            lines: [LyricLine(id: 0, timestamp: 1.0, text: "Custom line")]
+        ))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.setLyricSourceChoice(.custom, for: trackB.id)
+        state.playbackAnchorPosition = 172.0
+        state.playbackAnchorDate = Date()
+        let tailEntered = LockedBox(false)
+        let allowTail = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(attempted: [2], confident: []) { _ in
+                tailEntered.withLock { $0 = true }
+                XCTAssertEqual(allowTail.wait(timeout: .now() + 5), .success)
+                return []
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        let fetcher = LyricsFetcher(diskCache: LyricsDiskCache(directory: tempDir, maxEntries: 10)) { request in
+            let url = try XCTUnwrap(request.url)
+            let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil))
+            return (Data(), response)
+        }
+        let delegate = AppDelegate(
+            state: state, spotifyMonitor: SpotifyMonitor(), lyricsFetcher: fetcher, audioSyncManager: manager, customLyricsStore: customStore
+        )
+        defer {
+            delegate.stopPlaybackMonitoring()
+            manager.stop()
+        }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(buffered)
+
+        // Track B's Custom lyrics skip audio sync while track A's tail is still finalizing.
+        delegate.handlePlaybackUpdate(PlaybackSnapshot(isRunning: true, isPlaying: true, track: trackB, position: 0))
+        let enteredTail = await waitUntil { tailEntered.withLock { $0 } }
+        XCTAssertTrue(enteredTail)
+        await delegate.waitForPendingFetch()
+        XCTAssertEqual(state.rawLyricLines.map(\.text), ["Custom line"])
+        allowTail.signal()
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(cache.load(trackId: trackA.id)?.attemptedLineIDs, [2])
+    }
+
+    @MainActor
+    func testUnresumableAttemptRecordKeepsAttemptsForTheNextPlay() async {
+        let track = sampleTrack()
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        // A previous play attempted line 0 and matched nothing, so the record has no timings or heard words.
+        cache.save(AudioSyncedLyricsRecord(
+            trackId: track.id,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: nil,
+            alignedLineCount: 0,
+            sourceLineCount: 3,
+            lines: source,
+            lockedLineIDs: [],
+            attemptedLineIDs: [0],
+            lockedAtPlayStart: 0,
+            newlyLockedLineIDs: []
+        ))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 15.0
+        state.playbackAnchorDate = Date()
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.launchLyricsAligner = { _, _ in FakeChunkEngine(attempted: [1, 2], confident: []) { _ in [] } }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: track, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(cache.load(trackId: track.id)?.attemptedLineIDs, [0], "loading must not delete the attempts")
+
+        // This play attempts the other two lines; together with line 0 the track settles.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let settled = await waitUntil { state.audioSyncStatus == .settled(engine: .lyricsAlignment, lockedLines: 0, totalLines: 3) }
+        XCTAssertTrue(settled, "status \(state.audioSyncStatus)")
+        await manager.flushCacheOperations()
+        XCTAssertEqual(cache.load(trackId: track.id)?.attemptedLineIDs, [0, 1, 2])
+    }
+
+    @MainActor
+    func testForceResyncDuringFinalizationDropsItsStaleOffsetRemoval() async {
+        let trackA = sampleTrack()
+        let trackB = TrackInfo(id: "spotify:track:next-resync", title: "Next", artist: "Artist", album: "", duration: 180, artworkURL: nil)
+        let source = threeLines()
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        cache.save(twoLockedRecord(trackId: trackA.id, source: source))
+
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 172.0
+        state.playbackAnchorDate = Date()
+        let gateUsed = LockedBox(false)
+        let discardEntered = LockedBox(false)
+        let firstEngine = LockedBox<FakeChunkEngine?>(nil)
+        let allowDiscard = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
+        deps.launchLyricsAligner = { _, _ in
+            let engine = FakeChunkEngine(attempted: [2], confident: [], discardStaleOffset: { _ in
+                guard !gateUsed.withLock({ used in defer { used = true }; return used }) else { return false }
+                discardEntered.withLock { $0 = true }
+                XCTAssertEqual(allowDiscard.wait(timeout: .now() + 5), .success)
+                return true
+            }, transcribe: { _ in [] })
+            firstEngine.withLock { $0 = $0 ?? engine }
+            return engine
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+        manager.handleTrackLoaded(track: trackA, rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(buffered)
+
+        manager.handleTrackLoaded(track: trackB, rawLines: [])
+        let entered = await waitUntil { discardEntered.withLock { $0 } }
+        XCTAssertTrue(entered)
+
+        // Force resync takes ownership of track A's record, and a new result is saved before the finalizer resumes.
+        manager.handleTrackLoaded(track: trackA, rawLines: source, forceResync: true)
+        let resynced = twoLockedRecord(trackId: trackA.id, source: source)
+        await withCheckedContinuation { continuation in
+            deps.cacheQueue.async {
+                cache.save(resynced)
+                continuation.resume()
+            }
+        }
+        allowDiscard.signal()
+        // The finalizer shuts its engine down only after any cache write it enqueues.
+        let finalizerEnded = await waitUntil { firstEngine.withLock { $0?.shutdownCount } == 1 }
+        XCTAssertTrue(finalizerEnded)
+        await manager.flushCacheOperations()
+
+        XCTAssertNotNil(cache.load(trackId: trackA.id), "a cancelled finalizer must not remove the resynced record")
+    }
+
+    private func twoLockedRecord(trackId: String, source: [LyricLine]) -> AudioSyncedLyricsRecord {
+        AudioSyncedLyricsRecord(
+            trackId: trackId,
+            engine: .lyricsAlignment,
+            syncedAt: Date(),
+            medianOffset: 0.7,
+            alignedLineCount: 2,
+            sourceLineCount: 3,
+            lines: [
+                LyricLine(id: 0, timestamp: 10.7, text: "Alpha beta", words: [WordTimestamp(timestamp: 10.7, duration: 0.7, text: "Alpha beta")]),
+                LyricLine(id: 1, timestamp: 15.7, text: "Gamma delta", words: [WordTimestamp(timestamp: 15.7, duration: 0.7, text: "Gamma delta")]),
+                source[2],
+            ],
+            lockedLineIDs: [0, 1],
+            attemptedLineIDs: [],
+            lockedAtPlayStart: 2,
+            newlyLockedLineIDs: []
+        )
+    }
+
+    private static func words(for line: LyricLine, at start: Double) -> [RecognizedAudioWord] {
+        line.text.split(separator: " ").enumerated().map { idx, token in
+            RecognizedAudioWord(
+                text: String(token), startTime: start + Double(idx) * 0.3, duration: 0.25, confidence: 0.95, sourceLineId: line.id
+            )
+        }
+    }
+
     private func sampleLines() -> [LyricLine] {
         [
             LyricLine(id: 0, timestamp: 10.0, text: "Hello world from test"),
@@ -4720,22 +5450,30 @@ private enum FakeChunkEngineError: Error {
 private final class FakeChunkEngine: AudioChunkTranscribing, LineAttemptReporting, @unchecked Sendable {
     private let handler: @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]
     private let discardOffset: @Sendable (Set<Int>) -> Bool
+    private let finishRunHandler: (@Sendable () -> [RecognizedAudioWord])?
     private let shutdowns = LockedBox<Int>(0)
+    private let holdsAudio = LockedBox(false)
+    private let calls = LockedBox<[String]>([])
     let attemptedLineIDs: Set<Int>
     let confidentLineIDs: Set<Int>
     let nearlyConfidentLineIDs: Set<Int>
 
     var shutdownCount: Int { shutdowns.withLock { $0 } }
+    var callLog: [String] { calls.withLock { $0 } }
+    /// Only an engine given `finishRun` models held-back audio.
+    var hasHeldAudio: Bool { finishRunHandler != nil && holdsAudio.withLock { $0 } }
 
     init(
         attempted: Set<Int> = [],
         confident: Set<Int> = Set(0..<100),
         nearlyConfident: Set<Int> = [],
         discardStaleOffset: @escaping @Sendable (Set<Int>) -> Bool = { _ in false },
+        finishRun: (@Sendable () -> [RecognizedAudioWord])? = nil,
         transcribe handler: @escaping @Sendable (AudioSyncManager.AudioChunkRequest) throws -> [RecognizedAudioWord]
     ) {
         self.handler = handler
         discardOffset = discardStaleOffset
+        finishRunHandler = finishRun
         attemptedLineIDs = attempted
         confidentLineIDs = confident
         nearlyConfidentLineIDs = nearlyConfident
@@ -4747,7 +5485,17 @@ private final class FakeChunkEngine: AudioChunkTranscribing, LineAttemptReportin
 
     // swiftlint:disable:next async_without_await
     func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async throws -> [RecognizedAudioWord] {
-        try handler(request)
+        calls.withLock { $0.append(request.isFinal ? "final" : "chunk") }
+        holdsAudio.withLock { $0 = !request.isFinal }
+        return try handler(request)
+    }
+
+    // swiftlint:disable:next unneeded_throws_rethrows
+    func finishRun(continuesAfterGap: Bool) throws -> [RecognizedAudioWord] {
+        guard let finishRunHandler, holdsAudio.withLock({ $0 }) else { return [] }
+        holdsAudio.withLock { $0 = false }
+        calls.withLock { $0.append(continuesAfterGap ? "finishRunBeforeGap" : "finishRun") }
+        return finishRunHandler()
     }
 
     func shutdown() {

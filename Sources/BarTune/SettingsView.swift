@@ -910,7 +910,7 @@ struct SettingsView: View {
                 let remover = cacheRemover
                 Task {
                     // Deleting files off the main thread keeps Settings responsive on a large cache.
-                    await Task.detached { remover.removeAllAudioSync() }.value
+                    await Task.detached { await remover.removeAllAudioSync() }.value
                     refreshCacheStats()
                 }
             }

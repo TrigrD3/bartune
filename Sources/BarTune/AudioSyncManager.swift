@@ -615,6 +615,20 @@ final class AudioCaptureStreamOutput: NSObject, SCStreamOutput, @unchecked Senda
 protocol AudioChunkTranscribing: AnyObject, Sendable {
     func transcribe(_ request: AudioSyncManager.AudioChunkRequest) async throws -> [RecognizedAudioWord]
     func shutdown()
+    /// Audio from a non-final request is still held back waiting for right context.
+    var hasHeldAudio: Bool { get }
+    /// Aligns held-back audio when its run ends without a final request. `continuesAfterGap`: a capture gap,
+    /// not the track's end, ends the run, so lines missed at its edge stay eligible for the next span.
+    func finishRun(continuesAfterGap: Bool) throws -> [RecognizedAudioWord]
+}
+
+extension AudioChunkTranscribing {
+    var hasHeldAudio: Bool { false }
+
+    // swiftlint:disable:next unneeded_throws_rethrows
+    func finishRun(continuesAfterGap _: Bool) throws -> [RecognizedAudioWord] {
+        []
+    }
 }
 
 @MainActor
@@ -786,9 +800,16 @@ final class AudioSyncManager {
     private var seekBoundary: TimeInterval = 0
     /// Last playback state this manager saw; seeks are detected against it because `LyricsState` is updated first.
     private var lastPlayback: (position: Double, uptime: TimeInterval, rate: Double, isPlaying: Bool)?
+    private struct ChunkOutcome: Sendable {
+        let words: [RecognizedAudioWord]
+        let pitch: VocalPitchContour.Segment?
+        let chroma: AudioChromaProfile
+    }
+
     private var cacheLoadTask: Task<Void, Never>?
     private var alignerStartupTask: Task<Void, Never>?
-    private var chunkProcessingTask: Task<Void, Never>?
+    private var chunkProcessingTask: Task<ChunkOutcome?, Never>?
+    private var pendingTailFinalizations: [String: (id: UUID, task: Task<Void, Never>)] = [:]
     private var modelIdleReleaseTask: Task<Void, Never>?
     private var noAudioWatchdogTask: Task<Void, Never>?
     private var noAudioObservationStartedAt: TimeInterval?
@@ -821,6 +842,11 @@ final class AudioSyncManager {
     }
 
     func flushCacheOperations() async {
+        // Wait for any outgoing-track tail finalizations so their cache saves are queued first.
+        let tailTasks = pendingTailFinalizations.values.map(\.task)
+        for task in tailTasks {
+            await task.value
+        }
         // Applying a cache load can enqueue a removal of its own.
         await cacheLoadTask?.value
         await withCheckedContinuation { continuation in
@@ -869,6 +895,39 @@ final class AudioSyncManager {
     }
 
     func stop() {
+        for entry in pendingTailFinalizations.values {
+            entry.task.cancel()
+        }
+        pendingTailFinalizations.removeAll()
+        stopActiveSession()
+    }
+
+    /// Ends the live session but lets other tracks' tail finalizers finish saving.
+    func stopLiveSession() {
+        stopActiveSession()
+    }
+
+    /// Cancels the tail finalizers whose saves would restore records being deleted (all when `cacheKey` is nil),
+    /// then waits for the cache writes they already queued, so the deletion runs after them.
+    func cancelPendingTailFinalizations(cacheKey: String?) async {
+        let trackIds = pendingTailFinalizations.keys.filter { trackId in
+            cacheKey.map { AudioSyncedLyricsCache.cacheKey(forTrackId: trackId) == $0 } ?? true
+        }
+        for trackId in trackIds {
+            pendingTailFinalizations.removeValue(forKey: trackId)?.task.cancel()
+        }
+        await withCheckedContinuation { continuation in
+            dependencies.cacheQueue.async { continuation.resume() }
+        }
+    }
+
+    /// Ends the live session when the player moves to another track, finishing the outgoing tail in the background.
+    func handleTrackChanged() {
+        finalizeOutgoingTrackTailIfNeeded()
+        stopActiveSession()
+    }
+
+    private func stopActiveSession() {
         cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
         captureTargetGeneration &+= 1
@@ -907,7 +966,13 @@ final class AudioSyncManager {
         onCacheLoad: (() -> Void)? = nil
     ) {
         let trackChanged = activeTrackId != track.id
-        stop()
+        if trackChanged {
+            finalizeOutgoingTrackTailIfNeeded()
+        }
+        if forceResync, let pending = pendingTailFinalizations.removeValue(forKey: track.id) {
+            pending.task.cancel()
+        }
+        stopActiveSession()
         activeTrackId = track.id
         activeSourceBundleId = track.sourceBundleId
         baseLines = rawLines
@@ -950,7 +1015,11 @@ final class AudioSyncManager {
         state.audioSyncStatus = .idle
         let generation = syncGeneration
         let cacheQueue = dependencies.cacheQueue
+        let pendingFinalization = pendingTailFinalizations[track.id]?.task
         cacheLoadTask = Task { [weak self, cache] in
+            if let pendingFinalization {
+                await pendingFinalization.value
+            }
             // A rapid reload must see all earlier saves and removals.
             let loaded: AudioSyncedLyricsRecord? = await withCheckedContinuation { continuation in
                 cacheQueue.async {
@@ -1032,7 +1101,12 @@ final class AudioSyncManager {
             } else if current {
                 // Keep recognized words for refinement without applying unreliable timings.
                 priorHeardWords = cached.heardWords ?? []
-                if priorHeardWords.isEmpty, !cached.hasLowYieldLocks {
+                // Keep settled attempts too, so this play adds to them instead of starting over.
+                let keepsAttempts = fillsIn && !rawLines.isEmpty && cached.lockedLineIDs != nil && !cached.settledLineIDs.isEmpty
+                if keepsAttempts {
+                    attemptedLineIDs = cached.settledLineIDs
+                }
+                if priorHeardWords.isEmpty, !cached.hasLowYieldLocks, !keepsAttempts {
                     removeCachedAlignment(trackId: track.id)
                 }
             } else {
@@ -1305,7 +1379,7 @@ final class AudioSyncManager {
     private func handleCaptureFailure(_ error: Error, generation: UInt64, captureGeneration: UInt64) {
         guard syncGeneration == generation, captureTargetGeneration == captureGeneration else { return }
         persistCurrentAlignmentIfReady()
-        stop()
+        stopActiveSession()
         if dependencies.usesProcessTap {
             if let captureError = error as? ProcessTapCaptureError, captureError.isPermissionError {
                 state.systemAudioCapturePermission = .denied
@@ -1603,14 +1677,14 @@ final class AudioSyncManager {
         // Run vocal isolation, pitch analysis, chroma extraction, normalization, Core ML inference,
         // and CTC Viterbi at `.background` QoS so multi-threaded CPU fallback (libBNNS) stays on
         // efficiency cores and never preempts interactive UI threads.
-        chunkProcessingTask = Task.detached(priority: .background) { [weak self] in
+        chunkProcessingTask = Task.detached(priority: .background) { [weak self] () -> ChunkOutcome? in
             let recognized = Self.recognitionAudio(mid: rawChunk, side: sideChunk, sampleRate: sampleRate, separator: separator, resample: resample)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return nil }
             guard let audio = recognized else {
                 await self?.stopAfterChunkFailure(
                     generation: generation, message: "Could not resample captured audio for lyrics alignment; it restarts with the next track"
                 )
-                return
+                return nil
             }
             if let envelopeLocation, audio.vocalSeparationSeconds != nil {
                 var stem = VocalEnvelope()
@@ -1619,7 +1693,7 @@ final class AudioSyncManager {
                     await self?.publishSeparatedEnvelope(segment, at: envelopeLocation, trackId: trackId, generation: generation)
                 }
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return nil }
             let pitch: VocalPitchContour.Segment? = if audio.vocalSeparationSeconds != nil, audio.sampleRate == VocalPitchContour.sampleRate {
                 VocalPitchContour.analyze(mid: audio.samples, side: [], start: chunkStart, rate: requestPlaybackRate)
             } else if Int(sampleRate) == VocalPitchContour.sampleRate {
@@ -1629,7 +1703,7 @@ final class AudioSyncManager {
             } else {
                 nil
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return nil }
             var chroma = AudioChromaProfile()
             for index in spans.indices {
                 let span = spans[index]
@@ -1638,7 +1712,7 @@ final class AudioSyncManager {
                 chroma.append(samples: samples, sampleRate: sampleRate, startTime: span.time, rate: requestPlaybackRate)
             }
             let chunkChroma = chroma
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return nil }
             let request = AudioChunkRequest(
                 samples: AudioLevel.normalizedForRecognition(audio.samples),
                 sampleRate: audio.sampleRate,
@@ -1654,15 +1728,15 @@ final class AudioSyncManager {
                 await self?.stopAfterChunkFailure(
                     generation: generation, message: "Lyrics alignment stopped unexpectedly; it restarts with the next track"
                 )
-                return
+                return nil
             }
-            await MainActor.run { [weak self] in
-                guard let self, self.syncGeneration == generation else { return }
+            let appliedOnMain = await MainActor.run { [weak self] () -> Bool in
+                guard let self, self.syncGeneration == generation else { return false }
                 self.chunkProcessingTask = nil
                 guard self.activeTrackId == trackId,
                       self.isLiveSyncActive,
                       self.state.audioSyncEngine == .lyricsAlignment
-                else { return }
+                else { return true }
                 if let pitch {
                     self.vocalPitchContour.merge(pitch)
                 }
@@ -1686,7 +1760,9 @@ final class AudioSyncManager {
                 }
                 self.applyLyricsAlignment(replacingAttempts: newAttempts, reporter: reporter)
                 self.dispatchChunkIfReady(trackId: trackId, generation: generation)
+                return true
             }
+            return appliedOnMain ? nil : ChunkOutcome(words: words, pitch: pitch, chroma: chunkChroma)
         }
     }
 
@@ -1708,7 +1784,7 @@ final class AudioSyncManager {
         guard syncGeneration == generation else { return }
         chunkProcessingTask = nil
         persistCurrentAlignmentIfReady()
-        stop()
+        stopActiveSession()
         state.audioSyncStatus = .unavailable(message)
     }
 
@@ -1832,6 +1908,24 @@ final class AudioSyncManager {
     }
 
     private func keepingLockedAndAccepted(_ result: AudioAlignmentResult, replacingAttempts: Set<Int> = []) -> AudioAlignmentResult {
+        Self.keepingLockedAndAccepted(
+            result,
+            baseLines: baseLines,
+            anchoredLines: anchoredLines,
+            lockedThisPlay: lockedThisPlay,
+            acceptedSessionLines: acceptedSessionLines,
+            replacingAttempts: replacingAttempts
+        )
+    }
+
+    private nonisolated static func keepingLockedAndAccepted(
+        _ result: AudioAlignmentResult,
+        baseLines: [LyricLine],
+        anchoredLines: [Int: LyricLine],
+        lockedThisPlay: [Int: LyricLine],
+        acceptedSessionLines: [Int: LyricLine],
+        replacingAttempts: Set<Int> = []
+    ) -> AudioAlignmentResult {
         let preserved = acceptedSessionLines
         guard !anchoredLines.isEmpty || !lockedThisPlay.isEmpty || !preserved.isEmpty else { return result }
         let minLineGap = 0.15
@@ -2119,8 +2213,16 @@ final class AudioSyncManager {
         AudioSyncedLyricsRecord.hasLowYieldLocks(lockedIDs: lockedLineIDs, attemptedIDs: attemptedLineIDs)
     }
 
-    /// Attempted lines count as settled only while this play hasn't locked anything new.
-    private var settledLineIDs: Set<Int> { lockedThisPlay.isEmpty ? attemptedLineIDs : [] }
+    /// Attempted lines that stay settled during this play: once prior anchors exist, only lines near a newly
+    /// locked anchor reopen rather than wiping every settled line on the track.
+    private var settledLineIDs: Set<Int> {
+        AudioSyncedLyricsRecord.settledLineIDs(
+            attemptedIDs: attemptedLineIDs,
+            newlyLockedIDs: Set(lockedThisPlay.keys),
+            hadPriorAnchors: !anchoredLines.isEmpty,
+            in: baseLines
+        )
+    }
 
     nonisolated static func sungSpan(of line: LyricLine) -> ClosedRange<Double>? {
         let lead = LyricsAudioAligner.leadTokenGroups(of: line)
@@ -2267,7 +2369,7 @@ final class AudioSyncManager {
         diagnostics.update { $0.record(alignment: result, sourceLines: lines) }
         let progress = Self.lyricsAlignmentProgress(lockedIDs: lockedLineIDs, settledIDs: settledLineIDs, lines: baseLines)
         if progress.totalLines == 0 {
-            stop()
+            stopActiveSession()
             state.audioSyncStatus = .unavailable("Lyrics script is not supported by Lyrics Alignment")
             return
         }
@@ -2291,13 +2393,13 @@ final class AudioSyncManager {
             )
             persistAlignment(result, engine: .lyricsAlignment, forceUpdateCount: newLockDisplacedCache || droppedPreviouslyAccepted)
             state.applyAudioSyncedLines(result.lines)
-        } else if droppedPriorWords {
+        } else if droppedPriorWords || (cachedAlignedLineCount == 0 && (!replacingAttempts.isEmpty || progress.isFinished)) {
             persistAlignment(result, engine: .lyricsAlignment)
         }
         if progress.isFinished {
             // Keep the playback boundary so the next repeat can retry a poorly aligned pass.
             let restartBoundary = hasLowYieldLocks ? lastPlayback : nil
-            stop()
+            stopActiveSession()
             lastPlayback = restartBoundary
             state.audioSyncStatus = progress.status(engine: .lyricsAlignment)
         } else {
@@ -2343,6 +2445,7 @@ final class AudioSyncManager {
             lockedLineIDs: engine == .lyricsAlignment ? lockedLineIDs.sorted() : nil,
             attemptedLineIDs: engine == .lyricsAlignment ? attemptedLineIDs.subtracting(lockedLineIDs).sorted() : nil,
             lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil,
+            newlyLockedLineIDs: engine == .lyricsAlignment ? lockedThisPlay.keys.sorted() : nil,
             chromaTemplates: templates.isEmpty ? nil : templates
         )
         dependencies.cacheQueue.async { [cache] in
@@ -2351,6 +2454,347 @@ final class AudioSyncManager {
         cachedAlignedLineCount = forceUpdateCount
             ? result.matchedLineCount
             : max(cachedAlignedLineCount, result.matchedLineCount)
+    }
+
+    /// Finishes an in-flight chunk and any buffered tail audio for the outgoing track in the background so a
+    /// track switch or crossfade does not drop the final lines before they can lock or settle into the cache.
+    private func finalizeOutgoingTrackTailIfNeeded() {
+        guard isLiveSyncActive,
+              state.audioSyncEngine == .lyricsAlignment,
+              !silencePermissionFlagged,
+              let trackId = activeTrackId,
+              !baseLines.isEmpty,
+              let engine = chunkEngine
+        else { return }
+        let hasRemainingAudio = !sentFinalChunk
+            && !audioSampleBuffer.isEmpty
+            && (!dependencies.usesProcessTap || hasReceivedAudibleAudioThisSession)
+        let inFlightTask = chunkProcessingTask
+        guard inFlightTask != nil || hasRemainingAudio || engine.hasHeldAudio else { return }
+
+        // Hand ownership to the background finalizer before `stopActiveSession()` tears down live state.
+        chunkEngine = nil
+        chunkProcessingTask = nil
+        let separator = vocalSeparator
+        vocalSeparator = nil
+
+        let remainingMid = hasRemainingAudio ? audioSampleBuffer : []
+        let remainingSide = hasRemainingAudio && audioSideBuffer.count == audioSampleBuffer.count ? audioSideBuffer : []
+        let remainingSpans = hasRemainingAudio ? captureSpanStarts : []
+        let sampleRate = activeSampleRate
+        let fallbackChunkStart = chunkStartPos ?? currentPlaybackPosition()
+        let playbackRate = chunkPlaybackRate
+        let chunkFrames = max(1, Int(sampleRate * chunkDurationSeconds))
+        let resample = dependencies.resampleForRecognition
+        let cache = cache
+        let cacheQueue = dependencies.cacheQueue
+
+        let baseLines = baseLines
+        let anchoredLines = anchoredLines
+        var lockedThisPlay = lockedThisPlay
+        let acceptedSessionLines = acceptedSessionLines
+        let priorUnlockedLines = priorUnlockedLines
+        var attemptedLineIDs = attemptedLineIDs
+        var attemptedThisPlay = attemptedThisPlay
+        var confidentLineIDs = confidentLineIDs
+        var nearlyConfidentLineIDs = nearlyConfidentLineIDs
+        var recognizedWords = recognizedWords
+        let priorHeardWords = priorHeardWords
+        let vocalEnvelope = vocalEnvelope
+        var vocalPitchContour = vocalPitchContour
+        var chromaProfile = chromaProfile
+        let cachedChromaTemplates = cachedChromaTemplates
+        let cachedAlignedLineCount = cachedAlignedLineCount
+        let splitsSyllables = state.syllableTiming
+
+        let taskID = UUID()
+        let task = Task.detached(priority: .background) { [weak self] in
+            defer {
+                engine.shutdown()
+                Task { @MainActor [weak self] in
+                    if self?.pendingTailFinalizations[trackId]?.id == taskID {
+                        self?.pendingTailFinalizations.removeValue(forKey: trackId)
+                    }
+                }
+            }
+
+            if let inFlightTask, let outcome = await inFlightTask.value {
+                if let pitch = outcome.pitch {
+                    vocalPitchContour.merge(pitch)
+                }
+                chromaProfile.merge(outcome.chroma)
+                recognizedWords.append(contentsOf: outcome.words)
+            }
+            guard !Task.isCancelled else { return }
+
+            let requests = remainingMid.isEmpty ? [] : Self.tailRequests(
+                sampleCount: remainingMid.count,
+                spans: remainingSpans.isEmpty ? [(0, fallbackChunkStart, false)] : remainingSpans,
+                sampleRate: sampleRate,
+                rate: playbackRate,
+                chunkFrames: chunkFrames
+            )
+            for piece in requests {
+                guard !Task.isCancelled else { return }
+                // A drop starts a new run, which would discard the audio the previous run held back.
+                if piece.startsNewSpan, let words = try? engine.finishRun(continuesAfterGap: true) {
+                    recognizedWords.append(contentsOf: words)
+                }
+                let segMid = Array(remainingMid[piece.range])
+                let segSide = remainingSide.count == remainingMid.count ? Array(remainingSide[piece.range]) : []
+                guard let audio = Self.recognitionAudio(
+                    mid: segMid, side: segSide, sampleRate: sampleRate, separator: separator, resample: resample
+                ) else { break }
+                guard !Task.isCancelled else { return }
+
+                let pitch: VocalPitchContour.Segment? = if audio.vocalSeparationSeconds != nil,
+                    audio.sampleRate == VocalPitchContour.sampleRate {
+                    VocalPitchContour.analyze(mid: audio.samples, side: [], start: piece.startTime, rate: playbackRate)
+                } else if Int(sampleRate) == VocalPitchContour.sampleRate {
+                    VocalPitchContour.analyze(mid: segMid, side: segSide, start: piece.startTime, rate: playbackRate)
+                } else if audio.sampleRate == VocalPitchContour.sampleRate {
+                    VocalPitchContour.analyze(mid: audio.samples, side: [], start: piece.startTime, rate: playbackRate)
+                } else {
+                    nil
+                }
+                if let pitch {
+                    vocalPitchContour.merge(pitch)
+                }
+                for span in piece.chromaSpans {
+                    chromaProfile.append(
+                        samples: Array(remainingMid[span.range]), sampleRate: sampleRate, startTime: span.time, rate: playbackRate
+                    )
+                }
+
+                let request = AudioChunkRequest(
+                    samples: AudioLevel.normalizedForRecognition(audio.samples),
+                    sampleRate: audio.sampleRate,
+                    chunkStartTime: piece.startTime,
+                    playbackRate: playbackRate,
+                    isFinal: piece.isFinal,
+                    startsNewSpan: piece.startsNewSpan
+                )
+                if let words = try? await engine.transcribe(request) {
+                    recognizedWords.append(contentsOf: words)
+                }
+            }
+            guard !Task.isCancelled else { return }
+            if let words = try? engine.finishRun(continuesAfterGap: false) {
+                recognizedWords.append(contentsOf: words)
+            }
+
+            var newAttempts: Set<Int> = []
+            let reporter = engine as? LineAttemptReporting
+            if let reporter {
+                let reported = reporter.attemptedLineIDs
+                newAttempts = reported.subtracting(attemptedThisPlay)
+                attemptedLineIDs.formUnion(reported)
+                attemptedThisPlay.formUnion(newAttempts)
+                confidentLineIDs.formUnion(reporter.confidentLineIDs)
+                nearlyConfidentLineIDs.formUnion(reporter.nearlyConfidentLineIDs)
+            }
+
+            let allHeard: [RecognizedAudioWord]
+            if anchoredLines.isEmpty {
+                let unattemptedPrior = priorHeardWords.filter { word in
+                    word.sourceLineId.map { !attemptedThisPlay.contains($0) } ?? true
+                }
+                allHeard = Self.mergeHeardWords(prior: unattemptedPrior, current: recognizedWords)
+            } else {
+                allHeard = (Self.recognizedWords(of: Array(anchoredLines.values)) + recognizedWords)
+                    .sorted { $0.startTime < $1.startTime }
+            }
+            let (refinedWords, _) = WaveformTimingRefiner.refine(
+                allHeard, envelope: vocalEnvelope, pitchContour: vocalPitchContour, timingError: 0.06
+            )
+            let fresh = LyricsAudioAligner.align(
+                lines: baseLines,
+                recognizedWords: refinedWords,
+                regroupsCJKWords: false,
+                splitsSyllables: splitsSyllables
+            )
+            let direct = Self.keepingLockedAndAccepted(
+                fresh,
+                baseLines: baseLines,
+                anchoredLines: anchoredLines,
+                lockedThisPlay: lockedThisPlay,
+                acceptedSessionLines: acceptedSessionLines,
+                replacingAttempts: newAttempts
+            )
+            let existingLocked = Set(anchoredLines.keys).union(lockedThisPlay.keys)
+            let survivedNewMatches = Set(fresh.matchedLineIDs)
+                .intersection(direct.matchedLineIDs)
+                .subtracting(existingLocked)
+                .subtracting(fresh.clampedRunawayLineIDs)
+            var lockedNewLine = false
+            for line in direct.lines where survivedNewMatches.contains(line.id) && Self.locks(
+                line,
+                confident: confidentLineIDs,
+                nearlyConfident: nearlyConfidentLineIDs,
+                envelope: vocalEnvelope,
+                pitchContour: vocalPitchContour,
+                priorAlignedLine: priorUnlockedLines[line.id]
+            ) {
+                lockedThisPlay[line.id] = line
+                lockedNewLine = true
+            }
+            let lockedIDs = Set(anchoredLines.keys).union(lockedThisPlay.keys)
+            if reporter?.discardStaleOffset(lockedLineIDs: lockedIDs) == true {
+                await Self.enqueueUnlessCancelled(on: cacheQueue) { cache.remove(trackId: trackId) }
+                return
+            }
+
+            var result = direct
+            if !lockedIDs.isEmpty, !chromaProfile.segments.isEmpty {
+                let protectedTargetIDs = Set(fresh.matchedLineIDs)
+                    .intersection(direct.matchedLineIDs)
+                    .subtracting(fresh.clampedRunawayLineIDs)
+                let recovery = ChorusSelfSimilarity.recoverRepeatedLines(
+                    in: direct.lines,
+                    lockedIDs: lockedIDs,
+                    protectedTargetIDs: protectedTargetIDs,
+                    chroma: chromaProfile,
+                    cachedTemplates: cachedChromaTemplates,
+                    medianOffset: direct.medianOffset,
+                    sourceTimestamps: Dictionary(uniqueKeysWithValues: baseLines.map { ($0.id, $0.timestamp) })
+                )
+                if !recovery.recoveredLineIDs.isEmpty {
+                    let matched = Set(direct.matchedLineIDs).union(recovery.recoveredLineIDs)
+                    result = AudioAlignmentResult(
+                        lines: recovery.lines,
+                        matchedLineCount: matched.count,
+                        matchedWordCount: direct.matchedWordCount,
+                        medianOffset: direct.medianOffset,
+                        matchedLineIDs: recovery.lines.map(\.id).filter(matched.contains),
+                        clampedRunawayLineIDs: direct.clampedRunawayLineIDs.subtracting(recovery.recoveredLineIDs)
+                    )
+                }
+            }
+
+            let settled = AudioSyncedLyricsRecord.settledLineIDs(
+                attemptedIDs: attemptedLineIDs,
+                newlyLockedIDs: Set(lockedThisPlay.keys),
+                hadPriorAnchors: !anchoredLines.isEmpty,
+                in: baseLines
+            )
+            let progress = Self.lyricsAlignmentProgress(lockedIDs: lockedIDs, settledIDs: settled, lines: baseLines)
+            guard progress.totalLines > 0 else { return }
+
+            let matchedIDs = Set(result.matchedLineIDs)
+            let displacedAcceptedCount = acceptedSessionLines.keys.filter { !matchedIDs.contains($0) }.count
+            let droppedPreviouslyAccepted = acceptedSessionLines.keys.contains {
+                newAttempts.contains($0) && !matchedIDs.contains($0)
+            }
+            let droppedPriorWords = priorHeardWords.contains { word in
+                word.sourceLineId.map { newAttempts.contains($0) && !matchedIDs.contains($0) } ?? false
+            }
+            let newLockDisplacedCache = lockedNewLine
+                && (result.matchedLineCount + displacedAcceptedCount >= cachedAlignedLineCount)
+            let shouldPersist = droppedPreviouslyAccepted
+                || (result.matchedLineCount > 0 && (newLockDisplacedCache || result.matchedLineCount >= cachedAlignedLineCount))
+                || droppedPriorWords
+                || (cachedAlignedLineCount == 0 && (!newAttempts.isEmpty || progress.isFinished))
+            guard shouldPersist, !Task.isCancelled else { return }
+
+            let sourceCount = baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+            let templates = ChorusSelfSimilarity.extractCachedTemplates(
+                in: result.lines,
+                lockedIDs: lockedIDs,
+                chroma: chromaProfile,
+                existing: cachedChromaTemplates
+            )
+            let record = AudioSyncedLyricsRecord(
+                trackId: trackId,
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: result.medianOffset,
+                alignedLineCount: result.matchedLineCount,
+                sourceLineCount: sourceCount,
+                lines: result.lines,
+                heardWords: refinedWords,
+                lockedLineIDs: lockedIDs.sorted(),
+                attemptedLineIDs: attemptedLineIDs.subtracting(lockedIDs).sorted(),
+                lockedAtPlayStart: anchoredLines.count,
+                newlyLockedLineIDs: lockedThisPlay.keys.sorted(),
+                chromaTemplates: templates.isEmpty ? nil : templates
+            )
+            await Self.enqueueUnlessCancelled(on: cacheQueue) { cache.save(record) }
+        }
+        pendingTailFinalizations[trackId] = (taskID, task)
+    }
+
+    struct TailRequest: Equatable {
+        struct ChromaSpan: Equatable {
+            let range: Range<Int>
+            let time: Double
+        }
+
+        let range: Range<Int>
+        let startTime: Double
+        let startsNewSpan: Bool
+        var isFinal: Bool
+        /// The capture spans inside `range` at their own track times, as the live path extracts chroma.
+        let chromaSpans: [ChromaSpan]
+    }
+
+    /// Splits buffered tail audio into requests no longer than a live chunk, starting a new run at each drop.
+    /// The aligner's window fits one live chunk plus its held-back context, so a longer request would misplace frames.
+    nonisolated static func tailRequests(
+        sampleCount: Int,
+        spans: [(offset: Int, time: Double, followsDrop: Bool)],
+        sampleRate: Double,
+        rate: Double,
+        chunkFrames: Int
+    ) -> [TailRequest] {
+        guard sampleCount > 0, let first = spans.first else { return [] }
+        let spanEnds = spans.dropFirst().map(\.offset) + [sampleCount]
+        func time(at offset: Int, in index: Int) -> Double {
+            spans[index].time + Double(offset - spans[index].offset) / max(sampleRate, 1) * rate
+        }
+
+        var segments: [(range: Range<Int>, followsDrop: Bool)] = []
+        var segmentStart = 0
+        var segmentFollowsDrop = first.followsDrop
+        for span in spans.dropFirst() where span.followsDrop && span.offset > segmentStart && span.offset < sampleCount {
+            segments.append((segmentStart..<span.offset, segmentFollowsDrop))
+            segmentStart = span.offset
+            segmentFollowsDrop = true
+        }
+        segments.append((segmentStart..<sampleCount, segmentFollowsDrop))
+
+        var requests: [TailRequest] = []
+        for segment in segments {
+            for start in stride(from: segment.range.lowerBound, to: segment.range.upperBound, by: max(1, chunkFrames)) {
+                let range = start..<min(start + max(1, chunkFrames), segment.range.upperBound)
+                let startSpan = spans.lastIndex { $0.offset <= start } ?? 0
+                let chromaSpans = spans.indices.compactMap { index -> TailRequest.ChromaSpan? in
+                    let lower = max(range.lowerBound, spans[index].offset)
+                    let upper = min(range.upperBound, spanEnds[index])
+                    return lower < upper ? TailRequest.ChromaSpan(range: lower..<upper, time: time(at: lower, in: index)) : nil
+                }
+                requests.append(TailRequest(
+                    range: range,
+                    startTime: time(at: start, in: startSpan),
+                    startsNewSpan: segment.followsDrop && start == segment.range.lowerBound,
+                    isFinal: false,
+                    chromaSpans: chromaSpans
+                ))
+            }
+        }
+        requests[requests.count - 1].isFinal = true
+        return requests
+    }
+
+    /// Force resync cancels finalizers on the main actor, so checking there orders a finalizer's cache write
+    /// before resync's removal or drops it.
+    private nonisolated static func enqueueUnlessCancelled(
+        on queue: DispatchQueue,
+        _ operation: @escaping @Sendable () -> Void
+    ) async {
+        await MainActor.run {
+            guard !Task.isCancelled else { return }
+            queue.async(execute: operation)
+        }
     }
 
     struct AudioChunkRequest: Sendable {

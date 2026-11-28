@@ -600,7 +600,46 @@ final class LyricsCacheTests: XCTestCase {
         XCTAssertEqual(translatedAfterClear.map(\.text), ["newer en"])
     }
 
-    func testClearingAudioSyncKeepsFetchedLyricsAndTranslations() {
+    func testAudioSyncRemovalCancelsPendingSavesBeforeDeleting() async {
+        let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
+        let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
+        let offline: LyricsFetcher.DataLoader = { _ in throw URLError(.notConnectedToInternet) }
+        let trackId = "spotify:track:pending-save"
+        let record = AudioSyncedLyricsRecord(
+            trackId: trackId, engine: .lyricsAlignment, syncedAt: Date(), medianOffset: 0.2,
+            alignedLineCount: 1, sourceLineCount: 1, lines: [LyricLine(id: 0, timestamp: 1.2, text: "line")]
+        )
+        let calls = LockedCalls()
+        let remover = OfflineCacheRemover(
+            fetcher: LyricsFetcher(diskCache: diskCache, dataLoader: offline),
+            translator: LyricsTranslator(diskCache: diskCache, dataLoader: offline),
+            lyricsCache: diskCache,
+            syncCache: syncCache,
+            beforeAudioSyncRemoval: { cacheKey in
+                calls.append(cacheKey, recordExisted: syncCache.load(trackId: trackId) != nil)
+            }
+        )
+        let cacheKey = AudioSyncedLyricsCache.cacheKey(forTrackId: trackId)
+        let song = CachedSongSummary(
+            cacheKey: cacheKey, trackId: trackId, title: "Song", artist: "Artist",
+            lineCount: 1, sizeBytes: 0, modifiedAt: Date(), syncEngine: .lyricsAlignment
+        )
+
+        syncCache.save(record)
+        await remover.remove(song)
+        XCTAssertNil(syncCache.load(trackId: trackId))
+        syncCache.save(record)
+        await remover.removeAllAudioSync()
+        XCTAssertNil(syncCache.load(trackId: trackId))
+        syncCache.save(record)
+        await remover.removeAll()
+        XCTAssertNil(syncCache.load(trackId: trackId))
+
+        XCTAssertEqual(calls.cacheKeys, [cacheKey, nil, nil])
+        XCTAssertEqual(calls.recordExisted, [true, true, true], "pending saves are cancelled before the deletion")
+    }
+
+    func testClearingAudioSyncKeepsFetchedLyricsAndTranslations() async {
         let diskCache = LyricsDiskCache(directory: tempDir, maxEntries: 10)
         let syncCache = AudioSyncedLyricsCache(directory: tempDir.appendingPathComponent("sync", isDirectory: true))
         let offline: LyricsFetcher.DataLoader = { _ in throw URLError(.notConnectedToInternet) }
@@ -620,7 +659,7 @@ final class LyricsCacheTests: XCTestCase {
             alignedLineCount: 1, sourceLineCount: 1, lines: [LyricLine(id: 0, timestamp: 1.2, text: "fetched")]
         ))
 
-        remover.removeAllAudioSync()
+        await remover.removeAllAudioSync()
 
         XCTAssertNil(syncCache.load(trackId: trackId))
         XCTAssertEqual(syncCache.stats().count, 0)
@@ -759,5 +798,21 @@ final class LyricsCacheTests: XCTestCase {
         await stale.value
 
         XCTAssertEqual(model.snapshot.cachedSongCount, 2)
+    }
+}
+
+private final class LockedCalls: @unchecked Sendable {
+    private let lock = NSLock()
+    private var keys: [String?] = []
+    private var existed: [Bool] = []
+
+    var cacheKeys: [String?] { lock.withLock { keys } }
+    var recordExisted: [Bool] { lock.withLock { existed } }
+
+    func append(_ cacheKey: String?, recordExisted: Bool) {
+        lock.withLock {
+            keys.append(cacheKey)
+            existed.append(recordExisted)
+        }
     }
 }

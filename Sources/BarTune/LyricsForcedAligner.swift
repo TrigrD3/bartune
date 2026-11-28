@@ -522,6 +522,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private var runSamples = 0
     private var frames: [Float] = []
     private var committedFrames = 0
+    /// The last window kept back its newest `holdBack` frames, or its prediction failed.
+    private var holdsFrames = false
     /// End of the last aligned word in this run; later lines can't start before it.
     private var alignedUntilFrame = 0
     /// Onset minus LRC time of each anchor and confident line, across runs.
@@ -719,6 +721,31 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
 
     func shutdown() {}
 
+    var hasHeldAudio: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return holdsFrames
+    }
+
+    func finishRun(continuesAfterGap: Bool = false) throws -> [RecognizedAudioWord] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard holdsFrames else { return [] }
+        let doneBefore = done
+        // Rescore the last window without holding back, as a final request would have.
+        try score([], holdingBack: false)
+        let words = alignReadyLines(throughEnd: true)
+        if continuesAfterGap {
+            // A miss whose onset may come after the gap retries against the next capture span.
+            let coveredEnd = trackTime(ofRunFrame: committedFrames)
+            let matchedIDs = Set(words.compactMap(\.sourceLineId))
+            done.subtract(done.subtracting(doneBefore).filter { index in
+                !matchedIDs.contains(lines[index].id) && searchWindow(for: index).latestOnset > coveredEnd
+            })
+        }
+        return words
+    }
+
     private var secondsPerFrame: Double {
         Double(model.windowSampleCount) / Double(Self.sampleRate) / Double(model.frameCount)
     }
@@ -755,6 +782,8 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         history.append(contentsOf: samples)
         if history.count > windowSize { history.removeFirst(history.count - windowSize) }
         runSamples += samples.count
+        // The window stays pending until its prediction succeeds, so `finishRun` can score it again.
+        holdsFrames = true
 
         var window = [Float](repeating: 0, count: windowSize)
         if !history.isEmpty {
@@ -772,6 +801,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         vDSP_vsmul(window, 1, &scale, &window, 1, length)
 
         let logProbs = try model.logProbabilities(window: window)
+        holdsFrames = holdingBack
         let frameCount = model.frameCount
         let windowStartFrame = Int((Double(runSamples - windowSize) / Double(windowSize) * Double(frameCount)).rounded())
         let heldBack = holdingBack ? holdBackSamples : 0

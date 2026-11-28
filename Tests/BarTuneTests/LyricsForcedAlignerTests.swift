@@ -1055,6 +1055,81 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertEqual(words.last?.startTime ?? 0, 20.8, accuracy: 0.01)
     }
 
+    func testFinishRunAlignsAudioTheLastNonFinalChunkHeldBack() async throws {
+        let lines = [LyricLine(id: 0, timestamp: 12.0, text: "ka"), LyricLine(id: 1, timestamp: 20.0, text: "ka")]
+        // Frame f is track -2 + 0.24 f: line 1's "ka" at 20.8 s is in the newest 2 s the chunk holds back.
+        let peaks = [63: 14, 64: 4, 95: 14, 96: 4]
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        model.peaksForCall = [peaks, peaks]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+
+        let midSong = try await aligner.transcribe(chunk(start: 10.0))
+        XCTAssertTrue(midSong.isEmpty)
+        XCTAssertTrue(aligner.hasHeldAudio)
+
+        // The track switched away before another chunk, so the held frames are aligned without more audio.
+        let words = try aligner.finishRun()
+        XCTAssertEqual(words.map(\.sourceLineId), [0, 1])
+        XCTAssertEqual(words.last?.startTime ?? 0, 20.8, accuracy: 0.01)
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+        XCTAssertFalse(aligner.hasHeldAudio)
+
+        XCTAssertTrue(try aligner.finishRun().isEmpty)
+        XCTAssertEqual(model.windows.count, 2, "a finished run is not scored again")
+    }
+
+    func testFinishRunScoresAWindowWhoseFinalPredictionFailed() async throws {
+        let lines = [LyricLine(id: 0, timestamp: 12.0, text: "ka")]
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        model.failingCalls = [0]
+        model.peaksForCall = [[63: 14, 64: 4]]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+
+        do {
+            _ = try await aligner.transcribe(chunk(start: 10.0, isFinal: true))
+            XCTFail("the first prediction fails")
+        } catch {}
+        XCTAssertTrue(aligner.hasHeldAudio, "the unscored window stays pending")
+
+        let words = try aligner.finishRun()
+        XCTAssertEqual(words.map(\.sourceLineId), [0])
+        XCTAssertEqual(words.first?.startTime ?? 0, 13.12, accuracy: 0.01)
+        XCTAssertEqual(model.windows.count, 2)
+        XCTAssertEqual(model.windows.first, model.windows.last, "the retained samples are not appended again")
+        XCTAssertFalse(aligner.hasHeldAudio)
+    }
+
+    func testFinishRunBeforeAGapLeavesAMissAtItsEdgeForTheNextSpan() async throws {
+        let lines = [LyricLine(id: 0, timestamp: 2.0, text: "ka"), LyricLine(id: 1, timestamp: 11.5, text: "ka")]
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        // Run 1 frame f is track 0.24 (f - 50): line 0 is heard 1.12 s late, so line 1 may start after 12 s.
+        // Run 2 frame f is track 12.1 + 0.24 (f - 50): line 1 is heard at 12.58 s.
+        model.peaksForCall = [[63: 14, 64: 4], [:], [52: 14, 53: 4]]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+
+        _ = try await aligner.transcribe(chunk(start: 0))
+        let beforeGap = try aligner.finishRun(continuesAfterGap: true)
+        XCTAssertEqual(beforeGap.map(\.sourceLineId), [0], "a match before the gap is kept")
+        XCTAssertEqual(aligner.attemptedLineIDs, [0], "line 1's onset window reaches past the gap")
+
+        let afterGap = try await aligner.transcribe(chunk(start: 12.1, isFinal: true, startsNewSpan: true))
+        XCTAssertEqual(afterGap.map(\.sourceLineId), [1])
+        XCTAssertEqual(afterGap.first?.startTime ?? 0, 12.58, accuracy: 0.01)
+        XCTAssertEqual(aligner.attemptedLineIDs, [0, 1])
+    }
+
+    func testFinishRunAfterFinalChunkDoesNotScoreAgain() async throws {
+        let lines = [LyricLine(id: 0, timestamp: 12.0, text: "ka")]
+        let model = FakeAcousticModel(windowSampleCount: 24 * 16000, frameCount: 100)
+        model.peaksForCall = [[63: 14, 64: 4]]
+        let aligner = LyricsForcedAligner(lines: lines, model: model, lineWindow: 3.0, holdBack: 2.0)
+
+        _ = try await aligner.transcribe(chunk(start: 10.0, isFinal: true))
+        XCTAssertFalse(aligner.hasHeldAudio)
+        XCTAssertTrue(try aligner.finishRun().isEmpty)
+        XCTAssertEqual(model.windows.count, 1)
+    }
+
     func testFinalChunkRetriesClearLineWhenItsSuccessorCannotFit() async throws {
         let model = FakeAcousticModel(windowSampleCount: 2 * 16000, frameCount: 20)
         let lines = [
@@ -1716,15 +1791,20 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertFalse(pass2.needsAudio(from: 95, to: 107), "chunk well past window end + hold-back should be skipped")
     }
 
-    private func chunk(start: Double, isFinal: Bool = false) -> AudioSyncManager.AudioChunkRequest {
+    private func chunk(start: Double, isFinal: Bool = false, startsNewSpan: Bool = false) -> AudioSyncManager.AudioChunkRequest {
         AudioSyncManager.AudioChunkRequest(
             samples: (0..<(12 * 16000)).map { Float($0 % 7 + 1) / 8 },
             sampleRate: 16000,
             chunkStartTime: start,
             playbackRate: 1,
-            isFinal: isFinal
+            isFinal: isFinal,
+            startsNewSpan: startsNewSpan
         )
     }
+}
+
+private enum FakeAcousticModelError: Error {
+    case predictionFailed
 }
 
 private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
@@ -1737,6 +1817,8 @@ private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
     var weakFrames: Set<Int> = []
     var weakLogProbability: Float = -2
     var logProbabilityByFrame: [Int: Float] = [:]
+    /// Zero-based calls that throw instead of predicting; they keep `peaksForCall` for the next call.
+    var failingCalls: Set<Int> = []
     private(set) var windows: [[Float]] = []
 
     init(windowSampleCount: Int, frameCount: Int) {
@@ -1744,8 +1826,9 @@ private final class FakeAcousticModel: CTCAcousticModel, @unchecked Sendable {
         self.frameCount = frameCount
     }
 
-    func logProbabilities(window: [Float]) -> [Float] {
+    func logProbabilities(window: [Float]) throws -> [Float] {
         windows.append(window)
+        if failingCalls.contains(windows.count - 1) { throw FakeAcousticModelError.predictionFailed }
         let peaks = peaksForCall.isEmpty ? [:] : peaksForCall.removeFirst()
         var values = [Float](repeating: -10, count: frameCount * vocabSize)
         for frame in 0..<frameCount {
