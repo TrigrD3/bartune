@@ -1205,16 +1205,20 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         index + 1 < lines.count && lines[index + 1].start - lines[index].contextEnd > 2 * lineWindow
     }
 
-    private func median(_ offsets: [Double]) -> Double? {
+    static func median(_ offsets: [Double]) -> Double? {
         guard !offsets.isEmpty else { return nil }
         let sorted = offsets.sorted()
         return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
     }
 
-    private func offsetEstimate(around index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
-        guard !offsets.isEmpty else { return (0, 0) }
-        let before = Array(lines.indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
-        let after = Array(lines.indices[(index + 1)...].lazy.compactMap { offsets[$0] }.prefix(3))
+    static func localOffsetEstimate(
+        around index: Int,
+        in indices: Range<Int>,
+        using offsets: [Int: Double]
+    ) -> (offset: Double, priorCount: Int, neighborCount: Int) {
+        guard !offsets.isEmpty, indices.contains(index) else { return (0, 0, 0) }
+        let before = Array(indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
+        let after = Array(indices[(index + 1)...].lazy.compactMap { offsets[$0] }.prefix(3))
         let combined: [Double] = if !before.isEmpty, !after.isEmpty {
             Array(before.prefix(2)) + Array(after.prefix(1))
         } else if !before.isEmpty {
@@ -1222,7 +1226,12 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         } else {
             after
         }
-        return (median(combined) ?? median(Array(offsets.values)) ?? 0, before.count)
+        return (median(combined) ?? median(Array(offsets.values)) ?? 0, before.count, combined.count)
+    }
+
+    private func offsetEstimate(around index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
+        let estimate = Self.localOffsetEstimate(around: index, in: lines.indices, using: offsets)
+        return (estimate.offset, estimate.priorCount)
     }
 
     private func searchWindow(for index: Int, coarseShift: Double? = nil) -> SearchWindow {

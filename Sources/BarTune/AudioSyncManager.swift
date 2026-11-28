@@ -2256,16 +2256,20 @@ final class AudioSyncManager {
     private nonisolated static let harmonicityLockRise: Float = 0.35
     nonisolated static let consensusStartTolerance = 0.15
     nonisolated static let consensusEndTolerance = 0.25
+    nonisolated static let lrcAgreementTolerance = 0.30
+    nonisolated static let minLrcAgreementNeighbors = 2
 
-    /// A well-timed line locks when confident, or when nearly confident and either starting on a vocal onset
-    /// or agreeing closely with an earlier unlocked pass.
+    /// A well-timed line locks when confident, or when nearly confident and starting on a vocal onset,
+    /// agreeing closely with an earlier unlocked pass, or agreeing with its offset-corrected LRC timestamp.
     nonisolated static func locks(
         _ line: LyricLine,
         confident: Set<Int>,
         nearlyConfident: Set<Int>,
         envelope: VocalEnvelope,
         pitchContour: VocalPitchContour? = nil,
-        priorAlignedLine: LyricLine? = nil
+        priorAlignedLine: LyricLine? = nil,
+        sourceTimestamp: Double? = nil,
+        localOffset: (offset: Double, neighborCount: Int)? = nil
     ) -> Bool {
         let groups = LyricsAudioAligner.leadTokenGroups(of: line)
         guard !groups.joined().contains(where: { word in
@@ -2307,7 +2311,113 @@ final class AudioSyncManager {
                 return true
             }
         }
-        return (envelope.onsetRise(at: first.start) ?? 0) >= onsetLockRise
+        if (envelope.onsetRise(at: first.start) ?? 0) >= onsetLockRise {
+            return true
+        }
+        if let sourceTimestamp,
+           let localOffset,
+           localOffset.neighborCount >= minLrcAgreementNeighbors,
+           abs(first.start - (sourceTimestamp + localOffset.offset)) <= lrcAgreementTolerance {
+            return true
+        }
+        return false
+    }
+
+    struct LockContext {
+        let baseLines: [LyricLine]
+        let existingLocked: [Int: LyricLine]
+        let confident: Set<Int>
+        let nearlyConfident: Set<Int>
+        let envelope: VocalEnvelope
+        let pitchContour: VocalPitchContour?
+        let priorUnlockedLines: [Int: LyricLine]
+
+        nonisolated init(
+            baseLines: [LyricLine],
+            existingLocked: [Int: LyricLine],
+            confident: Set<Int>,
+            nearlyConfident: Set<Int>,
+            envelope: VocalEnvelope,
+            pitchContour: VocalPitchContour? = nil,
+            priorUnlockedLines: [Int: LyricLine] = [:]
+        ) {
+            self.baseLines = baseLines
+            self.existingLocked = existingLocked
+            self.confident = confident
+            self.nearlyConfident = nearlyConfident
+            self.envelope = envelope
+            self.pitchContour = pitchContour
+            self.priorUnlockedLines = priorUnlockedLines
+        }
+    }
+
+    /// Collects newly lockable lines from `lines`, running a second pass for deferred `nearlyConfident` lines
+    /// so later independently evidenced locks in the same batch can supply their local LRC offset estimate.
+    nonisolated static func newlyLockedLines(
+        in lines: [LyricLine],
+        eligibleIDs: Set<Int>,
+        context: LockContext
+    ) -> [Int: LyricLine] {
+        var baseIndexAndStartByID: [Int: (index: Int, start: Double)] = [:]
+        baseIndexAndStartByID.reserveCapacity(context.baseLines.count)
+        var lockedOffsets: [Int: Double] = [:]
+        for (index, source) in context.baseLines.enumerated() {
+            if baseIndexAndStartByID[source.id] == nil {
+                baseIndexAndStartByID[source.id] = (index, source.timestamp)
+            }
+            if let locked = context.existingLocked[source.id] {
+                let lockedStart = sungSpan(of: locked)?.lowerBound ?? locked.timestamp
+                lockedOffsets[index] = lockedStart - source.timestamp
+            }
+        }
+
+        var newlyLocked: [Int: LyricLine] = [:]
+        func attemptLock(_ line: LyricLine) -> Bool {
+            let baseInfo = baseIndexAndStartByID[line.id]
+            func locksLine(sourceTimestamp: Double? = nil, localOffset: (offset: Double, neighborCount: Int)? = nil) -> Bool {
+                locks(
+                    line,
+                    confident: context.confident,
+                    nearlyConfident: context.nearlyConfident,
+                    envelope: context.envelope,
+                    pitchContour: context.pitchContour,
+                    priorAlignedLine: context.priorUnlockedLines[line.id],
+                    sourceTimestamp: sourceTimestamp,
+                    localOffset: localOffset
+                )
+            }
+            let independent = locksLine()
+            if !independent {
+                guard let baseInfo else { return false }
+                let estimate = LyricsForcedAligner.localOffsetEstimate(
+                    around: baseInfo.index, in: context.baseLines.indices, using: lockedOffsets
+                )
+                guard locksLine(
+                    sourceTimestamp: baseInfo.start,
+                    localOffset: (estimate.offset, estimate.neighborCount)
+                ) else { return false }
+            }
+            newlyLocked[line.id] = line
+            // Agreement locks never support a neighbour's agreement, so they cannot chain within a pass.
+            if independent, let baseInfo {
+                let lockedStart = sungSpan(of: line)?.lowerBound ?? line.timestamp
+                lockedOffsets[baseInfo.index] = lockedStart - baseInfo.start
+            }
+            return true
+        }
+
+        var deferred: [LyricLine] = []
+        for line in lines where eligibleIDs.contains(line.id) {
+            if !attemptLock(line), context.nearlyConfident.contains(line.id) {
+                deferred.append(line)
+            }
+        }
+        if !newlyLocked.isEmpty {
+            for line in deferred {
+                _ = attemptLock(line)
+            }
+        }
+        return newlyLocked
     }
 
     private func clearSessionAlignment() {
@@ -2332,22 +2442,26 @@ final class AudioSyncManager {
         let direct = keepingLockedAndAccepted(fresh, replacingAttempts: replacingAttempts)
         // Only a line aligned from this play's audio that survived conflict resolution against existing
         // locks can lock itself, never a conflicting match or one carried over unlocked.
+        let existingLocked = anchoredLines.merging(lockedThisPlay) { old, _ in old }
         let survivedNewMatches = Set(fresh.matchedLineIDs)
             .intersection(direct.matchedLineIDs)
-            .subtracting(lockedLineIDs)
+            .subtracting(existingLocked.keys)
             .subtracting(fresh.clampedRunawayLineIDs)
-        var lockedNewLine = false
-        for line in direct.lines where survivedNewMatches.contains(line.id) && Self.locks(
-            line,
-            confident: confidentLineIDs,
-            nearlyConfident: nearlyConfidentLineIDs,
-            envelope: vocalEnvelope,
-            pitchContour: vocalPitchContour,
-            priorAlignedLine: priorUnlockedLines[line.id]
-        ) {
-            lockedThisPlay[line.id] = line
-            lockedNewLine = true
-        }
+        let newLocks = Self.newlyLockedLines(
+            in: direct.lines,
+            eligibleIDs: survivedNewMatches,
+            context: Self.LockContext(
+                baseLines: baseLines,
+                existingLocked: existingLocked,
+                confident: confidentLineIDs,
+                nearlyConfident: nearlyConfidentLineIDs,
+                envelope: vocalEnvelope,
+                pitchContour: vocalPitchContour,
+                priorUnlockedLines: priorUnlockedLines
+            )
+        )
+        let lockedNewLine = !newLocks.isEmpty
+        lockedThisPlay.merge(newLocks) { old, _ in old }
         if reporter?.discardStaleOffset(lockedLineIDs: lockedLineIDs) == true {
             clearSessionAlignment()
             if let trackId = activeTrackId { removeCachedAlignment(trackId: trackId) }
@@ -2621,23 +2735,26 @@ final class AudioSyncManager {
                 acceptedSessionLines: acceptedSessionLines,
                 replacingAttempts: newAttempts
             )
-            let existingLocked = Set(anchoredLines.keys).union(lockedThisPlay.keys)
+            let existingLockedMap = anchoredLines.merging(lockedThisPlay) { old, _ in old }
             let survivedNewMatches = Set(fresh.matchedLineIDs)
                 .intersection(direct.matchedLineIDs)
-                .subtracting(existingLocked)
+                .subtracting(existingLockedMap.keys)
                 .subtracting(fresh.clampedRunawayLineIDs)
-            var lockedNewLine = false
-            for line in direct.lines where survivedNewMatches.contains(line.id) && Self.locks(
-                line,
-                confident: confidentLineIDs,
-                nearlyConfident: nearlyConfidentLineIDs,
-                envelope: vocalEnvelope,
-                pitchContour: vocalPitchContour,
-                priorAlignedLine: priorUnlockedLines[line.id]
-            ) {
-                lockedThisPlay[line.id] = line
-                lockedNewLine = true
-            }
+            let newLocks = Self.newlyLockedLines(
+                in: direct.lines,
+                eligibleIDs: survivedNewMatches,
+                context: Self.LockContext(
+                    baseLines: baseLines,
+                    existingLocked: existingLockedMap,
+                    confident: confidentLineIDs,
+                    nearlyConfident: nearlyConfidentLineIDs,
+                    envelope: vocalEnvelope,
+                    pitchContour: vocalPitchContour,
+                    priorUnlockedLines: priorUnlockedLines
+                )
+            )
+            let lockedNewLine = !newLocks.isEmpty
+            lockedThisPlay.merge(newLocks) { old, _ in old }
             let lockedIDs = Set(anchoredLines.keys).union(lockedThisPlay.keys)
             if reporter?.discardStaleOffset(lockedLineIDs: lockedIDs) == true {
                 await Self.enqueueUnlessCancelled(on: cacheQueue) { cache.remove(trackId: trackId) }
