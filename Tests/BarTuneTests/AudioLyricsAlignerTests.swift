@@ -1910,4 +1910,137 @@ final class AudioLyricsAlignerTests: XCTestCase {
         XCTAssertEqual(result.matchedLineIDs, [0, 2, 3])
         XCTAssertEqual(result.lines[2].timestamp, 13.2, accuracy: 0.01)
     }
+
+    func testSyncEngineMinimalDecodeSupportsMinimalAndLargePayloads() throws {
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let minimalKey = AudioSyncedLyricsCache.cacheKey(forTrackId: "spotify:track:minimal")
+        try Data(#"{"engine":"lyricsAlignment"}"#.utf8).write(to: cache.fileURL(forCacheKey: minimalKey))
+        XCTAssertEqual(cache.syncEngine(forCacheKey: minimalKey), .lyricsAlignment)
+
+        let removedKey = AudioSyncedLyricsCache.cacheKey(forTrackId: "spotify:track:removed")
+        try Data(#"{"engine":"appleSpeech"}"#.utf8).write(to: cache.fileURL(forCacheKey: removedKey))
+        XCTAssertNil(cache.syncEngine(forCacheKey: removedKey))
+
+        let largeTrackId = "spotify:track:large"
+        let largeWords = (0..<200).map { index in
+            RecognizedAudioWord(
+                text: "word\(index)",
+                startTime: Double(index) * 0.25,
+                duration: 0.2,
+                confidence: 0.9,
+                sourceLineId: index % 10
+            )
+        }
+        let largeTemplates = [
+            ChorusSelfSimilarity.CachedTemplate(
+                lineId: 0,
+                startTime: 10.0,
+                frames: [Float](repeating: 0.5, count: 40 * 12)
+            ),
+        ]
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: largeTrackId,
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0.1,
+                alignedLineCount: 1,
+                sourceLineCount: 1,
+                lines: [LyricLine(id: 0, timestamp: 1.0, text: "Large line")],
+                heardWords: largeWords,
+                chromaTemplates: largeTemplates
+            )
+        )
+        XCTAssertEqual(cache.syncEngine(forCacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: largeTrackId)), .lyricsAlignment)
+    }
+
+    func testAudioSyncedLyricsCachePrunesOldestRecordsIncludingOrphans() throws {
+        let cache = AudioSyncedLyricsCache(directory: tempDir, maxEntries: 2)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let lines = [LyricLine(id: 0, timestamp: 1.0, text: "Synced line")]
+
+        // Seed an orphaned record directly on disk with an old modification date.
+        let orphanURL = cache.fileURL(forCacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: "orphan-track"))
+        let orphanData = try JSONEncoder().encode(
+            AudioSyncedLyricsRecord(
+                trackId: "orphan-track",
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                lines: lines
+            )
+        )
+        try orphanData.write(to: orphanURL)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-7200)],
+            ofItemAtPath: orphanURL.path
+        )
+
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "track-a",
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                lines: lines
+            )
+        )
+        let trackAURL = cache.fileURL(forCacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: "track-a"))
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-3600)],
+            ofItemAtPath: trackAURL.path
+        )
+
+        // Loading a fresh record (< 1 hour old) must not rewrite its modification date.
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "track-b",
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                lines: lines
+            )
+        )
+        var trackBURL = cache.fileURL(forCacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: "track-b"))
+        let freshDate = Date().addingTimeInterval(-60)
+        try FileManager.default.setAttributes([.modificationDate: freshDate], ofItemAtPath: trackBURL.path)
+        XCTAssertNotNil(cache.load(trackId: "track-b"))
+        trackBURL.removeCachedResourceValue(forKey: .contentModificationDateKey)
+        let afterFreshLoad = try XCTUnwrap(
+            trackBURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+        )
+        XCTAssertEqual(afterFreshLoad.timeIntervalSince1970, freshDate.timeIntervalSince1970, accuracy: 1.0)
+
+        // Orphaned record was oldest and should already have been pruned when track-b was saved.
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphanURL.path))
+        XCTAssertEqual(cache.stats().count, 2)
+
+        // Make track-a stale (> 1 hour) and load it so its mtime refreshes and track-b becomes oldest.
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date().addingTimeInterval(-7200)],
+            ofItemAtPath: trackAURL.path
+        )
+        XCTAssertNotNil(cache.load(trackId: "track-a"))
+
+        cache.save(
+            AudioSyncedLyricsRecord(
+                trackId: "track-c",
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                lines: lines
+            )
+        )
+
+        XCTAssertEqual(cache.stats().count, 2)
+        XCTAssertNotNil(cache.load(trackId: "track-a"), "Stale-then-loaded track-a should survive LRU pruning")
+        XCTAssertNil(cache.load(trackId: "track-b"), "Oldest untouched track-b should be pruned")
+        XCTAssertNotNil(cache.load(trackId: "track-c"))
+    }
 }

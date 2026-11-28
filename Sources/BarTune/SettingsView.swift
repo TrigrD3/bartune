@@ -49,14 +49,14 @@ struct OfflineCacheSnapshot: Equatable, Sendable {
         lyricsCache: LyricsDiskCache = .default,
         syncCache: AudioSyncedLyricsCache = .default
     ) -> OfflineCacheSnapshot {
-        let stats = lyricsCache.stats()
+        let lyricsSnapshot = lyricsCache.snapshot(audioSyncCache: syncCache)
         let syncStats = syncCache.stats()
         return OfflineCacheSnapshot(
-            cachedSongCount: stats.count,
-            cachedBytes: stats.bytes,
+            cachedSongCount: lyricsSnapshot.count,
+            cachedBytes: lyricsSnapshot.bytes,
             syncedSongCount: syncStats.count,
             syncedBytes: syncStats.bytes,
-            songs: lyricsCache.listEntries(audioSyncCache: syncCache)
+            songs: lyricsSnapshot.entries
         )
     }
 }

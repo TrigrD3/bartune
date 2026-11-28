@@ -5389,6 +5389,189 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertNotNil(cache.load(trackId: trackA.id), "a cancelled finalizer must not remove the resynced record")
     }
 
+    @MainActor
+    func testPersistAlignmentCoalescesRapidChunksAndFlushesOnPause() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let source = threeLines()
+        let firstChunkWords = [
+            RecognizedAudioWord(text: "Alpha", startTime: 10.7, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            RecognizedAudioWord(text: "beta", startTime: 11.1, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+        ]
+        let secondChunkWords = [
+            RecognizedAudioWord(text: "Gamma", startTime: 15.7, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            RecognizedAudioWord(text: "delta", startTime: 16.1, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+        ]
+        let chunkCounter = LockedBox(0)
+        let nowBox = LockedBox<TimeInterval>(100.0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.alignmentPersistInterval = 30.0
+        deps.alignmentPersistNow = { nowBox.withLock { $0 } }
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(confident: [0, 1]) { _ in
+                let idx = chunkCounter.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                return idx == 1 ? firstChunkWords : secondChunkWords
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: source)
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Chunk 1 persists immediately.
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let firstSaved = await waitUntil { cache.load(trackId: self.sampleTrack().id)?.alignedLineCount == 1 }
+        XCTAssertTrue(firstSaved)
+
+        // Chunk 2 arrives 5s later (inside 30s coalesce window): UI updates, disk save is coalesced.
+        nowBox.withLock { $0 = 105.0 }
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let secondAligned = await waitUntil {
+            state.audioSyncStatus == .syncing(engine: .lyricsAlignment, alignedLines: 2, totalLines: 3)
+        }
+        XCTAssertTrue(secondAligned)
+        await withCheckedContinuation { continuation in
+            deps.cacheQueue.async { continuation.resume() }
+        }
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 1, "Rapid chunk inside coalesce interval should not rewrite disk")
+
+        // Pausing flushes the coalesced alignment immediately.
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 16.0)
+        await manager.flushCacheOperations()
+        XCTAssertEqual(cache.load(trackId: sampleTrack().id)?.alignedLineCount, 2, "Pausing must flush pending coalesced alignment")
+    }
+
+    @MainActor
+    func testCancelledTailFinalizerKeepsCoalescedAlignmentSave() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        let cache = AudioSyncedLyricsCache(directory: tempDir)
+        let track = sampleTrack()
+        let chunkWords = [
+            [
+                RecognizedAudioWord(text: "Alpha", startTime: 10.7, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+                RecognizedAudioWord(text: "beta", startTime: 11.1, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+            ],
+            [
+                RecognizedAudioWord(text: "Gamma", startTime: 15.7, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+                RecognizedAudioWord(text: "delta", startTime: 16.1, duration: 0.3, confidence: 0.9, sourceLineId: 1),
+            ],
+        ]
+        let chunkCounter = LockedBox(0)
+        let nowBox = LockedBox<TimeInterval>(100.0)
+        let releaseTail = DispatchSemaphore(value: 0)
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.alignmentPersistInterval = 30.0
+        deps.alignmentPersistNow = { nowBox.withLock { $0 } }
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(confident: [0, 1]) { request in
+                if request.isFinal {
+                    releaseTail.wait()
+                    return []
+                }
+                let idx = chunkCounter.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                return chunkWords[min(idx, chunkWords.count) - 1]
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: track, rawLines: threeLines())
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let firstSaved = await waitUntil { cache.load(trackId: track.id)?.alignedLineCount == 1 }
+        XCTAssertTrue(firstSaved)
+
+        // Chunk 2 lands inside the coalesce window, so only the pending save holds two lines.
+        nowBox.withLock { $0 = 105.0 }
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let secondAligned = await waitUntil {
+            state.audioSyncStatus == .syncing(engine: .lyricsAlignment, alignedLines: 2, totalLines: 3)
+        }
+        XCTAssertTrue(secondAligned)
+        capture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100)
+        let buffered = await waitUntil { manager.bufferedSampleCount == 50 }
+        XCTAssertTrue(buffered)
+
+        // The track changes, then stop() cancels the tail finalizer before it can save.
+        manager.handleTrackChanged()
+        manager.stop()
+        releaseTail.signal()
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(cache.load(trackId: track.id)?.alignedLineCount, 2, "the coalesced save must survive the handoff")
+    }
+
+    @MainActor
+    func testAlignmentSavePrunesToTheCurrentCacheLimit() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        // The cache was built with the launch-time limit; a raised or lowered Settings limit must still apply.
+        let cache = AudioSyncedLyricsCache(directory: tempDir, maxEntries: 1000)
+        for (index, trackId) in ["spotify:track:old-1", "spotify:track:old-2"].enumerated() {
+            cache.save(AudioSyncedLyricsRecord(
+                trackId: trackId,
+                engine: .lyricsAlignment,
+                syncedAt: Date(),
+                medianOffset: 0,
+                alignedLineCount: 1,
+                lines: [LyricLine(id: 0, timestamp: 1.0, text: "Old line")]
+            ))
+            let url = cache.fileURL(forCacheKey: AudioSyncedLyricsCache.cacheKey(forTrackId: trackId))
+            try FileManager.default.setAttributes(
+                [.modificationDate: Date().addingTimeInterval(-7200 + Double(index) * 60)],
+                ofItemAtPath: url.path
+            )
+        }
+
+        let capture = FakeAudioCapture()
+        var deps = makeDependencies(capture: capture, chunkDurationSeconds: 1.0)
+        deps.audioSyncCacheLimit = { 2 }
+        deps.launchLyricsAligner = { _, _ in
+            FakeChunkEngine(confident: [0]) { _ in
+                [
+                    RecognizedAudioWord(text: "Alpha", startTime: 10.7, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+                    RecognizedAudioWord(text: "beta", startTime: 11.1, duration: 0.3, confidence: 0.9, sourceLineId: 0),
+                ]
+            }
+        }
+        let manager = AudioSyncManager(state: state, cache: cache, dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: threeLines())
+        let started = await waitUntil { manager.isLiveSyncActive && capture.startCount == 1 }
+        XCTAssertTrue(started)
+        capture.emit(samples: [Float](repeating: 0.1, count: 100), sampleRate: 100)
+        let saved = await waitUntil { cache.load(trackId: self.sampleTrack().id) != nil }
+        XCTAssertTrue(saved)
+        await manager.flushCacheOperations()
+
+        XCTAssertEqual(cache.stats().count, 2)
+        XCTAssertNil(cache.load(trackId: "spotify:track:old-1"), "the oldest record should be pruned to the current limit")
+    }
+
     private func twoLockedRecord(trackId: String, source: [LyricLine]) -> AudioSyncedLyricsRecord {
         AudioSyncedLyricsRecord(
             trackId: trackId,
@@ -5436,7 +5619,9 @@ final class AudioSyncManagerTests: XCTestCase {
             hasScreenCaptureAccess: { hasScreenCaptureAccess },
             requestScreenCaptureAccess: {},
             chunkDurationSeconds: chunkDurationSeconds,
-            launchLyricsAligner: launchAligner ?? { _, _ in FakeChunkEngine(transcribe: runChunk) }
+            launchLyricsAligner: launchAligner ?? { _, _ in FakeChunkEngine(transcribe: runChunk) },
+            alignmentPersistInterval: 0,
+            audioSyncCacheLimit: { 0 }
         )
     }
 }

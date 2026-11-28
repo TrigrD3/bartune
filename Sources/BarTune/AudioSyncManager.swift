@@ -671,6 +671,9 @@ final class AudioSyncManager {
         var noAudioWatchdogSleep: @Sendable (Duration) async throws -> Void = {
             try await Task.sleep(for: $0)
         }
+        var alignmentPersistInterval: TimeInterval = 30.0
+        var alignmentPersistNow: @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        var audioSyncCacheLimit: @Sendable () -> Int = { LyricsDiskCache.configuredMaxEntries() }
 
         static func live() -> Dependencies {
             let launchWithPriors: @Sendable ([LyricLine], [Int: ClosedRange<Double>], [Int: LyricLine]) async -> AudioChunkTranscribing? = {
@@ -806,10 +809,24 @@ final class AudioSyncManager {
         let chroma: AudioChromaProfile
     }
 
+    private struct PendingAlignmentSave {
+        let trackId: String
+        let result: AudioAlignmentResult
+        let engine: AudioSyncEngine
+        let sourceCount: Int
+        let lockedIDs: Set<Int>
+        let attemptedIDs: Set<Int>
+        let anchoredCount: Int
+        let newlyLockedIDs: [Int]
+        let templates: [ChorusSelfSimilarity.CachedTemplate]
+    }
+
     private var cacheLoadTask: Task<Void, Never>?
     private var alignerStartupTask: Task<Void, Never>?
     private var chunkProcessingTask: Task<ChunkOutcome?, Never>?
     private var pendingTailFinalizations: [String: (id: UUID, task: Task<Void, Never>)] = [:]
+    private var pendingAlignmentSave: PendingAlignmentSave?
+    private var lastAlignmentPersistTime: TimeInterval?
     private var modelIdleReleaseTask: Task<Void, Never>?
     private var noAudioWatchdogTask: Task<Void, Never>?
     private var noAudioObservationStartedAt: TimeInterval?
@@ -842,6 +859,7 @@ final class AudioSyncManager {
     }
 
     func flushCacheOperations() async {
+        flushPendingAlignmentIfNeeded()
         // Wait for any outgoing-track tail finalizations so their cache saves are queued first.
         let tailTasks = pendingTailFinalizations.values.map(\.task)
         for task in tailTasks {
@@ -855,6 +873,10 @@ final class AudioSyncManager {
     }
 
     private func removeCachedAlignment(trackId: String) {
+        if trackId == activeTrackId {
+            pendingAlignmentSave = nil
+            lastAlignmentPersistTime = nil
+        }
         dependencies.cacheQueue.async { [cache] in
             cache.remove(trackId: trackId)
         }
@@ -928,6 +950,7 @@ final class AudioSyncManager {
     }
 
     private func stopActiveSession() {
+        flushPendingAlignmentIfNeeded()
         cacheActiveVocalEnvelopeIfNonEmpty()
         syncGeneration &+= 1
         captureTargetGeneration &+= 1
@@ -969,8 +992,14 @@ final class AudioSyncManager {
         if trackChanged {
             finalizeOutgoingTrackTailIfNeeded()
         }
-        if forceResync, let pending = pendingTailFinalizations.removeValue(forKey: track.id) {
-            pending.task.cancel()
+        if forceResync {
+            if let pending = pendingTailFinalizations.removeValue(forKey: track.id) {
+                pending.task.cancel()
+            }
+            if pendingAlignmentSave?.trackId == track.id {
+                pendingAlignmentSave = nil
+            }
+            lastAlignmentPersistTime = nil
         }
         stopActiveSession()
         activeTrackId = track.id
@@ -2343,6 +2372,8 @@ final class AudioSyncManager {
         priorUnlockedLines = [:]
         cachedChromaTemplates = []
         cachedAlignedLineCount = 0
+        pendingAlignmentSave = nil
+        lastAlignmentPersistTime = nil
     }
 
     /// Lyrics Alignment locks each confidently aligned line and keeps listening until no further play could
@@ -2412,10 +2443,15 @@ final class AudioSyncManager {
                 result.lines.filter { matchedIDs.contains($0.id) }.map { ($0.id, $0) },
                 uniquingKeysWith: { _, latest in latest }
             )
-            persistAlignment(result, engine: .lyricsAlignment, forceUpdateCount: newLockDisplacedCache || droppedPreviouslyAccepted)
+            persistAlignment(
+                result,
+                engine: .lyricsAlignment,
+                forceUpdateCount: newLockDisplacedCache || droppedPreviouslyAccepted,
+                immediate: progress.isFinished
+            )
             state.applyAudioSyncedLines(result.lines)
         } else if droppedPriorWords || (cachedAlignedLineCount == 0 && (!replacingAttempts.isEmpty || progress.isFinished)) {
-            persistAlignment(result, engine: .lyricsAlignment)
+            persistAlignment(result, engine: .lyricsAlignment, immediate: progress.isFinished)
         }
         if progress.isFinished {
             // Keep the playback boundary so the next repeat can retry a poorly aligned pass.
@@ -2434,13 +2470,24 @@ final class AudioSyncManager {
 
     private func persistCurrentAlignmentIfReady() {
         let engine = state.audioSyncEngine
-        guard engine != .off, !baseLines.isEmpty, !recognizedWords.isEmpty else { return }
+        guard engine != .off, !baseLines.isEmpty, !recognizedWords.isEmpty else {
+            flushPendingAlignmentIfNeeded()
+            return
+        }
         let result = currentAlignment()
-        guard result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount else { return }
-        persistAlignment(result, engine: engine)
+        if result.matchedLineCount > 0, result.matchedLineCount > cachedAlignedLineCount {
+            persistAlignment(result, engine: engine, immediate: true)
+        } else {
+            flushPendingAlignmentIfNeeded()
+        }
     }
 
-    private func persistAlignment(_ result: AudioAlignmentResult, engine: AudioSyncEngine, forceUpdateCount: Bool = false) {
+    private func persistAlignment(
+        _ result: AudioAlignmentResult,
+        engine: AudioSyncEngine,
+        forceUpdateCount: Bool = false,
+        immediate: Bool = false
+    ) {
         guard let trackId = activeTrackId else { return }
         let sourceCount = baseLines.filter { !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
         let templates = engine == .lyricsAlignment
@@ -2454,27 +2501,59 @@ final class AudioSyncManager {
         if engine == .lyricsAlignment {
             cachedChromaTemplates = templates
         }
-        let record = AudioSyncedLyricsRecord(
-            trackId: trackId,
-            engine: engine,
-            syncedAt: Date(),
-            medianOffset: result.medianOffset,
-            alignedLineCount: result.matchedLineCount,
-            sourceLineCount: sourceCount,
-            lines: result.lines,
-            heardWords: refinedHeardWords(),
-            lockedLineIDs: engine == .lyricsAlignment ? lockedLineIDs.sorted() : nil,
-            attemptedLineIDs: engine == .lyricsAlignment ? attemptedLineIDs.subtracting(lockedLineIDs).sorted() : nil,
-            lockedAtPlayStart: engine == .lyricsAlignment ? anchoredLines.count : nil,
-            newlyLockedLineIDs: engine == .lyricsAlignment ? lockedThisPlay.keys.sorted() : nil,
-            chromaTemplates: templates.isEmpty ? nil : templates
-        )
-        dependencies.cacheQueue.async { [cache] in
-            cache.save(record)
-        }
         cachedAlignedLineCount = forceUpdateCount
             ? result.matchedLineCount
             : max(cachedAlignedLineCount, result.matchedLineCount)
+
+        let pending = PendingAlignmentSave(
+            trackId: trackId,
+            result: result,
+            engine: engine,
+            sourceCount: sourceCount,
+            lockedIDs: lockedLineIDs,
+            attemptedIDs: attemptedLineIDs,
+            anchoredCount: anchoredLines.count,
+            newlyLockedIDs: lockedThisPlay.keys.sorted(),
+            templates: templates
+        )
+
+        let now = dependencies.alignmentPersistNow()
+        let shouldWriteNow = immediate
+            || lastAlignmentPersistTime.map { now - $0 >= dependencies.alignmentPersistInterval } ?? true
+        if shouldWriteNow {
+            writeAlignment(pending, at: now)
+        } else {
+            pendingAlignmentSave = pending
+        }
+    }
+
+    private func flushPendingAlignmentIfNeeded() {
+        guard let pending = pendingAlignmentSave else { return }
+        writeAlignment(pending, at: dependencies.alignmentPersistNow())
+    }
+
+    private func writeAlignment(_ pending: PendingAlignmentSave, at now: TimeInterval) {
+        pendingAlignmentSave = nil
+        lastAlignmentPersistTime = now
+        let record = AudioSyncedLyricsRecord(
+            trackId: pending.trackId,
+            engine: pending.engine,
+            syncedAt: Date(),
+            medianOffset: pending.result.medianOffset,
+            alignedLineCount: pending.result.matchedLineCount,
+            sourceLineCount: pending.sourceCount,
+            lines: pending.result.lines,
+            heardWords: refinedHeardWords(),
+            lockedLineIDs: pending.engine == .lyricsAlignment ? pending.lockedIDs.sorted() : nil,
+            attemptedLineIDs: pending.engine == .lyricsAlignment ? pending.attemptedIDs.subtracting(pending.lockedIDs).sorted() : nil,
+            lockedAtPlayStart: pending.engine == .lyricsAlignment ? pending.anchoredCount : nil,
+            newlyLockedLineIDs: pending.engine == .lyricsAlignment ? pending.newlyLockedIDs : nil,
+            chromaTemplates: pending.templates.isEmpty ? nil : pending.templates
+        )
+        let limit = dependencies.audioSyncCacheLimit()
+        dependencies.cacheQueue.async { [cache] in
+            cache.save(record, maxEntriesOverride: limit)
+        }
     }
 
     /// Finishes an in-flight chunk and any buffered tail audio for the outgoing track in the background so a
@@ -2492,6 +2571,8 @@ final class AudioSyncManager {
             && (!dependencies.usesProcessTap || hasReceivedAudibleAudioThisSession)
         let inFlightTask = chunkProcessingTask
         guard inFlightTask != nil || hasRemainingAudio || engine.hasHeldAudio else { return }
+        // Queue the coalesced save first: the finalizer only writes when its tail beats the count it raised.
+        flushPendingAlignmentIfNeeded()
 
         // Hand ownership to the background finalizer before `stopActiveSession()` tears down live state.
         chunkEngine = nil
@@ -2509,6 +2590,7 @@ final class AudioSyncManager {
         let resample = dependencies.resampleForRecognition
         let cache = cache
         let cacheQueue = dependencies.cacheQueue
+        let cacheLimit = dependencies.audioSyncCacheLimit
 
         let baseLines = baseLines
         let anchoredLines = anchoredLines
@@ -2735,7 +2817,7 @@ final class AudioSyncManager {
                 newlyLockedLineIDs: lockedThisPlay.keys.sorted(),
                 chromaTemplates: templates.isEmpty ? nil : templates
             )
-            await Self.enqueueUnlessCancelled(on: cacheQueue) { cache.save(record) }
+            await Self.enqueueUnlessCancelled(on: cacheQueue) { cache.save(record, maxEntriesOverride: cacheLimit()) }
         }
         pendingTailFinalizations[trackId] = (taskID, task)
     }
