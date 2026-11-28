@@ -530,7 +530,8 @@ protocol CTCAcousticModel: AnyObject, Sendable {
 }
 
 /// Aligns the known lyrics to captured audio instead of transcribing it. Each chunk is scored in a window
-/// that ends with it; a line is aligned once audio covering its LRC time ± `lineWindow` has been scored.
+/// that ends with it; a line is aligned once audio covering its search window has been scored: its LRC time
+/// ± `lineWindow`, narrowed to 3 × MAD (at least 1 s) of the locked offsets once four or more exist.
 /// An engine that reports which lyric lines it had the audio for, and which of them it aligned confidently.
 protocol LineAttemptReporting: AnyObject {
     /// Lyrics attempted against captured audio, including lines with no reliable match. Anchors are excluded.
@@ -1211,6 +1212,13 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         return (sorted[(sorted.count - 1) / 2] + sorted[sorted.count / 2]) / 2
     }
 
+    private func effectiveHalfWindow(using offsets: [Int: Double]) -> Double {
+        guard offsets.count >= 4, let center = median(Array(offsets.values)) else { return lineWindow }
+        let deviations = offsets.values.map { abs($0 - center) }
+        guard let mad = median(deviations) else { return lineWindow }
+        return min(lineWindow, max(1.0, 3.0 * mad))
+    }
+
     private func offsetEstimate(around index: Int, using offsets: [Int: Double]) -> (offset: Double, priorCount: Int) {
         guard !offsets.isEmpty else { return (0, 0) }
         let before = Array(lines.indices[..<index].reversed().lazy.compactMap { offsets[$0] }.prefix(3))
@@ -1228,26 +1236,27 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
     private func searchWindow(for index: Int, coarseShift: Double? = nil) -> SearchWindow {
         let line = lines[index]
         let (offset, priorCount) = offsetEstimate(around: index, using: lineOffsets)
+        let halfWindow = coarseShift == nil ? effectiveHalfWindow(using: lineOffsets) : lineWindow
         // Keep the LRC window within reach until two earlier lines support the shift.
         let startShift = coarseShift ?? (priorCount < 2 ? min(0, offset) : offset)
         let endShift = coarseShift ?? (priorCount < 2 ? max(0, offset) : offset)
-        let paddedStart = line.start + startShift - lineWindow
+        let paddedStart = line.start + startShift - halfWindow
         var rawStart = coarseShift != nil ? max(0, paddedStart) : (index == 0 && line.start <= Self.maxIntroStart ? 0 : paddedStart)
-        var rawEnd = line.searchEnd + endShift + lineWindow
+        var rawEnd = line.searchEnd + endShift + halfWindow
         let shiftedOnset = line.start + offset
         var earliestOnset = min(line.start, shiftedOnset)
         // Later anchors can widen the search on replay; an earlier match can establish a missed onset.
         var latestOnset = coarseShift.map { line.start + $0 } ?? max(0, priorCount < 2 ? max(line.start, shiftedOnset) : shiftedOnset)
-        var readyAt = min(line.contextEnd + endShift + lineWindow, line.upperBound)
+        var readyAt = min(line.contextEnd + endShift + halfWindow, line.upperBound)
 
         if coarseShift == nil {
             if let priorFirst = line.priorWordIntervals?.first?.lowerBound,
                let priorLast = line.priorWordIntervals?.last?.upperBound {
-                rawStart = min(rawStart, max(0, priorFirst - lineWindow))
-                rawEnd = max(rawEnd, priorLast + lineWindow)
+                rawStart = min(rawStart, max(0, priorFirst - halfWindow))
+                rawEnd = max(rawEnd, priorLast + halfWindow)
                 earliestOnset = min(earliestOnset, priorFirst)
                 latestOnset = max(latestOnset, priorFirst)
-                readyAt = min(max(readyAt, priorLast + lineWindow), line.upperBound)
+                readyAt = min(max(readyAt, priorLast + halfWindow), line.upperBound)
             }
             if line.lowerBound.isFinite, line.upperBound.isFinite,
                line.upperBound > line.lowerBound,
