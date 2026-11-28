@@ -173,6 +173,67 @@ final class VocalWaveformTests: XCTestCase {
         XCTAssertEqual(twice.words, once)
     }
 
+    func testShortWordWithLoudOnsetExtendsAcrossSofterHeldNoteOnCompressedMix() throws {
+        // 40 ms loud onset (0.6) followed by 1.0 s softer held vowel (0.22) on a ~9 dB DR compressed mix (0.08 floor).
+        let env = envelope([(1.0, 0.08), (0.04, 0.6), (1.0, 0.22), (3.0, 0.08)])
+        let loud = try XCTUnwrap(env.percentile(0.9))
+        let floor = try XCTUnwrap(env.percentile(0.1))
+        XCTAssertLessThan(loud - floor, WaveformTimingRefiner.minimumDynamicRange)
+
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.04)], envelope: env, timingError: 0.06)
+        XCTAssertEqual(result.words.count, 1)
+        XCTAssertEqual(result.words[0].endTime, 2.04, accuracy: 0.04)
+        XCTAssertEqual(result.stats.extended, 1)
+    }
+
+    func testShortWordFollowedByImmediateSilenceOrCompressedFloorDoesNotOverExtend() throws {
+        // Digital silence immediately after a 40 ms word.
+        let silentEnv = envelope([(1.0, 0), (0.04, 0.5), (2.0, 0)])
+        let silentResult = WaveformTimingRefiner.refine([word(1.0, 0.04)], envelope: silentEnv, timingError: 0.06)
+        XCTAssertEqual(silentResult.words.count, 1)
+        XCTAssertEqual(silentResult.words[0].endTime, 1.04, accuracy: 0.01)
+        XCTAssertEqual(silentResult.stats.extended, 0)
+
+        // Compressed mix (~7 dB DR < sustainDrop 8 dB): immediate 0.22 backing floor after a 40 ms word must not extend.
+        let compressedEnv = envelope([(1.0, 0.22), (0.04, 0.5), (2.0, 0.22), (1.0, 0.5), (1.0, 0.22)])
+        let loud = try XCTUnwrap(compressedEnv.percentile(0.9))
+        let floor = try XCTUnwrap(compressedEnv.percentile(0.1))
+        XCTAssertLessThan(loud - floor, WaveformTimingRefiner.minimumDynamicRange)
+
+        let compressedResult = WaveformTimingRefiner.refine([word(1.0, 0.04)], envelope: compressedEnv, timingError: 0.06)
+        XCTAssertEqual(compressedResult.words.count, 1)
+        XCTAssertEqual(compressedResult.words[0].endTime, 1.04, accuracy: 0.01)
+        XCTAssertEqual(compressedResult.stats.extended, 0)
+    }
+
+    func testShortHeldNoteOnCompressedMixStopsBeforeNextWordAndAtFloorDrop() throws {
+        // Compressed 10 dB DR mix: 0.158 floor, 2.0 s held vocal at 0.5, then 0.158 floor.
+        let env = envelope([(1.0, 0.158), (2.0, 0.5), (2.5, 0.158)])
+        let loud = try XCTUnwrap(env.percentile(0.9))
+        let floor = try XCTUnwrap(env.percentile(0.1))
+        XCTAssertLessThan(loud - floor, WaveformTimingRefiner.minimumDynamicRange)
+
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.04), word(2.0, 0.04)], envelope: env, timingError: 0.06)
+        XCTAssertEqual(result.words.count, 2)
+        XCTAssertLessThanOrEqual(result.words[0].endTime, result.words[1].startTime - WaveformTimingRefiner.minimumGap + 1e-6)
+        XCTAssertEqual(result.words[0].endTime, 2.0 - WaveformTimingRefiner.minimumGap, accuracy: 0.02)
+        XCTAssertEqual(result.words[1].endTime, 3.0, accuracy: 0.03)
+        XCTAssertEqual(result.stats.extended, 2)
+    }
+
+    func testDynamicMixHeldNoteNearFloorStillExtends() throws {
+        // Dynamic mix: a quiet word (~10 dB over the floor) holds its note ~3.5 dB over the floor.
+        let env = envelope([(1.0, 0.01), (0.2, 0.03), (1.0, 0.015), (1.0, 0.01), (2.0, 0.5), (1.0, 0.01)])
+        let loud = try XCTUnwrap(env.percentile(0.9))
+        let floor = try XCTUnwrap(env.percentile(0.1))
+        XCTAssertGreaterThanOrEqual(loud - floor, WaveformTimingRefiner.minimumDynamicRange)
+
+        let result = WaveformTimingRefiner.refine([word(1.0, 0.2)], envelope: env, timingError: 0.06)
+        XCTAssertEqual(result.words.count, 1)
+        XCTAssertEqual(result.words[0].endTime, 2.2, accuracy: 0.05)
+        XCTAssertEqual(result.stats.extended, 1)
+    }
+
     func testMergedForDisplayRetainsNonOverlappingCachedSegmentsWhenLiveResumes() throws {
         var cached = VocalEnvelope()
         cached.append(mid: tone(10.0, amplitude: 0.4), side: [], sampleRate: sampleRate, startTime: 0.0, rate: 1)
