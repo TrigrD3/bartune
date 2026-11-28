@@ -1543,17 +1543,25 @@ enum LyricsAlignerModel {
             throw InstallError.httpStatus(http.statusCode)
         }
         try await Task.detached(priority: .utility) {
-            try install(archive: archive, expectedSHA256: downloadSHA256, into: directory)
+            try install(archive: archive, expectedSHA256: downloadSHA256, into: directory, compile: compileModel)
         }.value
     }
 
+    private static func compileModel(at package: URL, to destination: URL) throws {
+        let temporary = try MLModel.compileModel(at: package)
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        try FileManager.default.moveItem(at: temporary, to: destination)
+    }
+
     /// Verifies and unpacks a zipped Core ML package, optionally compiling it before replacing the installed artifacts.
+    /// When `compile` runs and `keepPackage` is false, only the compiled `.mlmodelc` is kept on disk.
     static func install(
         archive: URL,
         expectedSHA256: String,
         into directory: URL,
         packageName: String = packageName,
         compiledName: String = compiledName,
+        keepPackage: Bool = false,
         fileManager: FileManager = .default,
         lock: NSLock = modelFilesLock,
         onInstalled: (() -> Void)? = nil,
@@ -1593,8 +1601,11 @@ enum LyricsAlignerModel {
                         continue
                     }
                 }
-                var artifacts = [(unpacked, package)]
-                if compile != nil { artifacts.append((stagedCompiled, compiled)) }
+                let artifacts: [(URL, URL)] = if compile != nil {
+                    keepPackage ? [(unpacked, package), (stagedCompiled, compiled)] : [(stagedCompiled, compiled)]
+                } else {
+                    [(unpacked, package)]
+                }
                 for (source, destination) in artifacts {
                     try fileManager.moveItem(at: source, to: destination)
                     installed.append(destination)
@@ -1638,7 +1649,25 @@ enum LyricsAlignerModel {
             || fileManager.fileExists(atPath: directory.appendingPathComponent(packageName).path)
     }
 
-    /// Returns an aligner for `lines`, compiling an installed `.mlpackage` once and reusing the loaded
+    /// Returns the compiled model, compiling a legacy `.mlpackage` once and then deleting it; call with `modelFilesLock` held.
+    static func prepareCompiledModel(
+        in directory: URL,
+        fileManager: FileManager = .default,
+        compile: (URL) throws -> URL = { try MLModel.compileModel(at: $0) }
+    ) -> URL? {
+        let compiled = directory.appendingPathComponent(compiledName)
+        let package = directory.appendingPathComponent(packageName)
+        if !fileManager.fileExists(atPath: compiled.path) {
+            guard fileManager.fileExists(atPath: package.path), let temporary = try? compile(package) else { return nil }
+            defer { try? fileManager.removeItem(at: temporary) }
+            guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
+            releaseCachedModel()
+        }
+        try? fileManager.removeItem(at: package)
+        return compiled
+    }
+
+    /// Returns an aligner for `lines`, compiling an installed `.mlpackage` once (and removing it) and reusing the loaded
     /// `CoreMLAcousticModel` across tracks until released; nil when the model is missing, fails to load,
     /// or the Mac has no Neural Engine (the model's CPU path returns NaN).
     static func launch(
@@ -1650,15 +1679,8 @@ enum LyricsAlignerModel {
         #if arch(arm64)
             return await Task.detached(priority: .utility) {
                 modelFilesLock.withLock {
-                    let compiled = directory.appendingPathComponent(compiledName)
-                    let package = directory.appendingPathComponent(packageName)
                     let fileManager = FileManager.default
-                    if !fileManager.fileExists(atPath: compiled.path), fileManager.fileExists(atPath: package.path) {
-                        guard let temporary = try? MLModel.compileModel(at: package) else { return nil }
-                        defer { try? fileManager.removeItem(at: temporary) }
-                        guard (try? fileManager.moveItem(at: temporary, to: compiled)) != nil else { return nil }
-                        releaseCachedModel()
-                    }
+                    guard let compiled = prepareCompiledModel(in: directory, fileManager: fileManager) else { return nil }
                     let modDate = (try? fileManager.attributesOfItem(atPath: compiled.path))?[.modificationDate] as? Date
                     return sharedModelCache.load(compiledURL: compiled, modificationDate: modDate) {
                         CoreMLAcousticModel(compiledModelURL: $0)
