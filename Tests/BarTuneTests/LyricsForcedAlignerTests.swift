@@ -59,6 +59,17 @@ final class LyricsForcedAlignerTests: XCTestCase {
         XCTAssertTrue(ForcedAlignmentText.words(for: "♪ …", script: .latin).isEmpty)
     }
 
+    func testJapaneseAlignmentReadingsMapParticlesWoAndHeButKeepNonParticleHe() {
+        XCTAssertEqual(ForcedAlignmentText.words(for: "空へ", script: .japanese).map(\.reading), ["sora", "e"])
+        XCTAssertEqual(
+            ForcedAlignmentText.words(for: "君を愛してる", script: .japanese).map(\.reading),
+            ["kimi", "o", "aishi", "teru"]
+        )
+        XCTAssertEqual(ForcedAlignmentText.words(for: "海へ行く", script: .japanese).map(\.reading), ["umi", "e", "iku"])
+        XCTAssertEqual(ForcedAlignmentText.words(for: "部屋へ", script: .japanese).map(\.reading), ["heya", "e"])
+        XCTAssertEqual(ForcedAlignmentText.words(for: "平和を", script: .japanese).map(\.reading), ["heiwa", "o"])
+    }
+
     func testLatinReadingsExpandNumbersSymbolsAndElisionsWithoutChangingDisplay() {
         let examples = [
             ("& 100% +", ["and", "onehundredpercent", "plus"]),

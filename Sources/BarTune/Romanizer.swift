@@ -44,11 +44,13 @@ enum JapaneseRomanizer {
     /// Romanizes the words of one timed line in context, so readings and small っ that span word
     /// boundaries come out as they do for the whole line. Returns one string per word; a word whose
     /// reading was merged into the previous word gets "".
-    static func romanizeWords(_ words: [String]) -> [String] {
+    /// When `forAlignment` is true, particles `を` and `へ` are mapped to `"o"` and `"e"` to match
+    /// sung pronunciation for acoustic alignment without changing display romanization.
+    static func romanizeWords(_ words: [String], forAlignment: Bool = false) -> [String] {
         let text = words.joined()
         guard containsJapaneseOrCJK(text) else { return words }
         var out = Array(repeating: "", count: words.count)
-        for span in romanizeWordSpans(words) {
+        for span in buildWordSpans(words, forAlignment: forAlignment) {
             out[span.sourceRange.lowerBound] = span.text
         }
         return out
@@ -57,6 +59,10 @@ enum JapaneseRomanizer {
     /// Romanizes timed words in context and returns each non-empty romanized span along with the
     /// inclusive range of source word indices that contributed to it.
     static func romanizeWordSpans(_ words: [String]) -> [RomanizedWordSpan] {
+        buildWordSpans(words, forAlignment: false)
+    }
+
+    private static func buildWordSpans(_ words: [String], forAlignment: Bool) -> [RomanizedWordSpan] {
         guard !words.isEmpty else { return [] }
         let text = words.joined()
         guard containsJapaneseOrCJK(text) else {
@@ -70,7 +76,7 @@ enum JapaneseRomanizer {
         }
         var grouped = Array(repeating: [String](), count: words.count)
         var endIndices = Array(0..<words.count)
-        for part in romanizedParts(text) {
+        for part in romanizedParts(text, forAlignment: forAlignment) {
             let owner = wordStarts.lastIndex { $0 <= part.location } ?? 0
             let lastWord = wordStarts.lastIndex { $0 < part.end } ?? owner
             grouped[owner].append(part.text)
@@ -99,7 +105,7 @@ enum JapaneseRomanizer {
 
     /// Romanized tokens and punctuation of `text`, each with its UTF-16 range. A token ending in a
     /// small っ is merged with the token after it, which supplies the doubled consonant.
-    private static func romanizedParts(_ text: String) -> [(location: Int, end: Int, text: String)] {
+    private static func romanizedParts(_ text: String, forAlignment: Bool = false) -> [(location: Int, end: Int, text: String)] {
         let nsText = text as NSString
         let cfText = text as CFString
         let fullRange = CFRange(location: 0, length: CFStringGetLength(cfText))
@@ -145,7 +151,7 @@ enum JapaneseRomanizer {
                    kCFStringTokenizerAttributeLatinTranscription
                ) as? String,
                !latin.isEmpty {
-                // Convert macOS macrons (ō, ū, etc.) to clean readable romaji and normalize particle "ha"
+                // Convert macOS macrons (ō, ū, etc.) to clean readable romaji and normalize particles
                 let cleaned = latin
                     .replacingOccurrences(of: "ō", with: "ou")
                     .replacingOccurrences(of: "ū", with: "uu")
@@ -154,6 +160,10 @@ enum JapaneseRomanizer {
                     .replacingOccurrences(of: "ē", with: "ee")
                 if rawToken == "は" && cleaned == "ha" {
                     parts.append((tokenRange.location, tokenEnd, "wa"))
+                } else if forAlignment, rawToken == "を" && cleaned == "wo" {
+                    parts.append((tokenRange.location, tokenEnd, "o"))
+                } else if forAlignment, rawToken == "へ" && cleaned == "he" {
+                    parts.append((tokenRange.location, tokenEnd, "e"))
                 } else {
                     parts.append((tokenRange.location, tokenEnd, cleaned))
                 }
