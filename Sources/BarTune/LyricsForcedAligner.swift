@@ -5,6 +5,14 @@ import Foundation
 /// CTC Viterbi forced alignment: finds the most likely frames for a known token sequence.
 enum CTCForcedAlignment {
     static let blank = 0
+    /// Subtracted from the wildcard's best letter score so matching lyric tokens (including held vowels) win.
+    private static let wildcardPenalty: Float = 0.5
+    /// Caps wildcard emissions so the path cannot trade strong lyric peaks for the filler.
+    private static let maxWildcardScore: Float = -2.0
+    /// The first letter in the vocabulary; `<pad>`, `</s>` and `<unk>` before it are never sung.
+    private static let firstLetter = 4
+    private static let blankState = -1
+    private static let wildcardState = -2
 
     struct TokenSpan: Equatable {
         let firstFrame: Int
@@ -14,62 +22,131 @@ enum CTCForcedAlignment {
     }
 
     /// `logProbs` is row-major `[frame][vocab]`. `allowedFrames`, when given, limits each token to a frame range.
-    /// Returns nil when the tokens cannot fit the frames or their ranges.
+    /// `wildcardPositions` inserts an optional self-looping filler ("star") state before the given token
+    /// indices (in `0...tokens.count`, e.g. line boundaries), scored at the frame's best letter minus a
+    /// small penalty and capped. Returns nil when the tokens cannot fit.
     static func align(
         logProbs: [Float],
         vocabSize: Int,
         tokens: [Int],
-        allowedFrames: [ClosedRange<Int>]? = nil
+        allowedFrames: [ClosedRange<Int>]? = nil,
+        wildcardPositions: Set<Int> = []
     ) -> [TokenSpan]? {
         let frameCount = logProbs.count / vocabSize
         guard !tokens.isEmpty, frameCount > 0 else { return nil }
-        let stateCount = 2 * tokens.count + 1
         let impossible = -Float.infinity
 
-        func emission(_ frame: Int, _ state: Int) -> Float {
-            guard state % 2 == 1 else { return logProbs[frame * vocabSize + blank] }
-            let token = (state - 1) / 2
-            if let allowed = allowedFrames?[token], !allowed.contains(frame) { return impossible }
-            return logProbs[frame * vocabSize + tokens[token]]
+        var stateKind: [Int] = []
+        stateKind.reserveCapacity(2 * tokens.count + 1 + wildcardPositions.count)
+        for boundary in 0...tokens.count {
+            stateKind.append(blankState)
+            if wildcardPositions.contains(boundary) {
+                stateKind.append(wildcardState)
+            }
+            if boundary < tokens.count {
+                stateKind.append(boundary)
+            }
+        }
+        let stateCount = stateKind.count
+        let hasWildcards = stateCount > 2 * tokens.count + 1
+
+        func wildcardEmission(_ frameOffset: Int) -> Float {
+            var best = impossible
+            for vocab in firstLetter..<vocabSize {
+                let value = logProbs[frameOffset + vocab]
+                if value > best { best = value }
+            }
+            return min(best - wildcardPenalty, maxWildcardScore)
         }
 
+        func emission(_ frame: Int, _ state: Int, wildcardScore: Float) -> Float {
+            let frameOffset = frame * vocabSize
+            let kind = stateKind[state]
+            if kind == blankState { return logProbs[frameOffset + blank] }
+            if kind == wildcardState { return wildcardScore }
+            if let allowed = allowedFrames?[kind], !allowed.contains(frame) { return impossible }
+            return logProbs[frameOffset + tokens[kind]]
+        }
+
+        let hasLeadingWildcard = stateCount > 1 && stateKind[1] == wildcardState
+        let firstTokenState = hasLeadingWildcard ? 2 : 1
+        let frame0Wildcard = hasWildcards ? wildcardEmission(0) : impossible
         var score = [Float](repeating: impossible, count: stateCount)
-        score[0] = emission(0, 0)
-        score[1] = emission(0, 1)
-        // 0 = stayed, 1 = came from the previous state, 2 = skipped the blank before this token.
-        var steps = [UInt8](repeating: 0, count: frameCount * stateCount)
+        for state in 0...firstTokenState {
+            score[state] = emission(0, state, wildcardScore: frame0Wildcard)
+        }
+
+        // Signed offset from `state` to its chosen predecessor in the previous frame (`prev = state + step`).
+        var steps = [Int8](repeating: 0, count: frameCount * stateCount)
         var next = score
         for frame in 1..<frameCount {
+            let wildcardScore = hasWildcards ? wildcardEmission(frame * vocabSize) : impossible
             for state in 0..<stateCount {
                 var best = score[state]
-                var step: UInt8 = 0
-                if state > 0, score[state - 1] > best {
-                    best = score[state - 1]
-                    step = 1
+                var step: Int8 = 0
+                let kind = stateKind[state]
+                if kind == blankState {
+                    // Check a trailing/post-token wildcard before `state - 1` so an earlier alignment that
+                    // absorbs a trailing peak in wildcard ties cleanly ahead of shifting lines rightward.
+                    if state + 1 < stateCount, stateKind[state + 1] == wildcardState, score[state + 1] > best {
+                        best = score[state + 1]
+                        step = 1
+                    }
+                    if state > 0, score[state - 1] > best {
+                        best = score[state - 1]
+                        step = -1
+                    }
+                } else if kind == wildcardState {
+                    if score[state - 1] > best {
+                        best = score[state - 1]
+                        step = -1
+                    }
+                    if state >= 2, score[state - 2] > best {
+                        best = score[state - 2]
+                        step = -2
+                    }
+                } else {
+                    if score[state - 1] > best {
+                        best = score[state - 1]
+                        step = -1
+                    }
+                    let hasStar = stateKind[state - 1] == wildcardState
+                    if hasStar, score[state - 2] > best {
+                        best = score[state - 2]
+                        step = -2
+                    }
+                    if kind > 0, tokens[kind] != tokens[kind - 1] {
+                        let skipOffset = hasStar ? 3 : 2
+                        if score[state - skipOffset] > best {
+                            best = score[state - skipOffset]
+                            step = Int8(-skipOffset)
+                        }
+                    }
                 }
-                if state >= 3, state % 2 == 1, tokens[(state - 1) / 2] != tokens[(state - 3) / 2], score[state - 2] > best {
-                    best = score[state - 2]
-                    step = 2
-                }
-                next[state] = best + emission(frame, state)
+                next[state] = best + emission(frame, state, wildcardScore: wildcardScore)
                 steps[frame * stateCount + state] = step
             }
             swap(&score, &next)
         }
 
-        var state = score[stateCount - 1] >= score[stateCount - 2] ? stateCount - 1 : stateCount - 2
+        let hasTrailingWildcard = stateKind[stateCount - 1] == wildcardState
+        let lastTokenState = stateCount - (hasTrailingWildcard ? 3 : 2)
+        var state = lastTokenState
+        for candidate in (lastTokenState + 1)..<stateCount where score[candidate] >= score[state] {
+            state = candidate
+        }
         guard score[state] > impossible else { return nil }
         var first = [Int](repeating: -1, count: tokens.count)
         var last = [Int](repeating: -1, count: tokens.count)
         var total = [Float](repeating: 0, count: tokens.count)
         for frame in stride(from: frameCount - 1, through: 0, by: -1) {
-            if state % 2 == 1 {
-                let token = (state - 1) / 2
-                if last[token] < 0 { last[token] = frame }
-                first[token] = frame
-                total[token] += logProbs[frame * vocabSize + tokens[token]]
+            let kind = stateKind[state]
+            if kind >= 0 {
+                if last[kind] < 0 { last[kind] = frame }
+                first[kind] = frame
+                total[kind] += logProbs[frame * vocabSize + tokens[kind]]
             }
-            state -= Int(steps[frame * stateCount + state])
+            state += Int(steps[frame * stateCount + state])
         }
         return tokens.indices.map { TokenSpan(firstFrame: first[$0], lastFrame: last[$0], logProbability: total[$0]) }
     }
@@ -93,6 +170,8 @@ enum ForcedAlignmentText {
         let display: String
         let reading: String
         let tokenIndex: Int
+        /// A backing vocal stripped from the lyric sits between this word and the previous one.
+        var followsBackingVocal = false
         var tokenIDs: [Int] { reading.compactMap { ForcedAlignmentText.vocabulary[$0] } }
     }
 
@@ -171,12 +250,18 @@ enum ForcedAlignmentText {
         case .chinese: spoken.map(ChineseRomanizer.romanizeLine)
         case .latin: spoken
         }
+        var previousIndex: Int?
         return zip(leadIndices, readings).compactMap { index, reading in
             let leadDisplay = lead[index]
             let isLatin = script == .latin || (!JapaneseRomanizer.containsJapaneseOrCJK(leadDisplay) && !KoreanRomanizer.containsHangul(leadDisplay))
             let letters = letters(of: isLatin && !reading.isEmpty ? latinReading(leadDisplay) : reading)
             let display = tokens[index].display.trimmingCharacters(in: .whitespacesAndNewlines)
-            return letters.isEmpty ? nil : Word(display: display, reading: letters, tokenIndex: index)
+            guard !letters.isEmpty else { return nil }
+            let stripped = previousIndex.map { previous in
+                ((previous + 1)..<index).contains { lead[$0].isEmpty && !tokens[$0].display.allSatisfy(\.isWhitespace) }
+            } ?? false
+            previousIndex = index
+            return Word(display: display, reading: letters, tokenIndex: index, followsBackingVocal: stripped)
         }
     }
 
@@ -960,6 +1045,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
         var allowed: [ClosedRange<Int>] = []
         var pinningRanges: [ClosedRange<Int>] = []
         var owners: [(line: Int, word: Int)] = []
+        var wildcardBoundaries: Set<Int> = [0]
         var restrictedByWordPriors = false
         for (index, window) in zip(batch, windows) {
             let line = lines[index]
@@ -973,6 +1059,7 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                 : nil
             pinningRanges.append(runFrame(atTrackTime: window.rawStart)...min(committedFrames - 1, runFrame(atTrackTime: window.rawEnd)))
             for (wordIndex, word) in line.words.enumerated() {
+                if word.followsBackingVocal { wildcardBoundaries.insert(tokens.count) }
                 let range = wordRanges?[wordIndex] ?? lineRange
                 if range != lineRange { restrictedByWordPriors = true }
                 for token in word.tokenIDs {
@@ -981,10 +1068,17 @@ final class LyricsForcedAligner: AudioChunkTranscribing, LineAttemptReporting, @
                     owners.append((index, wordIndex))
                 }
             }
+            wildcardBoundaries.insert(tokens.count)
         }
         let vocab = model.vocabSize
         let slice = Array(frames[(lowFrame * vocab)..<((highFrame + 1) * vocab)])
-        guard let spans = CTCForcedAlignment.align(logProbs: slice, vocabSize: vocab, tokens: tokens, allowedFrames: allowed)
+        guard let spans = CTCForcedAlignment.align(
+            logProbs: slice,
+            vocabSize: vocab,
+            tokens: tokens,
+            allowedFrames: allowed,
+            wildcardPositions: wildcardBoundaries
+        )
         else { return restrictedByWordPriors ? align(batch, keeping: keep, coarseShift: coarseShift, usesWordPriors: false) : nil }
 
         let kept = Set(batch.prefix(keep))
