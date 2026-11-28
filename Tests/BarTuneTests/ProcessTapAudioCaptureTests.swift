@@ -835,6 +835,7 @@ final class ProcessTapAudioCaptureTests: XCTestCase {
             let error = item.error
             let state = LyricsState(userDefaults: defaults)
             state.audioSyncEngine = .lyricsAlignment
+            state.isPlaying = true
             let capture = StubAudioCapture()
             let failAfterStartup = index == cases.count - 1
             if !failAfterStartup {
@@ -968,12 +969,20 @@ final class ProcessTapAudioCaptureTests: XCTestCase {
         let track = watchdogTrack()
         manager.handleTrackLoaded(track: track, rawLines: watchdogLines)
         await fulfillment(of: [started], timeout: 2)
+        capture.onStart = nil
 
         await emitCapture(seconds: 5, cumulativeSeconds: 5, capture: capture, diagnostics: diagnostics)
         state.isPlaying = false
         manager.handlePlaybackStateChanged(isPlaying: false, position: 0)
+        let resumed = expectation(description: "Capture restarted after resume")
+        capture.onStart = { resumed.fulfill() }
         state.isPlaying = true
         manager.handlePlaybackStateChanged(isPlaying: true, position: 0)
+        await fulfillment(of: [resumed], timeout: 2)
+        capture.onStart = nil
+        for _ in 0..<5 {
+            await Task.yield()
+        }
 
         await emitCapture(seconds: 1, cumulativeSeconds: 6, capture: capture, diagnostics: diagnostics)
         XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 1))
@@ -1057,12 +1066,25 @@ final class ProcessTapAudioCaptureTests: XCTestCase {
     @MainActor
     func testNoAudioWatchdogWaitsForPendingCaptureStartEvenAfterPlaybackResumes() async {
         let capture = StubAudioCapture()
-        let (startGate, acceptStart) = AsyncStream<Void>.makeStream()
-        let startPending = expectation(description: "Capture start is pending")
+        let (firstGate, acceptFirstStart) = AsyncStream<Void>.makeStream()
+        let (secondGate, acceptSecondStart) = AsyncStream<Void>.makeStream()
+        let firstStartPending = expectation(description: "First capture start is pending")
+        let secondStartPending = expectation(description: "Resumed capture start is pending")
+        let startAttempt = LockedBox(0)
         capture.awaitStart = {
-            startPending.fulfill()
-            var iterator = startGate.makeAsyncIterator()
-            _ = await iterator.next()
+            let attempt = startAttempt.withValue { value -> Int in
+                value += 1
+                return value
+            }
+            if attempt == 1 {
+                firstStartPending.fulfill()
+                var iterator = firstGate.makeAsyncIterator()
+                _ = await iterator.next()
+            } else if attempt == 2 {
+                secondStartPending.fulfill()
+                var iterator = secondGate.makeAsyncIterator()
+                _ = await iterator.next()
+            }
         }
         let startReleased = LockedBox(false)
         let armed = expectation(description: "Watchdog starts a full observation interval")
@@ -1076,7 +1098,8 @@ final class ProcessTapAudioCaptureTests: XCTestCase {
         }
         defer {
             manager.stop()
-            acceptStart.finish()
+            acceptFirstStart.finish()
+            acceptSecondStart.finish()
             fireWatchdog.finish()
         }
         let warned = expectation(description: "No-audio warning")
@@ -1085,17 +1108,20 @@ final class ProcessTapAudioCaptureTests: XCTestCase {
         defer { status.cancel() }
 
         manager.handleTrackLoaded(track: watchdogTrack(), rawLines: watchdogLines)
-        await fulfillment(of: [startPending], timeout: 2)
+        await fulfillment(of: [firstStartPending], timeout: 2)
         state.isPlaying = false
         manager.handlePlaybackStateChanged(isPlaying: false, position: 0)
         state.isPlaying = true
         manager.handlePlaybackStateChanged(isPlaying: true, position: 0)
+        await fulfillment(of: [secondStartPending], timeout: 2)
+        let pendingBatchStart = ProcessInfo.processInfo.systemUptime
+        try? await Task.sleep(nanoseconds: 50_000_000)
         await emitCapture(seconds: 6, cumulativeSeconds: 6, capture: capture, diagnostics: diagnostics)
         XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 1))
 
-        let pendingBatchStart = ProcessInfo.processInfo.systemUptime - 6
         startReleased.withValue { $0 = true }
-        acceptStart.yield(())
+        acceptFirstStart.yield(())
+        acceptSecondStart.yield(())
         await fulfillment(of: [armed], timeout: 2)
         await emitCapture(seconds: 6, cumulativeSeconds: 12, capturedAt: pendingBatchStart, capture: capture, diagnostics: diagnostics)
         XCTAssertEqual(state.audioSyncStatus, .syncing(engine: .lyricsAlignment, alignedLines: 0, totalLines: 1))

@@ -247,6 +247,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testAlignerSessionLaunchesModelOnceAndShutsItDownOnStop() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let launches = LockedBox<Int>(0)
@@ -286,6 +287,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testAlignerSessionStopsWhenEngineThrows() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let launches = LockedBox<Int>(0)
@@ -355,7 +357,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let peaks = LockedBox<[Float]>([])
         let deps = makeDependencies(
@@ -385,7 +387,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let launchedWith = LockedBox<[String]>([])
         let aligned = ["Hello", "world", "from", "test"].enumerated().map { index, word in
@@ -422,7 +424,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.syllableTiming = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let aligned = [
             RecognizedAudioWord(text: "Hello", startTime: 11.0, duration: 0.6, confidence: 0.5, syllables: [
@@ -459,6 +461,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentKeepsSavedLinesAndAlignsOnlyTheMissingOnes() async throws {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -516,6 +519,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentKeepsListeningPastSixtyPercent() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let words = ["Alpha", "beta", "Gamma", "delta"].enumerated().map { index, word in
@@ -541,6 +545,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentListensAgainForALineItHeardButCouldNotAlign() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -575,6 +580,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentShowsAnUnconfidentLineButDoesNotLockIt() async throws {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -621,7 +627,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.isolateVocals = isolateVocals
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let words = ["Alpha", "beta", "Gamma", "delta"].enumerated().map { index, word in
             RecognizedAudioWord(text: word, startTime: [10.7, 11.1, 15.7, 16.1][index], duration: 0.3, confidence: 0.1)
@@ -656,6 +662,7 @@ final class AudioSyncManagerTests: XCTestCase {
             }
             return tone
         }
+        state.playbackAnchorDate = Date()
         for second in 0..<7 {
             let samples = Array(audio[(second * rate)..<((second + 1) * rate)])
             let side: [Float] = if wideTone {
@@ -907,6 +914,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ]
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10
         state.playbackAnchorDate = Date()
         let words = [
@@ -956,6 +964,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 15
         state.playbackAnchorDate = Date()
         let fakeCapture = FakeAudioCapture()
@@ -1002,6 +1011,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 15
         state.playbackAnchorDate = Date()
         let capture = FakeAudioCapture()
@@ -1051,6 +1061,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10
         let capture = FakeAudioCapture()
         let launches = LockedBox(0)
@@ -1094,6 +1105,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentSettlesOnceAPlayLocksNothingNew() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -1235,6 +1247,7 @@ final class AudioSyncManagerTests: XCTestCase {
         cache.save(earlyLockRecord(track: track, source: source, missed: Array(4..<48), lockedAtPlayStart: 4))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.setTrack(track, lyrics: source)
         let capture = FakeAudioCapture()
         let launchedWith = LockedBox<[Set<Int>]>([])
@@ -1290,7 +1303,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.setTrack(track, lyrics: source)
         let endPosition = track.duration - 0.5
-        state.updatePlayback(isPlaying: false, position: endPosition)
+        state.updatePlayback(isPlaying: true, position: endPosition)
         let capture = FakeAudioCapture()
         let launchedWith = LockedBox<[Set<Int>]>([])
         let deps = makeDependencies(capture: capture, launchAligner: { _, anchors in
@@ -1347,6 +1360,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentSendsTheRestOfTheAudioAsTheFinalChunkAtTheTrackEnd() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 178.2 // the track is 180 s long
         state.playbackAnchorDate = Date()
         let requests = LockedBox<[(samples: Int, isFinal: Bool)]>([])
@@ -1379,6 +1393,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testResyncCurrentTrackPreservesTrackDurationForFinalChunk() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 178.2 // the track is 180 s long
         state.playbackAnchorDate = Date()
         let requests = LockedBox<[(samples: Int, isFinal: Bool)]>([])
@@ -1409,6 +1424,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentListensAgainForLinesAPartialPlayMissed() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -1465,6 +1481,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testLyricsAlignmentStopsWithUnavailableWhenNoLinesAreReadable() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let fakeCapture = FakeAudioCapture()
@@ -1510,6 +1527,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testFailedAlignerRestartReleasesThePreviouslyCachedModelAfterIdle() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let nextEngine = LockedBox<FakeChunkEngine?>(FakeChunkEngine { _ in [] })
         var deps = makeDependencies(capture: capture, launchAligner: { _, _ in
@@ -1539,7 +1557,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
@@ -1582,6 +1600,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         // While chunk 1 is busy, feed 500 samples (5x targetFrames) starting at playback position 20.0.
         state.playbackAnchorPosition = 20.0
+        state.playbackAnchorDate = Date()
         for batch in 0..<5 {
             fakeCapture.emit(samples: [Float](repeating: Float(batch + 1) * 0.1, count: chunkFrames), sampleRate: sampleRate)
         }
@@ -1612,6 +1631,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testStopDuringAlignerStartupSkipsCaptureStartAndShutsDownEngine() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let engine = FakeChunkEngine { _ in [] }
@@ -1652,7 +1672,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
 
@@ -1747,7 +1767,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let recordedRequests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
@@ -1769,6 +1789,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started)
 
         // Emit half of a 1.0s chunk (50 of 100 frames) at position 10.0.
+        state.playbackAnchorDate = Date()
         fakeCapture.emit(samples: [Float](repeating: 0.1, count: 50), sampleRate: 100.0)
         for _ in 0..<10 {
             await Task.yield()
@@ -1807,7 +1828,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let recordedRequests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
@@ -1874,7 +1895,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let recordedRequests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
@@ -1898,7 +1919,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         fakeCapture.emit(samples: [Float](repeating: 0.2, count: 30), sampleRate: 100.0)
         change(state)
-        manager.handlePlaybackStateChanged(isPlaying: false, position: state.playbackAnchorPosition)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: state.playbackAnchorPosition)
         fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
         return recordedRequests.withLock { $0 }
@@ -1910,7 +1931,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let recordedRequests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
@@ -1938,9 +1959,11 @@ final class AudioSyncManagerTests: XCTestCase {
 
         // Seek to 90 s, then to 140 s before the next buffer; the caller updates live state first.
         state.playbackAnchorPosition = 90.0
-        manager.handlePlaybackStateChanged(isPlaying: false, position: 90.0)
+        state.playbackAnchorDate = Date()
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 90.0)
         state.playbackAnchorPosition = 140.0
-        manager.handlePlaybackStateChanged(isPlaying: false, position: 140.0)
+        state.playbackAnchorDate = Date()
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 140.0)
 
         fakeCapture.emit(samples: [Float](repeating: 0.95, count: 100), sampleRate: 100.0)
         await fulfillment(of: [chunkDispatched], timeout: 2.0)
@@ -1956,7 +1979,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         state.playbackRate = 2.0
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
@@ -1992,7 +2015,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let feed = LockedBox<[[RecognizedAudioWord]]>([])
         let deps = alignerDependencies(capture: fakeCapture, feed: feed)
@@ -2046,6 +2069,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testReleasedSessionOffsetDeletesCacheBeforeSavingRecoveredAlignment() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10
         let track = sampleTrack()
         let source = tenLines()
@@ -2150,7 +2174,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let feed = LockedBox<[[RecognizedAudioWord]]>([])
         let manager = AudioSyncManager(
@@ -2255,7 +2279,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let track = TrackInfo(
             id: "spotify:track:repeated-chorus", title: "Repeat", artist: "Artist", album: "",
             duration: 30, artworkURL: nil
@@ -2294,23 +2318,27 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let rate = ChromaTestAudio.sampleRate
         let audio = ChromaTestAudio.repeatedPhrase(transposeSecondBy: transposeSecondBy)
-        capture.emit(samples: Array(audio[..<Int(12 * rate)]), sampleRate: rate)
+        let firstChunk = Array(audio[..<Int(12 * rate)])
+        state.playbackAnchorDate = Date()
+        capture.emit(samples: firstChunk, sampleRate: rate)
         let firstLocked = await waitUntil(timeout: 5) { cache.load(trackId: track.id)?.lockedLineIDs == [0] }
         XCTAssertTrue(firstLocked)
 
         state.playbackAnchorPosition = 12
-        state.playbackAnchorDate = Date()
         if captureGap > 0 {
-            capture.emit(samples: Array(audio[Int(12 * rate)..<Int(15 * rate)]), sampleRate: rate, captureDelay: 0)
+            let preGap = Array(audio[Int(12 * rate)..<Int(15 * rate)])
+            state.playbackAnchorDate = Date()
+            capture.emit(samples: preGap, sampleRate: rate, captureDelay: 0)
             let buffered = await waitUntil { manager.bufferedSampleCount == Int(3 * rate) }
             XCTAssertTrue(buffered)
+            let postGap = Array(audio[Int((15 + captureGap) * rate)..<Int((24 + captureGap) * rate)])
             state.playbackAnchorPosition = 15 + captureGap
-            capture.emit(
-                samples: Array(audio[Int((15 + captureGap) * rate)..<Int((24 + captureGap) * rate)]),
-                sampleRate: rate, captureDelay: 0
-            )
+            state.playbackAnchorDate = Date()
+            capture.emit(samples: postGap, sampleRate: rate, captureDelay: 0)
         } else {
-            capture.emit(samples: Array(audio[Int(12 * rate)..<Int(24 * rate)]), sampleRate: rate)
+            let secondChunk = Array(audio[Int(12 * rate)..<Int(24 * rate)])
+            state.playbackAnchorDate = Date()
+            capture.emit(samples: secondChunk, sampleRate: rate)
         }
         let processed = await waitUntil(timeout: 5) { manager.diagnostics.snapshot?.resultCount == 2 }
         XCTAssertTrue(processed)
@@ -2337,7 +2365,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started, "a partial record keeps listening")
         state.updatePlayback(isPlaying: true, position: 10.2)
         XCTAssertNil(state.activeLine, "the partial record's timings are shown while listening")
-        state.updatePlayback(isPlaying: false, position: 10.0)
+        state.updatePlayback(isPlaying: true, position: 10.0)
 
         let oneHeard = await hear(heardWords(lines: 0..<1), manager: manager, capture: capture, feed: feed)
         XCTAssertTrue(oneHeard)
@@ -2447,7 +2475,7 @@ final class AudioSyncManagerTests: XCTestCase {
         // Unreliable timings (+0.5s shift) must not be applied to display.
         state.updatePlayback(isPlaying: true, position: 10.2)
         XCTAssertEqual(state.currentText, "amber river glows")
-        state.updatePlayback(isPlaying: false, position: 10.0)
+        state.updatePlayback(isPlaying: true, position: 10.0)
 
         // Hearing the remaining 9 lines combines with the 1 retained line to reach 10/10 completion.
         _ = await hear(heardWords(lines: 1..<10), manager: manager, capture: capture, feed: feed)
@@ -2475,6 +2503,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10
         state.playbackAnchorDate = Date()
         let capture = FakeAudioCapture()
@@ -2511,6 +2540,7 @@ final class AudioSyncManagerTests: XCTestCase {
         ))
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10
         state.playbackAnchorDate = Date()
         let capture = FakeAudioCapture()
@@ -2690,6 +2720,7 @@ final class AudioSyncManagerTests: XCTestCase {
         // AudioSyncManager with an unresolved track prefix must not start capture or recognition.
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let launches = LockedBox<[FakeChunkEngine]>([])
         let deps = makeDependencies(
@@ -2740,7 +2771,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let feed = LockedBox<[[RecognizedAudioWord]]>([])
@@ -2798,6 +2829,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testUpdateSourceBundleStartsNewAudioChunkAtNewCapturePosition() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let deps = makeDependencies(
             capture: fakeCapture,
@@ -2809,13 +2841,13 @@ final class AudioSyncManagerTests: XCTestCase {
         let chromeStarted = await waitUntil { manager.isLiveSyncActive && fakeCapture.startCount == 1 }
         XCTAssertTrue(chromeStarted)
 
-        state.updatePlayback(isPlaying: false, position: 10.0)
+        state.updatePlayback(isPlaying: true, position: 10.0)
         fakeCapture.emit(samples: [Float](repeating: 0.1, count: 80), sampleRate: 100)
         let chromeBuffered = await waitUntil { manager.bufferedSampleCount == 80 }
         XCTAssertTrue(chromeBuffered)
-        XCTAssertEqual(manager.currentChunkStartPos, 10.0)
+        XCTAssertEqual(manager.currentChunkStartPos ?? -1, 10.0, accuracy: 0.05)
 
-        state.updatePlayback(isPlaying: false, position: 24.0)
+        state.updatePlayback(isPlaying: true, position: 24.0)
         manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
         XCTAssertEqual(manager.bufferedSampleCount, 0)
         XCTAssertNil(manager.currentChunkStartPos)
@@ -2823,7 +2855,7 @@ final class AudioSyncManagerTests: XCTestCase {
         fakeCapture.emit(samples: [Float](repeating: 0.1, count: 30), sampleRate: 100)
         let safariBuffered = await waitUntil { manager.bufferedSampleCount == 30 }
         XCTAssertTrue(safariBuffered)
-        XCTAssertEqual(manager.currentChunkStartPos, 24.0)
+        XCTAssertEqual(manager.currentChunkStartPos ?? -1, 24.0, accuracy: 0.05)
     }
 
     @MainActor
@@ -2832,7 +2864,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let recordedRequests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
         let chunkDispatched = expectation(description: "Post-retarget audio chunk dispatched")
@@ -2894,7 +2926,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let words = ["Hello", "world", "from", "test"].enumerated().map {
             RecognizedAudioWord(text: $0.element, startTime: 10.0 + Double($0.offset) * 0.3, duration: 0.2, confidence: 0.9)
@@ -2913,6 +2945,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started)
 
         // One 6 s chunk: a note sung from 10 s to 12 s, then 4 s of silence.
+        state.playbackAnchorDate = Date()
         let rate = 16000
         let note = (0..<(2 * rate)).map { 0.5 * sin(2 * Float.pi * 440 * Float($0) / Float(rate)) }
         let audio = note + [Float](repeating: 0, count: 4 * rate)
@@ -2953,6 +2986,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testFailedRetargetCaptureTearsDownRecognitionSession() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let fakeCapture = FakeAudioCapture()
         let engine = FakeChunkEngine(transcribe: { _ in [] })
         let deps = alignerDependencies(capture: fakeCapture, feed: LockedBox([]), launchAligner: { _, _ in engine })
@@ -3033,7 +3067,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 14.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let track = TrackInfo(id: "spotify:track:two-chunk-trim", title: "Trim", artist: "Artist", album: "", duration: 60, artworkURL: nil)
         let rawLines = [
@@ -3109,7 +3143,8 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 8
-        state.isPlaying = false
+        state.playbackAnchorDate = Date()
+        state.isPlaying = true
 
         let track = sampleTrack()
         let rawLines = [
@@ -3176,7 +3211,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let track = TrackInfo(id: "spotify:track:shifted-locked-blank", title: "BlankOrder", artist: "Artist", album: "", duration: 60, artworkURL: nil)
         let rawLines = [
@@ -3406,7 +3441,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let capture = FakeAudioCapture()
         let deps = makeDependencies(capture: capture, chunkDurationSeconds: 2000.0)
@@ -3450,7 +3485,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let track = TrackInfo(id: "spotify:track:many-blanks-bound", title: "ManyBlanks", artist: "Artist", album: "", duration: 60, artworkURL: nil)
         // Raw lyrics place line 1 at 9.0 s so alignHeardWords matches line 53 at 10.60 s;
@@ -3536,7 +3571,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let capture = FakeAudioCapture()
         var deps = makeDependencies(capture: capture, chunkDurationSeconds: 12.0)
@@ -3587,7 +3622,7 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 5.0
         state.playbackAnchorDate = Date()
-        state.isPlaying = false
+        state.isPlaying = true
 
         let track = TrackInfo(id: "spotify:track:envelope-resume", title: "Resume", artist: "Artist", album: "", duration: 60, artworkURL: nil)
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -3639,7 +3674,7 @@ final class AudioSyncManagerTests: XCTestCase {
             state.audioSyncEngine = .lyricsAlignment
             state.playbackAnchorPosition = 12.0
             state.playbackAnchorDate = Date()
-            state.isPlaying = false
+            state.isPlaying = true
 
             let track = TrackInfo(id: "spotify:track:bound-conflict", title: "Conflict", artist: "Artist", album: "", duration: 60, artworkURL: nil)
             let rawLines = [
@@ -3719,7 +3754,7 @@ final class AudioSyncManagerTests: XCTestCase {
             state.audioSyncEngine = .lyricsAlignment
             state.playbackAnchorPosition = 12.0
             state.playbackAnchorDate = Date()
-            state.isPlaying = false
+            state.isPlaying = true
 
             let track = TrackInfo(id: "spotify:track:bound-tight-valid", title: "TightValid", artist: "Artist", album: "", duration: 60, artworkURL: nil)
             let rawLines = [
@@ -3875,6 +3910,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 16.0
         state.playbackAnchorDate = Date()
         let fakeCapture = FakeAudioCapture()
@@ -3921,6 +3957,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 0.0
         state.playbackAnchorDate = Date()
         let fakeCapture = FakeAudioCapture()
@@ -4043,6 +4080,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
         let releaseCount = LockedBox(0)
@@ -4102,7 +4140,8 @@ final class AudioSyncManagerTests: XCTestCase {
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
         state.playbackAnchorPosition = 10
-        state.isPlaying = false
+        state.playbackAnchorDate = Date()
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
         var deps = makeDependencies(capture: capture, runChunk: { input in
@@ -4118,11 +4157,13 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertTrue(started)
 
         // The right-channel stem is silent before the 200 ms gap and audible after it.
+        state.playbackAnchorDate = Date()
         let firstHalf = [Float](repeating: 0.3, count: 24000)
         capture.emit(samples: firstHalf, sampleRate: 48000, side: firstHalf, captureDelay: 0)
         let buffered = await waitUntil { manager.bufferedSampleCount == firstHalf.count }
         XCTAssertTrue(buffered)
         state.playbackAnchorPosition = 10.7
+        state.playbackAnchorDate = Date()
         capture.emit(samples: [Float](repeating: 0.5, count: 24000), sampleRate: 48000, side: firstHalf, captureDelay: 0)
         let processed = await waitForVocalIsolationChunk { manager.diagnostics.snapshot?.resultCount == 1 }
         XCTAssertTrue(processed)
@@ -4143,7 +4184,8 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.playbackAnchorPosition = 10
-        state.isPlaying = false
+        state.playbackAnchorDate = Date()
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let requests = LockedBox<[AudioSyncManager.AudioChunkRequest]>([])
         let deps = makeDependencies(capture: capture, runChunk: { request in
@@ -4156,11 +4198,13 @@ final class AudioSyncManagerTests: XCTestCase {
         let started = await waitUntil { capture.startCount == 1 }
         XCTAssertTrue(started)
 
+        state.playbackAnchorDate = Date()
         let halfSecond = [Float](repeating: 0.3, count: 8000)
         capture.emit(samples: halfSecond, sampleRate: 16000, captureDelay: 0)
         let buffered = await waitUntil { manager.bufferedSampleCount == halfSecond.count }
         XCTAssertTrue(buffered)
         state.playbackAnchorPosition = 10.51
+        state.playbackAnchorDate = Date()
         capture.emit(samples: halfSecond + halfSecond, sampleRate: 16000, captureDelay: 0, startsNewSpan: true)
 
         let processed = await waitUntil { requests.withLock(\.count) == 2 }
@@ -4171,7 +4215,7 @@ final class AudioSyncManagerTests: XCTestCase {
         XCTAssertEqual(beforeDrop.samples.count, halfSecond.count)
         XCTAssertFalse(beforeDrop.startsNewSpan)
         XCTAssertEqual(afterDrop.samples.count, halfSecond.count * 2)
-        XCTAssertEqual(afterDrop.chunkStartTime, 10.51, accuracy: 0.0001)
+        XCTAssertEqual(afterDrop.chunkStartTime, 10.51, accuracy: 0.05)
         XCTAssertTrue(afterDrop.startsNewSpan)
     }
 
@@ -4179,6 +4223,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testChunkInferenceRunsAtBackgroundPriority() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let cache = AudioSyncedLyricsCache(directory: tempDir)
@@ -4213,6 +4258,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let request = LockedBox<AudioSyncManager.AudioChunkRequest?>(nil)
         var deps = makeDependencies(capture: capture, runChunk: { input in
@@ -4246,6 +4292,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let requests = LockedBox<[Int]>([])
         let attemptedConversion = LockedBox(false)
@@ -4282,6 +4329,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         var deps = makeDependencies(capture: capture, runChunk: { _ in
             XCTFail("A five-second preview should not dispatch a chunk")
@@ -4312,6 +4360,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         var deps = makeDependencies(capture: capture, launchAligner: { _, _ in
             FakeChunkEngine { _ in throw FakeChunkEngineError.exited }
@@ -4341,6 +4390,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
         state.isolateVocals = true
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let peaks = LockedBox<[Float]>([])
         let receivedChunks = expectation(description: "Recognizer receives two consecutive chunks")
@@ -4386,6 +4436,7 @@ final class AudioSyncManagerTests: XCTestCase {
     func testIdleModelReleaseFiresAfterStopAndCancelsWhenNextTrackStartsSyncing() async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let fakeCapture = FakeAudioCapture()
         let releaseCount = LockedBox<Int>(0)
@@ -4453,6 +4504,7 @@ final class AudioSyncManagerTests: XCTestCase {
     private func checkLateCancelledStartup(startReplacement: Bool) async {
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let capture = FakeAudioCapture()
         let clock = ControlledNotifyClock()
         let releaseCount = LockedBox(0)
@@ -4575,6 +4627,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let cache = AudioSyncedLyricsCache(directory: dir)
         let state = LyricsState(userDefaults: ud)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         let track = TrackInfo(id: "spotify:track:prior-replay", title: "T", artist: "A", album: "B", duration: 60, artworkURL: nil)
         let rawLines = sampleLines()
         let lockedLine = LyricLine(
@@ -4714,6 +4767,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = aligned[9].timestamp
         state.playbackAnchorDate = Date()
         let launches = LockedBox<Int>(0)
@@ -4778,6 +4832,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 172.0
         state.playbackAnchorDate = Date()
         let seenFinalRequests = LockedBox<[Bool]>([])
@@ -4845,6 +4900,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 178.5
         state.playbackAnchorDate = Date()
         let chunkStarted = LockedBox(false)
@@ -4890,6 +4946,7 @@ final class AudioSyncManagerTests: XCTestCase {
         let cache = AudioSyncedLyricsCache(directory: tempDir)
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 10.0
         state.playbackAnchorDate = Date()
         let launches = LockedBox<Int>(0)
@@ -4927,6 +4984,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 172.0
         state.playbackAnchorDate = Date()
         let seenFinalRequests = LockedBox<[Bool]>([])
@@ -4975,6 +5033,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 100.0
         state.playbackAnchorDate = Date()
         let tailEntered = LockedBox(false)
@@ -5031,6 +5090,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 19.0
         state.playbackAnchorDate = Date()
         let engine = FakeChunkEngine(confident: [2], finishRun: { Self.words(for: source[2], at: 20.7) }, transcribe: { _ in [] })
@@ -5068,6 +5128,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 100.0
         state.playbackAnchorDate = Date()
         let engine = FakeChunkEngine(confident: [], finishRun: { [] }, transcribe: { _ in [] })
@@ -5129,6 +5190,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 100.0
         state.playbackAnchorDate = Date()
         let seen = LockedBox<[(count: Int, start: Double, isFinal: Bool)]>([])
@@ -5182,6 +5244,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 172.0
         state.playbackAnchorDate = Date()
         let entered = LockedBox(0)
@@ -5242,6 +5305,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.setLyricSourceChoice(.custom, for: trackB.id)
         state.playbackAnchorPosition = 172.0
         state.playbackAnchorDate = Date()
@@ -5310,6 +5374,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 15.0
         state.playbackAnchorDate = Date()
         let capture = FakeAudioCapture()
@@ -5340,6 +5405,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
         let state = LyricsState(userDefaults: defaults)
         state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
         state.playbackAnchorPosition = 172.0
         state.playbackAnchorDate = Date()
         let gateUsed = LockedBox(false)
@@ -5387,6 +5453,290 @@ final class AudioSyncManagerTests: XCTestCase {
         await manager.flushCacheOperations()
 
         XCTAssertNotNil(cache.load(trackId: trackA.id), "a cancelled finalizer must not remove the resynced record")
+    }
+
+    @MainActor
+    func testPauseStopsCaptureDropsLateBuffersAndResumeRestartsAlignment() async throws {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        let fakeCapture = FakeAudioCapture()
+        let transcribeCount = LockedBox(0)
+        let alignedWords = ["Hello", "world", "from", "test"].enumerated().map { index, word in
+            RecognizedAudioWord(text: word, startTime: 10.0 + Double(index) * 0.25, duration: 0.2, confidence: 0.9)
+        }
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            runChunk: { _ in
+                transcribeCount.withLock { $0 += 1 }
+                return alignedWords
+            },
+            chunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && manager.isCaptureRunning && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        let prePauseHandler = try XCTUnwrap(fakeCapture.onAudioSamples)
+        let stopCountBeforePause = fakeCapture.stopCount
+        state.playbackAnchorDate = Date()
+        // Emit 0.5 s of audible audio at 1000 Hz (50 frames in VocalEnvelope, half of a 1.0 s chunk).
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 500), sampleRate: 1000)
+        let bufferedPrePause = await waitUntil { manager.bufferedSampleCount == 500 }
+        XCTAssertTrue(bufferedPrePause)
+        let segmentsBeforePause = manager.vocalEnvelope.segments.count
+        let framesBeforePause = manager.vocalEnvelope.totalFrameCount
+        XCTAssertEqual(segmentsBeforePause, 1)
+        XCTAssertEqual(framesBeforePause, 50)
+
+        state.updatePlayback(isPlaying: false, position: 10.5)
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 10.5)
+
+        XCTAssertTrue(manager.isLiveSyncActive)
+        XCTAssertFalse(manager.isCaptureRunning)
+        XCTAssertEqual(fakeCapture.stopCount, stopCountBeforePause + 1)
+        XCTAssertNil(fakeCapture.onAudioSamples)
+        XCTAssertNil(fakeCapture.onCaptureFailure)
+
+        // Late or queued buffer from the pre-pause capture must be dropped without growing buffers,
+        // fragmenting VocalEnvelope, or dispatching transcribe.
+        prePauseHandler(CapturedAudio(samples: [Float](repeating: 0.3, count: 600), sampleRate: 1000))
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(manager.bufferedSampleCount, 500)
+        XCTAssertEqual(manager.vocalEnvelope.segments.count, segmentsBeforePause)
+        XCTAssertEqual(manager.vocalEnvelope.totalFrameCount, framesBeforePause)
+        XCTAssertEqual(transcribeCount.withLock { $0 }, 0)
+
+        // Repeated playback polls while paused must not stop capture again.
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 10.5)
+        XCTAssertEqual(fakeCapture.stopCount, stopCountBeforePause + 1)
+
+        // Resuming restarts capture and finishes aligning the chunk.
+        state.updatePlayback(isPlaying: true, position: 10.5)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 10.5)
+        let resumed = await waitUntil { manager.isCaptureRunning && fakeCapture.startCount == 2 }
+        XCTAssertTrue(resumed)
+
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 500), sampleRate: 1000)
+        let aligned = await waitUntil {
+            transcribeCount.withLock { $0 } == 1 && !manager.isChunkProcessing && !(state.rawLyricLines.first?.words.isEmpty ?? true)
+        }
+        XCTAssertTrue(aligned)
+        XCTAssertTrue(manager.isLiveSyncActive)
+    }
+
+    @MainActor
+    func testInFlightChunkCompletionWhilePausedDefersBufferedChunkUntilResume() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = true
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        let fakeCapture = FakeAudioCapture()
+        let firstStarted = expectation(description: "First chunk started")
+        let releaseFirst = DispatchSemaphore(value: 0)
+        let transcribeCount = LockedBox(0)
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            runChunk: { _ in
+                let count = transcribeCount.withLock { n -> Int in
+                    n += 1
+                    return n
+                }
+                if count == 1 {
+                    firstStarted.fulfill()
+                    XCTAssertEqual(releaseFirst.wait(timeout: .now() + 5), .success)
+                }
+                return []
+            },
+            chunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && manager.isCaptureRunning && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Start chunk 1 and buffer a complete chunk 2 behind it.
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
+        await fulfillment(of: [firstStarted], timeout: 2.0)
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
+        let bufferedSecond = await waitUntil { manager.bufferedSampleCount == 100 }
+        XCTAssertTrue(bufferedSecond)
+
+        // Pause before chunk 1 finishes: chunk 2 must stay buffered and NOT dispatch while paused.
+        state.updatePlayback(isPlaying: false, position: 12.0)
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 12.0)
+        releaseFirst.signal()
+        let firstFinished = await waitUntil { !manager.isChunkProcessing }
+        XCTAssertTrue(firstFinished)
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(transcribeCount.withLock { $0 }, 1)
+        XCTAssertEqual(manager.bufferedSampleCount, 100)
+
+        // Resuming dispatches the buffered chunk immediately alongside restarting capture.
+        state.updatePlayback(isPlaying: true, position: 12.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 12.0)
+        let secondDispatched = await waitUntil { transcribeCount.withLock { $0 } == 2 && !manager.isChunkProcessing }
+        XCTAssertTrue(secondDispatched)
+        XCTAssertEqual(fakeCapture.startCount, 2)
+    }
+
+    @MainActor
+    func testLoadingTrackWhilePausedDoesNotStartCaptureUntilPlaybackStarts() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isPlaying = false
+        state.playbackAnchorPosition = 10.0
+        state.playbackAnchorDate = Date()
+
+        let fakeCapture = FakeAudioCapture()
+        let transcribeCount = LockedBox(0)
+        let deps = makeDependencies(
+            capture: fakeCapture,
+            runChunk: { _ in
+                transcribeCount.withLock { $0 += 1 }
+                return []
+            },
+            chunkDurationSeconds: 1.0
+        )
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: browserTrack(sourceBundleId: "com.google.Chrome"), rawLines: sampleLines())
+        let liveActive = await waitUntil { manager.isLiveSyncActive }
+        XCTAssertTrue(liveActive)
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(fakeCapture.startCount, 0)
+        XCTAssertFalse(manager.isCaptureRunning)
+
+        // Retargeting source bundle while still paused must also defer capture start.
+        manager.updateSourceBundle(for: browserTrack(sourceBundleId: "com.apple.Safari"))
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        XCTAssertEqual(fakeCapture.startCount, 0)
+        XCTAssertFalse(manager.isCaptureRunning)
+
+        state.updatePlayback(isPlaying: true, position: 10.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 10.0)
+        let started = await waitUntil { manager.isCaptureRunning && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+        XCTAssertEqual(fakeCapture.lastTargetBundleIds, ["com.apple.Safari"])
+
+        fakeCapture.emit(samples: [Float](repeating: 0.2, count: 100), sampleRate: 100)
+        let transcribed = await waitUntil { transcribeCount.withLock { $0 } == 1 && !manager.isChunkProcessing }
+        XCTAssertTrue(transcribed)
+    }
+
+    @MainActor
+    func testIdleModelReleaseFiresWhilePausedAndCancelsOnResume() async {
+        let state = LyricsState(userDefaults: defaults)
+        state.audioSyncEngine = .lyricsAlignment
+        state.isolateVocals = true
+        state.isPlaying = true
+        state.playbackAnchorPosition = 5.0
+        state.playbackAnchorDate = Date()
+
+        let fakeCapture = FakeAudioCapture()
+        let releaseCount = LockedBox(0)
+        let separatorReleaseCount = LockedBox(0)
+        let cancellations = LockedBox(0)
+        let clock = ControlledNotifyClock()
+
+        let engines = LockedBox<[FakeChunkEngine]>([])
+        let separatorLaunches = LockedBox(0)
+
+        var deps = makeDependencies(capture: fakeCapture, launchAligner: { _, _ in
+            let engine = FakeChunkEngine(transcribe: { _ in [] })
+            engines.withLock { $0.append(engine) }
+            return engine
+        })
+        deps.launchVocalSeparator = {
+            separatorLaunches.withLock { $0 += 1 }
+            return RightChannelVocalSeparator()
+        }
+        deps.releaseCachedModel = { releaseCount.withLock { $0 += 1 } }
+        deps.releaseCachedVocalSeparator = { separatorReleaseCount.withLock { $0 += 1 } }
+        deps.idleModelReleaseSleep = { delay in
+            try await withTaskCancellationHandler {
+                try await clock.sleep(until: clock.now().advanced(by: delay))
+            } onCancel: {
+                cancellations.withLock { $0 += 1 }
+            }
+        }
+
+        let manager = AudioSyncManager(state: state, cache: AudioSyncedLyricsCache(directory: tempDir), dependencies: deps)
+        defer { manager.stop() }
+
+        manager.handleTrackLoaded(track: sampleTrack(), rawLines: sampleLines())
+        let started = await waitUntil { manager.isLiveSyncActive && manager.isCaptureRunning && fakeCapture.startCount == 1 }
+        XCTAssertTrue(started)
+
+        // Pausing schedules idle model release; resuming before the delay elapses cancels it.
+        state.updatePlayback(isPlaying: false, position: 5.0)
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 5.0)
+        let firstTimerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(firstTimerArmed)
+
+        clock.advance(by: .seconds(59))
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(releaseCount.withLock { $0 }, 0)
+        XCTAssertEqual(separatorReleaseCount.withLock { $0 }, 0)
+        XCTAssertTrue(clock.hasPendingWaiter)
+
+        state.updatePlayback(isPlaying: true, position: 5.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 5.0)
+        let resumed = await waitUntil { manager.isCaptureRunning && fakeCapture.startCount == 2 }
+        XCTAssertTrue(resumed)
+        XCTAssertEqual(cancellations.withLock { $0 }, 1)
+        XCTAssertFalse(clock.hasPendingWaiter)
+
+        clock.advance(by: .seconds(60))
+        for _ in 0..<10 {
+            await Task.yield()
+        }
+        XCTAssertEqual(releaseCount.withLock { $0 }, 0)
+        XCTAssertEqual(separatorReleaseCount.withLock { $0 }, 0)
+
+        // Staying paused past the idle delay shuts down the live engine and releases both cached models
+        // without tearing down the live session.
+        state.updatePlayback(isPlaying: false, position: 5.0)
+        manager.handlePlaybackStateChanged(isPlaying: false, position: 5.0)
+        let secondTimerArmed = await waitUntil { clock.hasPendingWaiter }
+        XCTAssertTrue(secondTimerArmed)
+
+        clock.advance(by: .seconds(60))
+        let released = await waitUntil { releaseCount.withLock { $0 == 1 } && separatorReleaseCount.withLock { $0 == 1 } }
+        XCTAssertTrue(released)
+        XCTAssertEqual(engines.withLock { $0.map(\.shutdownCount) }, [1])
+        XCTAssertTrue(manager.isLiveSyncActive)
+        XCTAssertFalse(manager.isCaptureRunning)
+
+        // Resuming relaunches the aligner and separator, then restarts capture.
+        state.updatePlayback(isPlaying: true, position: 5.0)
+        manager.handlePlaybackStateChanged(isPlaying: true, position: 5.0)
+        let relaunched = await waitUntil { manager.isCaptureRunning && fakeCapture.startCount == 3 }
+        XCTAssertTrue(relaunched)
+        XCTAssertEqual(engines.withLock { $0.map(\.shutdownCount) }, [1, 0])
+        XCTAssertEqual(separatorLaunches.withLock { $0 }, 2)
     }
 
     private func twoLockedRecord(trackId: String, source: [LyricLine]) -> AudioSyncedLyricsRecord {
@@ -5443,6 +5793,7 @@ final class AudioSyncManagerTests: XCTestCase {
 
 private final class FakeAudioCapture: AudioCaptureProviding {
     var onAudioSamples: (@Sendable (CapturedAudio) -> Void)?
+    var onCaptureFailure: (@Sendable (Error) -> Void)?
     private(set) var startCount = 0
     private(set) var stopCount = 0
     private(set) var lastTargetBundleIds: Set<String> = []

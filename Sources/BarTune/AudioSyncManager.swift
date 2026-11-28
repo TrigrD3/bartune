@@ -775,6 +775,7 @@ final class AudioSyncManager {
         return VocalEnvelope.mergedForDisplay(cached: vocalEnvelopeCache[trackId], live: VocalEnvelope())
     }
     private(set) var isLiveSyncActive: Bool = false
+    private(set) var isCaptureRunning: Bool = false
     private var syncGeneration: UInt64 = 0
     private var captureTargetGeneration: UInt64 = 0
     private var captureStartAccepted = false
@@ -882,12 +883,26 @@ final class AudioSyncManager {
             } catch {
                 return
             }
-            guard !Task.isCancelled,
-                  let self,
-                  !self.isLiveSyncActive,
+            guard !Task.isCancelled, let self else { return }
+            self.modelIdleReleaseTask = nil
+            guard !self.isLiveSyncActive || (!self.state.isPlaying && !self.isCaptureRunning),
                   self.alignerStartupTask == nil
             else { return }
-            self.modelIdleReleaseTask = nil
+            if self.isLiveSyncActive {
+                let generation = self.syncGeneration
+                await self.chunkProcessingTask?.value
+                guard self.modelIdleReleaseTask == nil,
+                      self.syncGeneration == generation,
+                      self.isLiveSyncActive,
+                      !self.state.isPlaying,
+                      !self.isCaptureRunning
+                else { return }
+                // A paused session drops its engine and separator so the models can be freed; resuming relaunches them.
+                self.chunkEngine?.shutdown()
+                self.chunkEngine = nil
+                self.vocalSeparator = nil
+                self.discardBufferedAudio()
+            }
             self.modelMayBeCached = false
             release()
             releaseSeparator()
@@ -927,15 +942,21 @@ final class AudioSyncManager {
         stopActiveSession()
     }
 
-    private func stopActiveSession() {
-        cacheActiveVocalEnvelopeIfNonEmpty()
-        syncGeneration &+= 1
+    private func stopCapture() {
         captureTargetGeneration &+= 1
         captureStartAccepted = false
-        isLiveSyncActive = false
+        isCaptureRunning = false
         capture.onAudioSamples = nil
         capture.onCaptureFailure = nil
         capture.stop()
+        resetNoAudioWatchdog()
+    }
+
+    private func stopActiveSession() {
+        cacheActiveVocalEnvelopeIfNonEmpty()
+        syncGeneration &+= 1
+        isLiveSyncActive = false
+        stopCapture()
         cacheLoadTask?.cancel()
         cacheLoadTask = nil
         alignerStartupTask?.cancel()
@@ -944,7 +965,6 @@ final class AudioSyncManager {
         chunkProcessingTask = nil
         pendingVocalEnvelopeNotification?.cancel()
         pendingVocalEnvelopeNotification = nil
-        resetNoAudioWatchdog()
         chunkEngine?.shutdown()
         chunkEngine = nil
         vocalSeparator = nil
@@ -1135,13 +1155,16 @@ final class AudioSyncManager {
         let updatedTargets = Self.targetBundleIdentifiers(for: track.id, sourceBundleId: track.sourceBundleId)
 
         guard isLiveSyncActive, previousTargets != updatedTargets else { return }
-        capture.stop()
+        if isCaptureRunning {
+            stopCapture()
+        }
         hasReceivedAudibleAudioThisSession = false
         clearNoAudioWarning()
         // Buffered samples belong to the old capture's timeline; the next sample starts a new chunk.
         discardBufferedAudio()
         // Deliveries still queued from the old capture must not start the new chunk.
         seekBoundary = ProcessInfo.processInfo.systemUptime
+        guard state.isPlaying else { return }
         startCaptureForCurrentTarget(trackId: track.id, engine: state.audioSyncEngine, generation: syncGeneration)
     }
 
@@ -1152,6 +1175,7 @@ final class AudioSyncManager {
     ) {
         captureTargetGeneration &+= 1
         captureStartAccepted = false
+        isCaptureRunning = true
         resetNoAudioWatchdog()
         let captureGeneration = captureTargetGeneration
         installChunkHandler(trackId: trackId, generation: generation, captureGeneration: captureGeneration)
@@ -1171,12 +1195,20 @@ final class AudioSyncManager {
                   self.activeTrackId == trackId,
                   self.state.audioSyncEngine == engine
             else { return }
+            guard self.state.isPlaying else {
+                self.stopCapture()
+                return
+            }
             do {
                 try await self.capture.start(targetBundleIds: targetBundles, sampleRate: sampleRate)
                 guard self.syncGeneration == generation,
                       self.captureTargetGeneration == captureGeneration,
                       self.isLiveSyncActive
                 else { return }
+                guard self.state.isPlaying else {
+                    self.stopCapture()
+                    return
+                }
                 self.captureStartAccepted = true
                 self.armNoAudioWatchdogIfNeeded()
             } catch {
@@ -1224,16 +1256,30 @@ final class AudioSyncManager {
     func handlePlaybackStateChanged(isPlaying: Bool, position: Double, playbackRate: Double? = nil) {
         let resolvedRate = Self.sanitizedPlaybackRate(playbackRate ?? state.playbackRate)
         discardChunkIfSeeked(to: position, playbackRate: resolvedRate, isPlaying: isPlaying)
-        if isLiveSyncActive {
-            if isPlaying {
-                armNoAudioWatchdogIfNeeded()
+        guard isLiveSyncActive else { return }
+        if isPlaying {
+            modelIdleReleaseTask?.cancel()
+            modelIdleReleaseTask = nil
+            if !isCaptureRunning, let trackId = activeTrackId {
+                if chunkEngine != nil {
+                    startCaptureForCurrentTarget(trackId: trackId, engine: state.audioSyncEngine, generation: syncGeneration)
+                    dispatchChunkIfReady(trackId: trackId, generation: syncGeneration)
+                } else if alignerStartupTask == nil, state.audioSyncEngine == .lyricsAlignment {
+                    startLyricsAlignmentSync(trackId: trackId, lines: baseLines)
+                }
+            }
+            armNoAudioWatchdogIfNeeded()
+        } else {
+            if isCaptureRunning {
+                stopCapture()
+                seekBoundary = ProcessInfo.processInfo.systemUptime
+                // Persist whatever alignment we gathered before pausing/stopping.
+                persistCurrentAlignmentIfReady()
             } else {
                 resetNoAudioWatchdog()
             }
+            scheduleIdleModelReleaseIfNeeded()
         }
-        guard !isPlaying, isLiveSyncActive else { return }
-        // Persist whatever alignment we gathered before pausing/stopping.
-        persistCurrentAlignmentIfReady()
     }
 
     private static func sanitizedPlaybackRate(_ rate: Double) -> Double {
@@ -1372,7 +1418,7 @@ final class AudioSyncManager {
         case .off:
             state.audioSyncStatus = .idle
         case .lyricsAlignment:
-            startLyricsAlignmentSync(track: track, lines: lines)
+            startLyricsAlignmentSync(trackId: track.id, lines: lines)
         }
     }
 
@@ -1394,7 +1440,7 @@ final class AudioSyncManager {
         }
     }
 
-    private func startLyricsAlignmentSync(track: TrackInfo, lines: [LyricLine]) {
+    private func startLyricsAlignmentSync(trackId: String, lines: [LyricLine]) {
         modelIdleReleaseTask?.cancel()
         modelIdleReleaseTask = nil
         modelMayBeCached = true
@@ -1423,7 +1469,7 @@ final class AudioSyncManager {
             guard let self,
                   !Task.isCancelled,
                   self.syncGeneration == generation,
-                  self.activeTrackId == track.id,
+                  self.activeTrackId == trackId,
                   self.state.audioSyncEngine == .lyricsAlignment
             else {
                 guard let engine else { return }
@@ -1444,11 +1490,11 @@ final class AudioSyncManager {
             self.chunkEngine = engine
             self.vocalSeparator = separator
             self.diagnostics.update { $0.localeIdentifier = "lyrics alignment" }
-            self.beginChunkCapture(track: track, generation: generation)
+            self.beginChunkCapture(trackId: trackId, generation: generation)
         }
     }
 
-    private func beginChunkCapture(track: TrackInfo, generation: UInt64) {
+    private func beginChunkCapture(trackId: String, generation: UInt64) {
         isLiveSyncActive = true
         lastPlayback = (
             currentPlaybackPosition(),
@@ -1456,7 +1502,11 @@ final class AudioSyncManager {
             Self.sanitizedPlaybackRate(state.playbackRate),
             state.isPlaying
         )
-        startCaptureForCurrentTarget(trackId: track.id, engine: .lyricsAlignment, generation: generation)
+        guard state.isPlaying else {
+            scheduleIdleModelReleaseIfNeeded()
+            return
+        }
+        startCaptureForCurrentTarget(trackId: trackId, engine: .lyricsAlignment, generation: generation)
     }
 
     private func resetNoAudioWatchdog() {
@@ -1506,6 +1556,7 @@ final class AudioSyncManager {
                       self.syncGeneration == generation,
                       self.captureTargetGeneration == captureGeneration,
                       self.isLiveSyncActive,
+                      self.state.isPlaying,
                       self.activeTrackId == trackId,
                       self.state.audioSyncEngine == .lyricsAlignment,
                       let audio = batch.trimmingBefore(self.seekBoundary, deliveredAt: deliveredAt),
@@ -1633,6 +1684,7 @@ final class AudioSyncManager {
     private func dispatchChunkIfReady(trackId: String, generation: UInt64) {
         guard syncGeneration == generation,
               isLiveSyncActive,
+              state.isPlaying,
               activeTrackId == trackId,
               state.audioSyncEngine == .lyricsAlignment,
               !dependencies.usesProcessTap || hasReceivedAudibleAudioThisSession,
